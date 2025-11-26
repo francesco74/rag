@@ -36,6 +36,15 @@ log.info(f"Logging level set to {log_level}")
 # 2. INITIALIZE CLIENTS AND CONSTANTS
 # ==============================================================================
 
+RERANK_SIZE = 15
+QDRANT_SIZE = 20
+
+# --- CONFIGURATION ---
+    # 30k chars is approx 7.5k tokens. Safe for Gemini Flash (1M window) 
+    # but prevents massive payloads that slow down response.
+MAX_CONTEXT_CHARS = 30000 
+
+
 # --- App Initialization ---
 app = Flask(__name__)
 CORS(app)
@@ -351,38 +360,33 @@ def rerank_documents(query, documents, top_n=5):
     return top_docs
 
 def retrieve_chunks(query, vector, topic_id):
-    """Full Hybrid Search (2-step) + Re-ranking pipeline."""
+    """
+    Retrieves, fuses, and re-ranks documents. 
+    Returns a list of dictionaries: {'content': str, 'source': str}
+    """
     if not qdrant_client:
         log.error("Qdrant client not available.")
         return [], []
 
-    log.debug(f"Performing 2-Step Hybrid Query for topic_id='{topic_id}'")
+    log.debug(f"Performing Hybrid Query for topic_id='{topic_id}'")
     
     try:
         fused_hits = {}
         
         # 1. Vector Search
-        log.debug("Step 1: Vector Search")
         vector_response = qdrant_client.query_points(
             collection_name=QDRANT_COLLECTION,
-            query=vector, # Parameter is now 'query'
-            limit=20,
+            query=vector,
+            limit=QDRANT_SIZE,
             query_filter=models.Filter(
-                must=[
-                    models.FieldCondition(key="topic_id", match=models.MatchValue(value=topic_id))
-                ]
+                must=[models.FieldCondition(key="topic_id", match=models.MatchValue(value=topic_id))]
             )
         )
-        
-        vector_hits = vector_response.points # Extract points list
-        
-        for hit in vector_hits:
+        for hit in vector_response.points:
             fused_hits[hit.id] = hit
-        log.debug(f"Vector search found {len(vector_hits)} hits.")
 
-        # 2. Keyword Search (Using Filter/Scroll)
-        log.debug("Step 2: Keyword Search (Filter)")
-        keyword_hits = qdrant_client.scroll(
+        # 2. Keyword Search (Filter)
+        keyword_response = qdrant_client.scroll(
             collection_name=QDRANT_COLLECTION,
             scroll_filter=models.Filter(
                 must=[
@@ -390,86 +394,122 @@ def retrieve_chunks(query, vector, topic_id):
                     models.FieldCondition(key="content", match=models.MatchText(text=query))
                 ]
             ),
-            limit=20,
-            with_vectors=False,
-            with_payload=True
-        )[0]
-        
-        for hit in keyword_hits:
-            fused_hits[hit.id] = hit
-        log.debug(f"Keyword filter found {len(keyword_hits)} hits.")
+            limit=QDRANT_SIZE,
+            with_payload=True,
+            with_vectors=False
+        )
+        for hit in keyword_response[0]: 
+            if hit.id not in fused_hits:
+                fused_hits[hit.id] = hit
     
-        # 3. Fusion
-        fused_documents = list(fused_hits.values())
-        log.debug(f"Hybrid search retrieved {len(fused_documents)} unique candidates.")
-        
-        if not fused_documents:
+        candidates = list(fused_hits.values())
+        if not candidates:
             return [], []
             
-        # 4. Fine-Grained Re-ranking
-        reranked_docs = rerank_documents(query, fused_documents, top_n=15)
+        # 3. Re-ranking
+        # We handle re-ranking safely; if it fails, we fall back to the original order
+        try:
+            if RERANKER_MODEL:
+                pairs = [(query, doc.payload.get('content', '')) for doc in candidates]
+                scores = RERANKER_MODEL.predict(pairs)
+                # Sort by score descending
+                scored_docs = sorted(zip(scores, candidates), key=lambda x: x[0], reverse=True)
+                top_docs = [doc for score, doc in scored_docs[:RERANK_SIZE]] # Take top 15 candidates
+            else:
+                top_docs = candidates[:RERANK_SIZE]
+        except Exception as e:
+            log.error(f"Re-ranking error: {e}")
+            top_docs = candidates[:RERANK_SIZE]
 
-        # 5. Format for output
-        context_chunks = []
-        sources = []
-        for doc in reranked_docs:
+        # 4. Format for Output (Rich Objects)
+        rich_context = []
+        unique_sources = []
+        seen_files = set()
+
+        for doc in top_docs:
             payload = doc.payload
-            context_chunks.append(payload["content"])
-            # --- FIX: Clean de-duplication source list ---
-            sources.append({
-                "file": payload["source_file"]
-                # Intentionally removed 'page' to allow correct de-duplication
+            content = payload.get("content", "").strip()
+            source_file = payload.get("source_file", "Unknown File")
+            
+            # Add to context list
+            rich_context.append({
+                "content": content,
+                "source": source_file
             })
-            log.debug(f"  > Finalist chunk from {payload['source_file']}")
-            # --- END FIX ---
-                
-        # De-duplicate sources
-        unique_sources = [dict(t) for t in {tuple(d.items()) for d in sources}]
+
+            # Add to sources list (for the UI)
+            if source_file not in seen_files:
+                unique_sources.append({"file": source_file})
+                seen_files.add(source_file)
         
-        log.debug(f"Retrieved {len(context_chunks)} re-ranked chunks. Unique sources: {len(unique_sources)}")
-        return context_chunks, unique_sources
+        log.info(f"Retrieved {len(rich_context)} chunks from {len(unique_sources)} files.")
+        log.debug(f"retrived text: {rich_context} ")
+        return rich_context, unique_sources
 
     except Exception as e:
-        log.error(f"Qdrant hybrid search failed: {e}", exc_info=True)
+        log.error(f"Search pipeline failed: {e}", exc_info=True)
         return [], []
 
-def generate_answer(query, context, topic_id):
-    """(LLM Call 3) Use Gemini to generate an answer from context."""
-    context_str = "\n\n".join(context)
+def generate_answer(query, rich_context, topic_id):
+    """
+    Constructs prompt with Source Headers and enforces Character Limit.
+    """
+    formatted_chunks = []
+    current_char_count = 0
     
+    # 1. Format and Limit Context
+    for item in rich_context:
+        # Create a header like: [Source: employee_handbook.pdf]
+        # This allows the LLM to cite the specific file.
+        chunk_str = f"[Source: {item['source']}]\n{item['content']}\n\n"
+        
+        chunk_len = len(chunk_str)
+        
+        if current_char_count + chunk_len < MAX_CONTEXT_CHARS:
+            formatted_chunks.append(chunk_str)
+            current_char_count += chunk_len
+        else:
+            log.info(f"Context limit ({MAX_CONTEXT_CHARS}) reached. Dropped remaining chunks.")
+            break
+            
+    final_context_str = "".join(formatted_chunks)
+    
+    # 2. Prepare Prompt
     prompt_template = load_prompt_template("generate_answer")
+    
+    # Fetch extra topic info if needed
     db_conn = get_db_connection()
     inference_topics = get_inference_topics(db_conn)
-    inference_topics = "\n- ".join(inference_topics)
-    inference_topics = "- " + inference_topics
+    inference_topics_str = "- " + "\n- ".join(inference_topics)
+    if db_conn: db_conn.close()
 
-    # 2. Inject the variables into the template
     try:
         prompt = prompt_template.format(
-            context_str=context_str, 
+            context_str=final_context_str, 
             query=query,
-            inference_topics=inference_topics,
+            inference_topics=inference_topics_str,
             topic=topic_id
         )
     except KeyError as e:
         log.error(f"Prompt template missing key: {e}")
-        return "<p>Error in prompt configuration.</p>"
+        return "Error in prompt configuration."
     
-    log.debug(f"Sending prompt to AI Generator (Context length: {len(context_str)} chars)")
-    log.debug(f"Prompt: \n\n {prompt}")
+    log.info(f"Sending prompt to AI (Length: {len(prompt)} chars)")
+    log.debug(f"Prompt:\n\n{prompt}")
     
+    # 3. Generate
     try:
         response = GENERATOR_MODEL.generate_content(prompt)
         answer = response.text.strip()
-        log.debug(f"AI Generator raw response: '{answer[:100]}...'")
-
+        
         if "could not find an answer" in answer.lower():
             log_failed_query(query, "NO_ANSWER_IN_CONTEXT", topic_id)
             
         return answer
     except Exception as e:
         log.error(f"Gemini generation call failed: {e}")
-        return "<p>I'm sorry, but I encountered an error while generating a response.</p>"
+        return "I'm sorry, but I encountered an error while generating a response."
+    
 
 # ==============================================================================
 # 4. FLASK API ENDPOINT
