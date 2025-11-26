@@ -1,11 +1,13 @@
 import os
 import logging
 import json
+import time
+import uuid
 from dotenv import load_dotenv
 
 # --- Flask and DB Imports ---
 from flask import Flask, request, jsonify
-from flask_cors import CORS  # Import CORS
+from flask_cors import CORS
 import mysql.connector
 from qdrant_client import QdrantClient, models
 
@@ -15,9 +17,9 @@ import google.generativeai as genai
 # --- Re-ranking ---
 from sentence_transformers.cross_encoder import CrossEncoder
 
-# ==============================================================================
-# 1. LOAD CONFIGURATION AND SET UP LOGGING
-# ==============================================================================
+# Define the prompts directory path relative to this script
+PROMPTS_DIR = os.path.join(os.path.dirname(__file__), 'prompts')
+
 load_dotenv()
 
 # Set log level from environment variable, default to INFO
@@ -27,17 +29,16 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[logging.StreamHandler()]  # Log to console
 )
-log = logging.getLogger("app")  # Give the logger a name
+log = logging.getLogger("app")
 
 log.info(f"Logging level set to {log_level}")
-
 # ==============================================================================
 # 2. INITIALIZE CLIENTS AND CONSTANTS
 # ==============================================================================
 
 # --- App Initialization ---
 app = Flask(__name__)
-CORS(app)  # <-- Enable CORS for all routes
+CORS(app)
 log.info("CORS enabled for all routes.")
 
 # --- Database Config ---
@@ -55,6 +56,7 @@ try:
     QDRANT_PORT = int(os.environ.get("QDRANT_PORT", 6333))
     qdrant_client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
     QDRANT_COLLECTION = "document_chunks"
+    CACHE_COLLECTION = "semantic_cache"
     log.info(f"Qdrant client initialized for {QDRANT_HOST}:{QDRANT_PORT}.")
 except Exception as e:
     log.critical(f"Failed to connect to Qdrant: {e}")
@@ -88,8 +90,91 @@ except Exception as e:
 # 3. HELPER FUNCTIONS (Database, Logging, AI)
 # ==============================================================================
 
+def load_prompt_template(filename):
+    """Reads a text file from the prompts directory."""
+    try:
+        file_path = os.path.join(PROMPTS_DIR, filename)
+        with open(file_path, 'r', encoding='utf-8') as f:
+            return f.read()
+    except Exception as e:
+        log.error(f"Error loading prompt file {filename}: {e}")
+        # Fallback to a safe default if file is missing
+        return "Context: {context_str}\nQuery: {query}\nAnswer:"
+
+# ==============================================================================
+# 1. LOAD CONFIGURATION AND SET UP LOGGING
+# ==============================================================================
+
+
+def init_cache_collection():
+    """Ensures the cache collection exists in Qdrant."""
+    if not qdrant_client: return
+    try:
+        if not qdrant_client.collection_exists(CACHE_COLLECTION):
+            qdrant_client.create_collection(
+                collection_name=CACHE_COLLECTION,
+                vectors_config=models.VectorParams(
+                    size=768,
+                    distance=models.Distance.COSINE
+                )
+            )
+            log.info(f"Created semantic cache collection: {CACHE_COLLECTION}")
+    except Exception as e:
+        log.error(f"Failed to init cache collection: {e}")
+
+init_cache_collection()
+
+def check_semantic_cache(query_vector, similarity_threshold=0.95):
+    """Checks Qdrant for a similar past query."""
+    if not qdrant_client: return None
+    
+    try:
+        response = qdrant_client.query_points(
+            collection_name=CACHE_COLLECTION,
+            query=query_vector, # Parameter is now 'query'
+            limit=1,
+            score_threshold=similarity_threshold
+        )
+        
+        hits = response.points
+        
+        if hits:
+            cached_response = hits[0].payload
+            log.info(f"Cache HIT! Similarity: {hits[0].score}")
+            return cached_response
+        
+        log.debug("Cache MISS.")
+        return None
+    except Exception as e:
+        log.error(f"Cache lookup failed: {e}")
+        return None
+
+def save_to_semantic_cache(query_vector, original_query, answer, sources, topic_id):
+    """Saves a query and its answer to the cache."""
+    if not qdrant_client: return
+    
+    try:
+        point = models.PointStruct(
+            id=str(uuid.uuid4()),
+            vector=query_vector,
+            payload={
+                "original_query": original_query,
+                "answer": answer,
+                "sources": sources,
+                "topic": topic_id,
+                "timestamp": time.time()
+            }
+        )
+        
+        qdrant_client.upsert(
+            collection_name=CACHE_COLLECTION,
+            points=[point]
+        )
+        log.debug("Saved response to semantic cache.")
+    except Exception as e:
+        log.error(f"Failed to save to cache: {e}")
+
 def get_db_connection():
-    """Establishes a new MySQL connection."""
     try:
         conn = mysql.connector.connect(**db_config)
         log.debug("New MySQL connection established.")
@@ -99,7 +184,6 @@ def get_db_connection():
         return None
 
 def log_failed_query(query, failure_type, topic_id=None):
-    """Logs a failed query to the MySQL database."""
     log.warning(f"Logging failed query. Type: {failure_type}, Query: {query[:100]}...")
     db_conn = None
     try:
@@ -123,37 +207,52 @@ def log_failed_query(query, failure_type, topic_id=None):
         if db_conn and db_conn.is_connected():
             db_conn.close()
 
+def get_inference_topics(db_conn):
+    """
+    Fetches a simple list of topic_ids where inference = 1.
+    Returns: list of strings (e.g., ['hr_policy', 'it_support'])
+    """
+    topic_ids = []
+    
+    if not db_conn:
+        log.error("Database connection missing for get_inference_topics.")
+        return []
+
+    try:
+        # We use a standard cursor (not dictionary) to get tuples
+        with db_conn.cursor() as cursor:
+            sql = "SELECT topic_id FROM topics WHERE inference = 1"
+            cursor.execute(sql)
+            results = cursor.fetchall()
+            
+            # results looks like [('topic_a',), ('topic_b',)]
+            # We flatten this into a simple list of strings
+            topic_ids = [row[0] for row in results]
+            
+        log.debug(f"Fetched {len(topic_ids)} active inference topics.")
+        return topic_ids
+
+    except Exception as e:
+        log.error(f"Failed to fetch inference topics: {e}")
+        return []
+
 def transform_query(history, query):
-    """(LLM Call 1) Transform conversational query to standalone query."""
     if not history:
         log.debug("No chat history. Using query as-is.")
         return query
 
-    # Format history
     history_str = "\n".join([f"{msg.get('role', 'user')}: {msg.get('text', '')}" for msg in history])
     
-    prompt = f"""
-    <role>
-    You are a query re-writer.
-    </role>
-    <instructions>
-    Look at the <chat_history> (which is in plain text) and the user's <last_query>.
-    Your goal is to re-write the <last_query> as a single, standalone query that is optimal for a vector database search.
-    - If the <last_query> is already a good standalone query, just return it.
-    - If the <last_query> is conversational (e.g., "Why?", "Tell me more"), use the <chat_history> to create a new, self-contained query.
-    - Respond with ONLY the re-written query and nothing else.
-    </instructions>
+    prompt_template = load_prompt_template("query_rewriter")
     
-    <chat_history>
-    {history_str}
-    </chat_history>
-    
-    <last_query>
-    {query}
-    </last_query>
-
-    Standalone Query:
-    """
+    try:
+        prompt = prompt_template.format(
+            history_str=history_str, 
+            query=query
+        )
+    except KeyError as e:
+        log.error(f"Prompt template missing key: {e}")
+        return "<p>Error in prompt configuration.</p>"
     
     log.debug(f"Sending prompt to AI Query Transformer:\n{prompt}")
     try:
@@ -163,14 +262,12 @@ def transform_query(history, query):
         return standalone_query
     except Exception as e:
         log.error(f"Gemini query transformation failed: {e}")
-        return query # Fallback to original query
+        return query
 
 def get_all_topics(db_conn):
-    """Fetches all topics and their aliases from the MySQL topic registry."""
     topics = []
     try:
         with db_conn.cursor(dictionary=True) as cursor:
-            # Fetch topic, description, and aliases
             cursor.execute("SELECT topic_id, description, aliases FROM topics")
             topics = cursor.fetchall()
         log.debug(f"Fetched {len(topics)} topics from MySQL.")
@@ -179,9 +276,6 @@ def get_all_topics(db_conn):
     return topics
 
 def route_query_to_topic(standalone_query, topics):
-    """(LLM Call 2) Use Gemini to classify the standalone query."""
-    
-    # Format the topic list with aliases
     topic_list_str = []
     for t in topics:
         entry = f"- {t['topic_id']}: {t['description']}"
@@ -191,27 +285,16 @@ def route_query_to_topic(standalone_query, topics):
     
     topic_string = '\n'.join(topic_list_str)
 
-    prompt = f"""
-    <role>
-    You are a topic finder.
-    </role>
-    <instructions>
-    Given the user <query>, which of the following <topics> is it about?
-    - Analyze the query, description, and aliases.
-    - Respond with ONLY the topic_id.
-    - If none match, respond with 'NONE'.
-    </instructions>
-
-    <topics>
-    {topic_string}
-    </topics>
+    prompt_template = load_prompt_template("topic_finder")
+    try:
+        prompt = prompt_template.format(
+            topic_string=topic_string, 
+            standalone_query=standalone_query,
+        )
+    except KeyError as e:
+        log.error(f"Prompt template missing key: {e}")
+        return "<p>Error in prompt configuration.</p>"
     
-    <query>
-    {standalone_query}
-    </query>
-
-    Topic:
-    """
     
     log.debug(f"Sending prompt to AI Router:\n{prompt}")
     try:
@@ -219,7 +302,6 @@ def route_query_to_topic(standalone_query, topics):
         topic_id = response.text.strip()
         log.debug(f"AI Router raw response: '{topic_id}'")
         
-        # Validate response
         if topic_id in [t['topic_id'] for t in topics]:
             log.info(f"Query routed to topic: {topic_id}")
             return topic_id
@@ -231,13 +313,12 @@ def route_query_to_topic(standalone_query, topics):
         return None
 
 def embed_query(query):
-    """Embed the user's query for vector search."""
     log.debug(f"Embedding query: '{query[:50]}...'")
     try:
         result = genai.embed_content(
             model=EMBEDDING_MODEL,
             content=query,
-            task_type="RETRIEVAL_QUERY" # Query, not Document
+            task_type="RETRIEVAL_QUERY"
         )
         log.debug("Query successfully embedded.")
         return result['embedding']
@@ -246,10 +327,8 @@ def embed_query(query):
         return None
 
 def rerank_documents(query, documents, top_n=5):
-    """Re-ranks a list of documents against a query."""
     if not RERANKER_MODEL:
         log.error("Re-ranker model not loaded. Skipping re-ranking.")
-        # Fallback: just return the first N documents
         return documents[:top_n]
 
     if not documents:
@@ -258,27 +337,19 @@ def rerank_documents(query, documents, top_n=5):
 
     log.debug(f"Re-ranking {len(documents)} documents...")
     
-    # The cross-encoder expects pairs of [query, document_content]
     pairs = [(query, doc.payload['content']) for doc in documents]
     
-    # Predict scores
     scores = RERANKER_MODEL.predict(pairs)
     
-    # Combine documents with their new scores
     scored_docs = list(zip(scores, documents))
     
-    # Sort by score in descending order
     scored_docs.sort(key=lambda x: x[0], reverse=True)
     
-    # Return the top_n documents (not the scores, just the docs)
     top_docs = [doc for score, doc in scored_docs[:top_n]]
     
     log.debug(f"Re-ranking complete. Top 5 scores: {[score for score, doc in scored_docs[:top_n]]}")
     return top_docs
 
-# ---
-# THIS IS THE FULLY CORRECTED FUNCTION
-# ---
 def retrieve_chunks(query, vector, topic_id):
     """Full Hybrid Search (2-step) + Re-ranking pipeline."""
     if not qdrant_client:
@@ -292,9 +363,9 @@ def retrieve_chunks(query, vector, topic_id):
         
         # 1. Vector Search
         log.debug("Step 1: Vector Search")
-        vector_hits = qdrant_client.search(
+        vector_response = qdrant_client.query_points(
             collection_name=QDRANT_COLLECTION,
-            query_vector=vector,
+            query=vector, # Parameter is now 'query'
             limit=20,
             query_filter=models.Filter(
                 must=[
@@ -302,16 +373,14 @@ def retrieve_chunks(query, vector, topic_id):
                 ]
             )
         )
+        
+        vector_hits = vector_response.points # Extract points list
+        
         for hit in vector_hits:
             fused_hits[hit.id] = hit
         log.debug(f"Vector search found {len(vector_hits)} hits.")
 
-        # ---
-        # 2. Keyword Search
-        # This is the most reliable way to do a keyword search.
-        # We use a `Must` condition with a `MatchText` filter.
-        # This is a *filter*, not a *search*, but it will find exact keywords.
-        # ---
+        # 2. Keyword Search (Using Filter/Scroll)
         log.debug("Step 2: Keyword Search (Filter)")
         keyword_hits = qdrant_client.scroll(
             collection_name=QDRANT_COLLECTION,
@@ -321,13 +390,13 @@ def retrieve_chunks(query, vector, topic_id):
                     models.FieldCondition(key="content", match=models.MatchText(text=query))
                 ]
             ),
-            limit=20, # Get 20 keyword results
+            limit=20,
             with_vectors=False,
             with_payload=True
-        )[0] # scroll returns (points, next_offset)
+        )[0]
         
         for hit in keyword_hits:
-            fused_hits[hit.id] = hit # Add/overwrite in our dictionary to de-duplicate
+            fused_hits[hit.id] = hit
         log.debug(f"Keyword filter found {len(keyword_hits)} hits.")
     
         # 3. Fusion
@@ -338,7 +407,7 @@ def retrieve_chunks(query, vector, topic_id):
             return [], []
             
         # 4. Fine-Grained Re-ranking
-        reranked_docs = rerank_documents(query, fused_documents, top_n=7)
+        reranked_docs = rerank_documents(query, fused_documents, top_n=15)
 
         # 5. Format for output
         context_chunks = []
@@ -346,17 +415,15 @@ def retrieve_chunks(query, vector, topic_id):
         for doc in reranked_docs:
             payload = doc.payload
             context_chunks.append(payload["content"])
-            # --- THIS IS THE FIX ---
-            # We only append the file, not the page/chunk index,
-            # so that de-duplication works correctly.
+            # --- FIX: Clean de-duplication source list ---
             sources.append({
                 "file": payload["source_file"]
+                # Intentionally removed 'page' to allow correct de-duplication
             })
-            # --- END FIX ---
             log.debug(f"  > Finalist chunk from {payload['source_file']}")
+            # --- END FIX ---
                 
         # De-duplicate sources
-        # This will now correctly de-duplicate based on filename only
         unique_sources = [dict(t) for t in {tuple(d.items()) for d in sources}]
         
         log.debug(f"Retrieved {len(context_chunks)} re-ranked chunks. Unique sources: {len(unique_sources)}")
@@ -365,52 +432,37 @@ def retrieve_chunks(query, vector, topic_id):
     except Exception as e:
         log.error(f"Qdrant hybrid search failed: {e}", exc_info=True)
         return [], []
-# ---
-# END OF CORRECTED FUNCTION
-# ---
 
 def generate_answer(query, context, topic_id):
     """(LLM Call 3) Use Gemini to generate an answer from context."""
     context_str = "\n\n".join(context)
     
-    prompt = f"""
-    <role>
-    You are a helpful assistant.
-    </role>
-    <instructions>
-    - Answer the user's <query> based ONLY on the provided <context>.
-    
-    - **IMPORTANT RULE:** If a piece of context appears to be a Table of Contents, an Index, or a reference to another page (e.g., '...see page 25'), you MUST ignore that piece of context and find the answer in the *other* context passages.
-    - If the *only* context you are given is a Table of Contents or page references, you MUST act as if you found no answer.
+    prompt_template = load_prompt_template("generate_answer")
+    db_conn = get_db_connection()
+    inference_topics = get_inference_topics(db_conn)
+    inference_topics = "\n- ".join(inference_topics)
+    inference_topics = "- " + inference_topics
 
-    - Format your answer in simple HTML (using <p>, <ul>, <li>, and <b> tags).
-    - Do NOT use markdown.
-    - If the answer is not in the context (or you were forced to ignore it), you MUST respond with only:
-    "<p>I could not find an answer in the provided documents."
-    - Do NOT repeat the query in your answer.
-    - Begin your response *directly* with the answer (e.g., "<p>The answer is...").
-    </instructions>
-    
-    <context>
-    {context_str}
-    </context>
-    
-    <query>
-    {query}
-    </query>
-
-    Answer:
-    """
+    # 2. Inject the variables into the template
+    try:
+        prompt = prompt_template.format(
+            context_str=context_str, 
+            query=query,
+            inference_topics=inference_topics,
+            topic=topic_id
+        )
+    except KeyError as e:
+        log.error(f"Prompt template missing key: {e}")
+        return "<p>Error in prompt configuration.</p>"
     
     log.debug(f"Sending prompt to AI Generator (Context length: {len(context_str)} chars)")
-    log.debug(f"{context_str}")
+    log.debug(f"Prompt: \n\n {prompt}")
     
     try:
         response = GENERATOR_MODEL.generate_content(prompt)
         answer = response.text.strip()
         log.debug(f"AI Generator raw response: '{answer[:100]}...'")
 
-        # Check if AI failed to find answer
         if "could not find an answer" in answer.lower():
             log_failed_query(query, "NO_ANSWER_IN_CONTEXT", topic_id)
             
@@ -427,7 +479,6 @@ def generate_answer(query, context, topic_id):
 def chat_handler():
     log.info("Received new /chat request.")
     
-    # --- 1. Get Query and History ---
     try:
         data = request.json
         log.debug(f"Raw request data: {data}")
@@ -436,7 +487,7 @@ def chat_handler():
         return jsonify({"error": "Bad Request", "message": "<p>Invalid JSON format</p>"}), 400
 
     query = data.get("query")
-    history = data.get("history", []) # Default to empty list
+    history = data.get("history", [])
     
     if not query:
         log.warning("Bad request: 'query' not found in JSON.")
@@ -446,15 +497,25 @@ def chat_handler():
 
     db_conn = None
     try:
-        # --- 2. Get DB Connection ---
         db_conn = get_db_connection()
         if not db_conn:
             return jsonify({"error": "Internal Server Error", "message": "<p>Could not connect to database</p>"}), 500
 
-        # --- 3. Step A: Transform Query ---
         standalone_query = transform_query(history, query)
+        
+        query_vector = embed_query(standalone_query)
+        if not query_vector:
+            return jsonify({"error": "Internal Server Error", "message": "<p>Failed to process query (embedding).</p>"}), 500
 
-        # --- 4. Step B: Route Query ---
+        cached_response = check_semantic_cache(query_vector)
+        if cached_response:
+            return jsonify({
+                "answer": cached_response['answer'],
+                "sources": cached_response['sources'],
+                "topic": cached_response['topic'],
+                "cached": True
+            }), 200
+
         topics = get_all_topics(db_conn)
         if not topics:
             log.error("No topics found in database. Ingestion pipeline must be run first.")
@@ -469,11 +530,6 @@ def chat_handler():
                 "message": "<p>I'm sorry, I don't have any documents related to that topic. Please rephrase your question.</p>"
             }), 404
 
-        # --- 5. Step C: Retrieve Chunks ---
-        query_vector = embed_query(standalone_query)
-        if not query_vector:
-            return jsonify({"error": "Internal Server Error", "message": "<p>Failed to process query (embedding).</p>"}), 500
-
         context, sources = retrieve_chunks(standalone_query, query_vector, topic_id)
         if not context:
             log.warning(f"No context found in Qdrant for topic '{topic_id}' and query '{standalone_query}'")
@@ -484,10 +540,11 @@ def chat_handler():
                 "topic": topic_id
             }), 404
 
-        # --- 6. Step D: Generate Answer ---
         answer = generate_answer(standalone_query, context, topic_id)
         
-        # --- 7. Send Response ---
+        if "could not find an answer" not in answer.lower():
+            save_to_semantic_cache(query_vector, standalone_query, answer, sources, topic_id)
+        
         response_payload = {
             "answer": answer,
             "sources": sources,
@@ -498,18 +555,63 @@ def chat_handler():
         return jsonify(response_payload), 200
 
     except Exception as e:
-        log.error(f"Unhandled exception in /chat: {e}", exc_info=True) # exc_info=True logs stack trace
+        log.error(f"Unhandled exception in /chat: {e}", exc_info=True)
         return jsonify({"error": "Internal Server Error", "message": f"<p>{str(e)}</p>"}), 500
         
     finally:
-        # --- 8. Cleanup ---
         if db_conn and db_conn.is_connected():
             db_conn.close()
             log.debug("MySQL connection closed.")
 
-# ==============================================================================
-# 5. RUN THE APPLICATION
-# ==============================================================================
+# --- NEW: Feedback Endpoint ---
+@app.route("/feedback", methods=["POST"])
+def feedback_handler():
+    log.info("Received new /feedback request.")
+    
+    try:
+        data = request.json
+        # Extract data
+        query = data.get("query")
+        answer = data.get("answer")
+        topic_id = data.get("topic_id")
+        rating = data.get("rating") # 1 (like) or -1 (dislike)
+        history = data.get("history", []) # Contextual history
+        
+        if not query or not answer or rating is None:
+            log.warning("Bad feedback request: Missing fields.")
+            return jsonify({"error": "Bad Request", "message": "Missing required fields"}), 400
+
+        # Prepare history as string for DB storage
+        history_json = json.dumps(history)
+
+        db_conn = get_db_connection()
+        if not db_conn:
+             return jsonify({"error": "Internal Server Error", "message": "Database connection failed"}), 500
+
+        try:
+            with db_conn.cursor() as cursor:
+                sql = """
+                INSERT INTO chat_feedback (user_query, ai_response, topic_id, rating, chat_history)
+                VALUES (%s, %s, %s, %s, %s)
+                """
+                val = (query, answer, topic_id, rating, history_json)
+                cursor.execute(sql, val)
+                db_conn.commit()
+            
+            log.info(f"Feedback saved. Rating: {rating} for topic: {topic_id}")
+            return jsonify({"status": "success", "message": "Feedback received"}), 200
+
+        except Exception as e:
+            log.error(f"Database error saving feedback: {e}")
+            return jsonify({"error": "Internal Server Error", "message": "Failed to save feedback"}), 500
+        finally:
+            if db_conn and db_conn.is_connected():
+                db_conn.close()
+
+    except Exception as e:
+        log.error(f"Unhandled exception in /feedback: {e}", exc_info=True)
+        return jsonify({"error": "Internal Server Error", "message": str(e)}), 500
+# --- END NEW ---
 
 if __name__ == "__main__":
     log.info("Starting Flask RAG API server...")

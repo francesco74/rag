@@ -5,9 +5,19 @@
  *
  * This is the complete, final version of the app.
  *
- * It uses:
- * - A `SelectableText` widget for your (user) messages.
- * - An `Html` widget (in a SelectionArea) for the AI's HTML responses.
+ * Features:
+ * - Stateful chat history sent to backend.
+ * - HTML rendering for AI responses.
+ * - Selectable text for both user and AI messages.
+ * - Clickable source links (Nginx).
+ * - Feedback (Like/Dislike) buttons.
+ * - Clear chat functionality.
+ *
+ * --- 🚀 Dependencies (pubspec.yaml) ---
+ * http: ^1.2.0
+ * flutter_html: ^3.0.0-beta.2
+ * url_launcher: ^6.3.0
+ * web: ^0.5.1
  *
  * ====================================================================
  */
@@ -37,6 +47,7 @@ class AiChatApp extends StatelessWidget {
           brightness: Brightness.dark,
         ),
         // Define a contrasting selection color for dark theme
+        // This ensures selected text is visible against the bubble background
         textSelectionTheme: TextSelectionThemeData(
           selectionColor: Colors.white.withAlpha(100),
           selectionHandleColor: Colors.white,
@@ -48,16 +59,21 @@ class AiChatApp extends StatelessWidget {
   }
 }
 
-// Simple data model for a chat message
+// Status enum for feedback
+enum FeedbackStatus { none, like, dislike }
+
+// Data model for a chat message
 class ChatMessage {
   final String text;
   final bool isUser;
   final String? topic;
   final List<Map<String, dynamic>> sources;
   final bool isError;
-  final bool isSystemMessage; // <-- NEW: Flag to exclude from history
-  // Added to support chat history
+  final bool isSystemMessage; // Exclude from history sent to LLM
   final String role; // 'user' or 'model'
+  
+  // Store feedback state
+  FeedbackStatus feedback;
 
   ChatMessage({
     required this.text,
@@ -65,8 +81,9 @@ class ChatMessage {
     this.topic,
     this.sources = const [],
     this.isError = false,
-    this.isSystemMessage = false, // <-- NEW: Default to false
-  }) : role = isUser ? 'user' : 'model'; // Automatically assign role
+    this.isSystemMessage = false, 
+    this.feedback = FeedbackStatus.none,
+  }) : role = isUser ? 'user' : 'model'; 
 }
 
 class ChatScreen extends StatefulWidget {
@@ -94,7 +111,7 @@ class _ChatScreenState extends State<ChatScreen> {
       0,
       ChatMessage(
         text: "<p>Hello! Ask me anything about the documents I have.</p>",
-        isSystemMessage: true, // <-- NEW: Mark as system message
+        isSystemMessage: true, 
       ),
     );
   }
@@ -106,43 +123,47 @@ class _ChatScreenState extends State<ChatScreen> {
     super.dispose();
   }
 
-  // --- Core API Logic ---
+  // ===========================================================================
+  // CORE API LOGIC
+  // ===========================================================================
 
   /// Sends the user's query and chat history to the Flask backend
   Future<void> _handleSendPressed() async {
     final text = _textController.text;
     if (text.isEmpty) return;
 
-    // Add user message to UI (as plain text)
+    // 1. Add user message to UI (as plain text, SelectableText handles it)
     final userMessage = ChatMessage(text: text, isUser: true);
     _addMessage(userMessage);
     _textController.clear();
 
-    // Show loading indicator
+    // 2. Show loading indicator
     setState(() {
       _isLoading = true;
     });
 
-    // --- Prepare Chat History ---
-    // Create a list of all non-error AND non-system messages
+    // 3. Prepare Chat History
+    // Filter out errors and system messages.
+    // Format strictly as [{"role": "user", "text": "..."}, ...]
     final chatHistory = _messages
         .where((msg) =>
-            !msg.isError && !msg.isSystemMessage) // <-- UPDATED FILTER
-        .toList() // Convert Iterable to List
+            !msg.isError && !msg.isSystemMessage) 
+        .toList() 
         .reversed // Oldest to newest
         .map((msg) => {
               'role': msg.role,
               'text': msg.text,
             })
-        .toList(); // Convert back to List
+        .toList(); 
 
-    // The Flask server now expects the *last* query separately
+    // The Flask server expects the *last* query separately.
+    // Remove the last item (current query) from history.
     final chatHistoryForApi = chatHistory.length > 1
         ? chatHistory.sublist(0, chatHistory.length - 1)
         : [];
     final lastQuery = chatHistory.last['text'] ?? "";
 
-    // Call the API
+    // 4. Call the API
     try {
       final String apiUrl = "${AppSettings.apiUrl}/chat";
 
@@ -150,21 +171,20 @@ class _ChatScreenState extends State<ChatScreen> {
           .post(
             Uri.parse(apiUrl),
             headers: {"Content-Type": "application/json"},
-            // Send the history and the last query
             body: jsonEncode({
-              "history": chatHistoryForApi, // Send all *but* the last message
-              "query": lastQuery // Send the last query
+              "history": chatHistoryForApi, 
+              "query": lastQuery 
             }),
           )
           .timeout(const Duration(seconds: 90));
 
-      // Handle the response
+      // 5. Handle the response
       if (response.statusCode == 200) {
         final data = jsonDecode(utf8.decode(response.bodyBytes));
         _addMessage(ChatMessage(
           text: data['answer'],
           topic: data['topic'],
-          // Ensure sources is correctly casted
+          // Ensure sources is correctly casted to List<Map>
           sources: (data['sources'] as List)
               .map((s) => s as Map<String, dynamic>)
               .toList(),
@@ -175,7 +195,7 @@ class _ChatScreenState extends State<ChatScreen> {
         _addMessage(ChatMessage(
           text: data['message'] ?? "<p>I could not find an answer.</p>",
           isError: true,
-          isSystemMessage: true, // <-- NEW: Mark as system message
+          isSystemMessage: true, // Do not save errors to history
         ));
       } else {
         // Handle other server errors (500, etc.)
@@ -184,7 +204,7 @@ class _ChatScreenState extends State<ChatScreen> {
           text:
               "<p>An error occurred on the server (Code: ${response.statusCode}).</p><p>${data['message'] ?? ''}</p>",
           isError: true,
-          isSystemMessage: true, // <-- NEW: Mark as system message
+          isSystemMessage: true,
         ));
       }
     } catch (e) {
@@ -193,13 +213,74 @@ class _ChatScreenState extends State<ChatScreen> {
         text:
             "<p>Failed to connect to the AI engine. Is the server running at ${AppSettings.apiUrl}?</p><p>Error: ${e.toString()}</p>",
         isError: true,
-        isSystemMessage: true, // <-- NEW: Mark as system message
+        isSystemMessage: true,
       ));
     } finally {
-      // Hide loading indicator
       setState(() {
         _isLoading = false;
       });
+    }
+  }
+
+  // --- Feedback Logic ---
+  Future<void> _sendFeedback(ChatMessage message, bool isLike) async {
+    // Prevent sending feedback for system/error messages or user messages
+    if (message.isUser || message.isError || message.isSystemMessage) return;
+
+    // 1. Identify the user query that prompted this answer
+    int msgIndex = _messages.indexOf(message);
+    String userQuery = "";
+    
+    // The user query should be immediately after the AI response in the reversed list
+    if (msgIndex != -1 && msgIndex + 1 < _messages.length) {
+        userQuery = _messages[msgIndex + 1].text;
+    }
+
+    // 2. Construct History *up to* this exchange
+    List<Map<String, dynamic>> contextHistory = [];
+    if (msgIndex + 2 < _messages.length) {
+        contextHistory = _messages
+            .sublist(msgIndex + 2)
+            .where((m) => !m.isError && !m.isSystemMessage)
+            .toList()
+            .reversed
+            .map((m) => {'role': m.role, 'text': m.text})
+            .toList();
+    }
+
+    // 3. Update UI State immediately
+    setState(() {
+      message.feedback = isLike ? FeedbackStatus.like : FeedbackStatus.dislike;
+    });
+
+    // 4. Send to Backend
+    try {
+        final String apiUrl = "${AppSettings.apiUrl}/feedback";
+        await http.post(
+            Uri.parse(apiUrl),
+            headers: {"Content-Type": "application/json"},
+            body: jsonEncode({
+                "query": userQuery,
+                "answer": message.text,
+                "topic_id": message.topic,
+                "rating": isLike ? 1 : -1,
+                "history": contextHistory
+            })
+        );
+        
+        if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(content: Text("Thank you for your feedback!"), duration: Duration(seconds: 1))
+            );
+        }
+
+    } catch (e) {
+        print("Failed to send feedback: $e");
+        if (mounted) {
+             ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(content: Text("Failed to send feedback."), duration: Duration(seconds: 1))
+            );
+        }
     }
   }
 
@@ -216,7 +297,7 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
-  /// --- New Function to Launch URLs ---
+  /// --- Opens Nginx Document URLs ---
   Future<void> _launchUrl(String urlString) async {
     final Uri url = Uri.parse(urlString);
     if (!await launchUrl(
@@ -227,19 +308,18 @@ class _ChatScreenState extends State<ChatScreen> {
       _addMessage(ChatMessage(
         text: "<p>Could not open the document: $urlString</p>",
         isError: true,
-        isSystemMessage: true, // <-- NEW: Mark as system message
+        isSystemMessage: true,
       ));
     }
   }
 
-  // --- NEW: Function to clear the chat ---
+  // --- Clears the chat history ---
   void _clearChat() {
     setState(() {
       _messages.clear();
       _addWelcomeMessage();
     });
 
-    // Show a confirmation snackbar
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(
         content: Text("Chat history cleared."),
@@ -248,15 +328,17 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
-  // --- UI Building Widgets ---
+  // ===========================================================================
+  // UI BUILDING
+  // ===========================================================================
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
         title: const Text("AI Document Chat"),
-        // --- NEW: Clear chat button ---
         actions: [
+          // Clear Chat Button
           IconButton(
             icon: const Icon(Icons.delete_sweep_outlined),
             tooltip: "Clear Chat",
@@ -264,7 +346,6 @@ class _ChatScreenState extends State<ChatScreen> {
           ),
           const SizedBox(width: 8),
         ],
-        // --- END NEW ---
       ),
       body: Column(
         children: [
@@ -295,19 +376,17 @@ class _ChatScreenState extends State<ChatScreen> {
     final bool isUser = message.isUser;
     final theme = Theme.of(context);
 
-    // --- THIS IS THE FIX ---
-    // Use a SelectableText widget for user messages (plain text)
-    // Use an Html widget (in a SelectionArea) for AI/error messages (HTML)
     Widget messageContent;
+    
     if (isUser) {
-      // USER MESSAGE
+      // USER MESSAGE: Plain Text, Selectable
       messageContent = SelectableText(
         message.text,
         style: theme.textTheme.bodyLarge!
             .copyWith(color: theme.colorScheme.onPrimary),
       );
     } else {
-      // AI MESSAGE (or error)
+      // AI MESSAGE: HTML, Selectable Area
       messageContent = SelectionArea(
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
@@ -340,11 +419,39 @@ class _ChatScreenState extends State<ChatScreen> {
               },
             ),
             _buildSources(message),
+            
+            // Feedback Buttons (Only for valid AI answers)
+            if (!message.isError && !message.isSystemMessage)
+                Padding(
+                  padding: const EdgeInsets.only(top: 8.0),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                        IconButton(
+                            icon: Icon(
+                                message.feedback == FeedbackStatus.like ? Icons.thumb_up : Icons.thumb_up_outlined,
+                                size: 20,
+                                color: message.feedback == FeedbackStatus.like ? Colors.green : theme.colorScheme.onSurfaceVariant,
+                            ),
+                            onPressed: () => _sendFeedback(message, true),
+                            tooltip: "Good response",
+                        ),
+                        IconButton(
+                            icon: Icon(
+                                message.feedback == FeedbackStatus.dislike ? Icons.thumb_down : Icons.thumb_down_outlined,
+                                size: 20,
+                                color: message.feedback == FeedbackStatus.dislike ? Colors.red : theme.colorScheme.onSurfaceVariant,
+                            ),
+                            onPressed: () => _sendFeedback(message, false),
+                            tooltip: "Bad response",
+                        ),
+                    ],
+                  ),
+                )
           ],
         ),
       );
     }
-    // --- END FIX ---
 
     return Container(
       margin: const EdgeInsets.symmetric(vertical: 8.0),
@@ -368,7 +475,7 @@ class _ChatScreenState extends State<ChatScreen> {
             ),
           if (isUser) const SizedBox(width: 40), // Spacer
 
-          // Bubble
+          // Bubble Container
           Expanded(
             child: Container(
               margin: const EdgeInsets.symmetric(horizontal: 12.0),
@@ -386,7 +493,7 @@ class _ChatScreenState extends State<ChatScreen> {
                   bottomRight: isUser ? Radius.zero : const Radius.circular(20),
                 ),
               ),
-              // We now apply selection *inside* the bubble
+              // The content (SelectableText or SelectionArea)
               child: messageContent,
             ),
           ),
@@ -419,7 +526,7 @@ class _ChatScreenState extends State<ChatScreen> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          // This text is now selectable because it's inside the SelectionArea
+          // Title text (Selectable due to parent SelectionArea)
           Text(
             "Sources (from topic: $topic):",
             style: theme.textTheme.bodySmall!.copyWith(
@@ -428,31 +535,33 @@ class _ChatScreenState extends State<ChatScreen> {
             ),
           ),
           const SizedBox(height: 8.0),
+          
+          // Chips
           Wrap(
             spacing: 8.0,
             runSpacing: 4.0,
             children: message.sources.map((source) {
               final String fileName = source['file'] ?? 'Unknown File';
-              // --- "Whole Document" Change ---
-              // Page number is no longer reliable, so we don't show it.
-              // final String page = (source['page'] ?? 0).toString();
 
               // Construct the Nginx URL
               final String url =
-                  "${AppSettings.downloadDocumentUrl}/$topic/$fileName";
+                  "http://ia-download.intranet.provincia.lucca/downloads/$topic/$fileName";
 
-              return InkWell(
-                onTap: () => _launchUrl(url),
-                borderRadius: BorderRadius.circular(16.0),
-                child: Chip(
-                  avatar: Icon(Icons.link,
-                      size: 16, color: theme.colorScheme.secondary),
-                  // --- "Whole Document" Change ---
-                  label: Text(fileName), // No page number
-                  labelStyle: theme.textTheme.labelSmall,
-                  backgroundColor: theme.colorScheme.secondaryContainer,
-                  labelPadding: const EdgeInsets.symmetric(horizontal: 8.0),
-                  visualDensity: VisualDensity.compact,
+              // Wrapper to enable cursor change on hover
+              return MouseRegion(
+                cursor: SystemMouseCursors.click,
+                child: InkWell(
+                  onTap: () => _launchUrl(url),
+                  borderRadius: BorderRadius.circular(16.0),
+                  child: Chip(
+                    avatar: Icon(Icons.link,
+                        size: 16, color: theme.colorScheme.secondary),
+                    label: Text("$fileName"),
+                    labelStyle: theme.textTheme.labelSmall,
+                    backgroundColor: theme.colorScheme.secondaryContainer,
+                    labelPadding: const EdgeInsets.symmetric(horizontal: 8.0),
+                    visualDensity: VisualDensity.compact,
+                  ),
                 ),
               );
             }).toList(),
@@ -464,7 +573,7 @@ class _ChatScreenState extends State<ChatScreen> {
 
   /// Builds the bottom text input field and send button
   Widget _buildTextInputArea() {
-    final theme = Theme.of(context); // Get theme here
+    final theme = Theme.of(context); 
     return Container(
       padding: const EdgeInsets.all(16.0),
       decoration: BoxDecoration(

@@ -1,0 +1,19 @@
+<role>
+You are a topic finder.
+</role>
+<instructions>
+Given the user <query>, which of the following <topics> is it about?
+- Analyze the query, description, and aliases.
+- Respond with ONLY the topic_id.
+- If none match, respond with 'NONE'.
+</instructions>
+
+<topics>
+{topic_string}
+</topics>
+
+<query>
+{standalone_query}
+</query>
+
+Topic:
