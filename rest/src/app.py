@@ -88,11 +88,17 @@ except Exception as e:
 
 # --- Re-ranker Model ---
 try:
-    # This is a small, fast, and very effective model
-    RERANKER_MODEL = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
-    log.info("Cross-encoder re-ranker model loaded.")
+    # Using 'BAAI/bge-reranker-v2-m3' for Multilingual (Italian) support.
+    # Max length set to 1024 to utilize large context without OOM errors.
+    RERANKER_MODEL_NAME = 'BAAI/bge-reranker-v2-m3'
+    RERANKER_MODEL = CrossEncoder(
+        RERANKER_MODEL_NAME, 
+        max_length=1024,
+        automodel_args={"torch_dtype": "auto"} # Use FP16 if available
+    )
+    log.info(f"Cross-encoder loaded: {RERANKER_MODEL_NAME}")
 except Exception as e:
-    log.critical(f"Failed to load cross-encoder model: {e}")
+    log.critical(f"Failed to load cross-encoder: {e}")
     RERANKER_MODEL = None
 
 # ==============================================================================
@@ -216,34 +222,6 @@ def log_failed_query(query, failure_type, topic_id=None):
         if db_conn and db_conn.is_connected():
             db_conn.close()
 
-def get_inference_topics(db_conn):
-    """
-    Fetches a simple list of topic_ids where inference = 1.
-    Returns: list of strings (e.g., ['hr_policy', 'it_support'])
-    """
-    topic_ids = []
-    
-    if not db_conn:
-        log.error("Database connection missing for get_inference_topics.")
-        return []
-
-    try:
-        # We use a standard cursor (not dictionary) to get tuples
-        with db_conn.cursor() as cursor:
-            sql = "SELECT topic_id FROM topics WHERE inference = 1"
-            cursor.execute(sql)
-            results = cursor.fetchall()
-            
-            # results looks like [('topic_a',), ('topic_b',)]
-            # We flatten this into a simple list of strings
-            topic_ids = [row[0] for row in results]
-            
-        log.debug(f"Fetched {len(topic_ids)} active inference topics.")
-        return topic_ids
-
-    except Exception as e:
-        log.error(f"Failed to fetch inference topics: {e}")
-        return []
 
 def transform_query(history, query):
     if not history:
@@ -277,7 +255,7 @@ def get_all_topics(db_conn):
     topics = []
     try:
         with db_conn.cursor(dictionary=True) as cursor:
-            cursor.execute("SELECT topic_id, description, aliases FROM topics")
+            cursor.execute("SELECT topic_id, description, aliases, prompt FROM topics")
             topics = cursor.fetchall()
         log.debug(f"Fetched {len(topics)} topics from MySQL.")
     except Exception as e:
@@ -414,7 +392,7 @@ def retrieve_chunks(query, vector, topic_id):
                 scores = RERANKER_MODEL.predict(pairs)
                 # Sort by score descending
                 scored_docs = sorted(zip(scores, candidates), key=lambda x: x[0], reverse=True)
-                top_docs = [doc for score, doc in scored_docs[:RERANK_SIZE]] # Take top 15 candidates
+                top_docs = [doc for score, doc in scored_docs[:RERANK_SIZE]] # Take top RERANK_SIZE candidates
             else:
                 top_docs = candidates[:RERANK_SIZE]
         except Exception as e:
@@ -449,8 +427,15 @@ def retrieve_chunks(query, vector, topic_id):
     except Exception as e:
         log.error(f"Search pipeline failed: {e}", exc_info=True)
         return [], []
+    
+def get_topic_details(topic_id, topics_list):
+    """Retrieves the full topic dictionary from the list."""
+    for topic in topics_list:
+        if topic['topic_id'] == topic_id:
+            return topic
+    return None
 
-def generate_answer(query, rich_context, topic_id):
+def generate_answer(query, rich_context, topic_id, topics_list):
     """
     Constructs prompt with Source Headers and enforces Character Limit.
     """
@@ -473,22 +458,25 @@ def generate_answer(query, rich_context, topic_id):
             break
             
     final_context_str = "".join(formatted_chunks)
+
+    topic_details = get_topic_details(topic_id, topics_list)
+    prompt_filename = "general" # Default generic prompt
+    if topic_details and topic_details.get('prompt'):
+        # Override with topic-specific prompt file if present
+        prompt_filename = topic_details['prompt']
+        log.info(f"Using topic-specific prompt template: {prompt_filename}")
+        
+    log.debug(f"Using prompt template: {prompt_filename}")
+    prompt_template = load_prompt_template(prompt_filename)
     
-    # 2. Prepare Prompt
-    prompt_template = load_prompt_template("generate_answer")
-    
-    # Fetch extra topic info if needed
+        # Fetch extra topic info if needed
     db_conn = get_db_connection()
-    inference_topics = get_inference_topics(db_conn)
-    inference_topics_str = "- " + "\n- ".join(inference_topics)
     if db_conn: db_conn.close()
 
     try:
         prompt = prompt_template.format(
             context_str=final_context_str, 
-            query=query,
-            inference_topics=inference_topics_str,
-            topic=topic_id
+            query=query
         )
     except KeyError as e:
         log.error(f"Prompt template missing key: {e}")
@@ -580,7 +568,7 @@ def chat_handler():
                 "topic": topic_id
             }), 404
 
-        answer = generate_answer(standalone_query, context, topic_id)
+        answer = generate_answer(standalone_query, context, topic_id, topics)
         
         if "could not find an answer" not in answer.lower():
             save_to_semantic_cache(query_vector, standalone_query, answer, sources, topic_id)

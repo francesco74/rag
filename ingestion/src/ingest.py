@@ -39,6 +39,8 @@ from tenacity import (
 CROP_OCR_LIMIT = 50
 VARIANCE_LIMIT = 15
 SLEEP_TIME = 60
+CHUNK_SIZE = 750
+CHUNK_OVERLAP = 150
 
 load_dotenv()
 
@@ -103,8 +105,8 @@ db_config = {
 # --- Text Splitter ---
 text_splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
     encoding_name="cl100k_base", 
-    chunk_size=800, 
-    chunk_overlap=100,
+    chunk_size=CHUNK_SIZE, 
+    chunk_overlap=CHUNK_OVERLAP,
     separators=["\n\n", "\n", ". ", " ", ""]
 )
 

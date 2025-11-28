@@ -4,6 +4,10 @@ FROM python:3.11-slim
 # Set the working directory in the container
 WORKDIR /app
 
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
 # --- Install System Dependencies ---
 # Update package lists and install LibreOffice.
 # Using --no-install-recommends keeps the image size smaller.
