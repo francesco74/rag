@@ -23,7 +23,9 @@ COPY nginx.conf /etc/nginx/conf.d/default.conf
 
 # Copy the built Flutter files from the build stage into the Nginx content directory
 COPY --from=build-stage /app/build/web /usr/share/nginx/html
+COPY docker-entrypoint.sh /docker-entrypoint.sh
+RUN chmod +x /docker-entrypoint.sh
 
 EXPOSE 80
 
-CMD ["nginx", "-g", "daemon off;"]
+ENTRYPOINT ["/docker-entrypoint.sh"]

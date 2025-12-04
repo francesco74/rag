@@ -1,3 +1,17 @@
+import 'dart:js_interop';
+
+// 1. Declare the global object (ENV_CONFIG)
+// @JS() is used to indicate a global scope definition.
+@JS('ENV_CONFIG')
+external EnvConfigJS? get envConfigJS;
+
+// 2. Define the structure of the JavaScript object
+@JS()
+extension type EnvConfigJS._(JSObject _) implements JSObject {
+  external String? get DOCUMENT_URL;
+  external String? get REST_URL;
+}
+
 class AppSettings {
   
   //static const String _productionApiUrl = "http://ia.intranet.provincia.lucca/api";
@@ -7,14 +21,19 @@ class AppSettings {
   static const String _downloadDocumentUrl = "http://127.0.0.1:5000";
   
 
-  /// Determines the correct API URL for the web app.
   static String get apiUrl {
-    // When running in development/debug mode, use the debug URL.
-    return _productionApiUrl;
+    // Read from JavaScript first (Runtime value)
+    final runtimeValue = envConfigJS?.REST_URL;
+    
+    // If the runtime value is missing or null, fall back to the safe default
+    return runtimeValue ?? _productionApiUrl;
   }
 
   static String get downloadDocumentUrl {
-    // When running in development/debug mode, use the debug URL.
-    return _downloadDocumentUrl;
+    // Read from JavaScript first (Runtime value)
+    final runtimeValue = envConfigJS?.DOCUMENT_URL;
+    
+    // If the runtime value is missing or null, fall back to the safe default
+    return runtimeValue ?? _downloadDocumentUrl;
   }
 }

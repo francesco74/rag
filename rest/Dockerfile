@@ -20,23 +20,15 @@ COPY requirements.txt .
 # --no-cache-dir is used to keep the image size down
 RUN pip install --no-cache-dir -r requirements.txt
 
+RUN python -c "from sentence_transformers.cross_encoder import CrossEncoder; CrossEncoder('BAAI/bge-reranker-v2-m3', max_length=1024)"
+
 # --- Copy Application Code ---
 # Copy the rest of the application code into the container
-COPY src/app.py .
+COPY src/. .
 
 # --- Configure and Run ---
 # Make port 8080 available to the world outside this container
 EXPOSE 8080
-
-# Define the environment variable for the API key (to be set at runtime)
-ENV GOOGLE_API_KEY=""
-ENV LOG_LEVEL=""
-ENV DB_HOST=""
-ENV DB_USER=""
-ENV DB_PASS=""
-ENV DB_NAME=""
-ENV QDRANT_HOST=""
-ENV QDRANT_PORT=""
 
 # Make port 8080 available to the world outside this container
 EXPOSE 5000

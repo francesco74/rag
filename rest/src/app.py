@@ -23,9 +23,10 @@ PROMPTS_DIR = os.path.join(os.path.dirname(__file__), 'prompts')
 load_dotenv()
 
 # Set log level from environment variable, default to INFO
-log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
+LOG_LEVEL_STR = os.environ.get("LOG_LEVEL", "INFO").upper()
+LOG_LEVEL = getattr(logging, LOG_LEVEL_STR, logging.INFO)
 logging.basicConfig(
-    level=log_level,
+    level=LOG_LEVEL,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[logging.StreamHandler()]  # Log to console
 )
@@ -78,7 +79,7 @@ try:
         raise ValueError("GOOGLE_API_KEY not set in .env file")
     genai.configure(api_key=GOOGLE_API_KEY)
     
-    EMBEDDING_MODEL = "text-embedding-004"
+    EMBEDDING_MODEL = "gemini-embedding-001"
     TRANSFORM_MODEL = genai.GenerativeModel("gemini-2.5-flash")
     ROUTER_MODEL = genai.GenerativeModel("gemini-2.5-flash")
     GENERATOR_MODEL = genai.GenerativeModel("gemini-2.5-flash")
@@ -305,7 +306,8 @@ def embed_query(query):
         result = genai.embed_content(
             model=EMBEDDING_MODEL,
             content=query,
-            task_type="RETRIEVAL_QUERY"
+            task_type="RETRIEVAL_QUERY",
+            generation_config={"output_dimensionality": 768}
         )
         log.debug("Query successfully embedded.")
         return result['embedding']
@@ -643,4 +645,4 @@ def feedback_handler():
 
 if __name__ == "__main__":
     log.info("Starting Flask RAG API server...")
-    app.run(host="0.0.0.0", port=5000)
+    app.run(debug=(LOG_LEVEL_STR == 'DEBUG'), host="0.0.0.0", port=5000)

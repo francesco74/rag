@@ -74,7 +74,7 @@ try:
     genai.configure(api_key=GOOGLE_API_KEY)
     
     OCR_MODEL_NAME = "gemini-2.5-flash"
-    EMBEDDING_MODEL_NAME = "text-embedding-004"
+    EMBEDDING_MODEL_NAME = "gemini-embedding-001"
     
     log.info(f"AI Clients Init: OCR={OCR_MODEL_NAME}, Embed={EMBEDDING_MODEL_NAME}")
 except Exception as e:
@@ -251,7 +251,8 @@ async def async_embed_batch(batch_texts):
             genai.embed_content,
             model=EMBEDDING_MODEL_NAME,
             content=batch_texts,
-            task_type="RETRIEVAL_DOCUMENT"
+            task_type="RETRIEVAL_DOCUMENT",
+            generation_config={"output_dimensionality": 768}
         )
         return result['embedding']
 
@@ -392,25 +393,23 @@ def initialize_qdrant_collection():
 async def main_loop():
     log.info("--- Async Ingestion Service Started ---")
     
-    while True:
-        try:
-            folders = [f for f in os.listdir(WATCH_FOLDER) if os.path.isdir(os.path.join(WATCH_FOLDER, f))]
-            
-            if not folders:
-                await asyncio.sleep(SLEEP_TIME)
-                continue
-
-            for topic_id in folders:
-                await process_topic_folder_async(topic_id, os.path.join(WATCH_FOLDER, topic_id))
-            
+    try:
+        folders = [f for f in os.listdir(WATCH_FOLDER) if os.path.isdir(os.path.join(WATCH_FOLDER, f))]
+        
+        if not folders:
             await asyncio.sleep(SLEEP_TIME)
+            exit(0)
 
-        except asyncio.CancelledError:
-            log.info("Service stopping...")
-            break
-        except Exception as e:
-            log.error(f"Main Loop Error: {e}", exc_info=True)
-            await asyncio.sleep(10)
+        for topic_id in folders:
+            await process_topic_folder_async(topic_id, os.path.join(WATCH_FOLDER, topic_id))
+        
+        await asyncio.sleep(SLEEP_TIME)
+
+    except asyncio.CancelledError:
+        log.info("Service stopping...")
+        
+    except Exception as e:
+        log.error(f"Main Loop Error: {e}", exc_info=True)
 
 if __name__ == "__main__":
     initialize_qdrant_collection()
