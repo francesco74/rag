@@ -252,7 +252,7 @@ async def async_embed_batch(batch_texts):
             model=EMBEDDING_MODEL_NAME,
             content=batch_texts,
             task_type="RETRIEVAL_DOCUMENT",
-            generation_config={"output_dimensionality": 768}
+            output_dimensionality=768
         )
         return result['embedding']
 

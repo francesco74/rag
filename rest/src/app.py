@@ -32,7 +32,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("app")
 
-log.info(f"Logging level set to {log_level}")
+log.info(f"Logging level set to {LOG_LEVEL_STR}")
 # ==============================================================================
 # 2. INITIALIZE CLIENTS AND CONSTANTS
 # ==============================================================================
@@ -102,9 +102,21 @@ except Exception as e:
     log.critical(f"Failed to load cross-encoder: {e}")
     RERANKER_MODEL = None
 
-# ==============================================================================
-# 3. HELPER FUNCTIONS (Database, Logging, AI)
-# ==============================================================================
+@app.before_request
+def start_timer_and_add_id():
+    request.request_id = str(uuid.uuid4())
+    request.start_time = time.time()
+    log.debug(f"[{request.request_id}] START {request.method} {request.path}")
+
+
+@app.after_request
+def log_response(response):
+    duration = time.time() - request.start_time
+    log.debug(
+        f"[{request.request_id}] END status={response.status_code} "
+        f"time={duration:.3f}s"
+    )
+    return response
 
 def load_prompt_template(filename):
     """Reads a text file from the prompts directory."""
@@ -307,7 +319,7 @@ def embed_query(query):
             model=EMBEDDING_MODEL,
             content=query,
             task_type="RETRIEVAL_QUERY",
-            generation_config={"output_dimensionality": 768}
+            output_dimensionality=768
         )
         log.debug("Query successfully embedded.")
         return result['embedding']
