@@ -6,7 +6,6 @@ Autore: AI Assistant (Basato su Specifiche Progetto)
 Il progetto è implementato come un'architettura a microservizi disaccoppiati, incentrata sul paradigma RAG (Retrieval-Augmented Generation) per fornire risposte basate su una knowledge base proprietaria.
 1.1 Diagramma dei Componenti
 Il sistema si compone di tre moduli applicativi principali e tre servizi di data storage:
-
 | Modulo Applicativo | Funzione | Linguaggio/Framework | Modello AI |
 |---|---|---|---|
 | Ingestion Worker | Estrazione, Chunking, Vettorizzazione. | Python (Asincrono) | Gemini 2.5 Flash (OCR), Gemini Embedding 001 |
