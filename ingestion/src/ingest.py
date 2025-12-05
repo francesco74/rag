@@ -9,6 +9,8 @@ import hashlib
 import mysql.connector
 import numpy as np
 from dotenv import load_dotenv
+# Add this to your imports
+from google.api_core import exceptions as google_exceptions
 
 # Image & PDF Processing
 import fitz  # PyMuPDF
@@ -115,8 +117,8 @@ text_splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
 # 2. ASYNC CONTROLS
 # ==============================================================================
 
-CONCURRENCY_LIMIT = asyncio.Semaphore(5)
-GEMINI_LIMITER = AsyncLimiter(max_rate=60, time_period=60)
+CONCURRENCY_LIMIT = asyncio.Semaphore(2)
+GEMINI_LIMITER = AsyncLimiter(max_rate=10, time_period=60)
 
 # ==============================================================================
 # 3. HELPER FUNCTIONS
@@ -245,9 +247,23 @@ async def async_ocr_generate(image_input):
         )
         return clean_text(response.text.strip())
 
-@retry(wait=wait_exponential(multiplier=1, min=2, max=60), stop=stop_after_attempt(5), reraise=True)
+# Update the retry decorator to catch ResourceExhausted
+@retry(
+    retry=retry_if_exception_type((
+        google_exceptions.ResourceExhausted, 
+        google_exceptions.ServiceUnavailable,
+        TimeoutError
+    )),
+    wait=wait_exponential(multiplier=2, min=5, max=120), # Wait longer (up to 2 mins)
+    stop=stop_after_attempt(10), # Try more times before giving up
+    reraise=True
+)
 async def async_embed_batch(batch_texts):
     async with GEMINI_LIMITER:
+        # Check if the batch is empty to save an API call
+        if not batch_texts: 
+            return []
+            
         result = await asyncio.to_thread(
             genai.embed_content,
             model=EMBEDDING_MODEL_NAME,
@@ -350,8 +366,8 @@ async def process_topic_folder_async(topic_id, folder_path):
     files = [f for f in os.listdir(folder_path) if os.path.isfile(os.path.join(folder_path, f))]
     if not files: return
 
-    dest_proc = PROCESSED_FOLDER / topic_id
-    dest_err = ERROR_FOLDER / topic_id
+    dest_proc = os.path.join(PROCESSED_FOLDER, topic_id)
+    dest_err = os.path.join(ERROR_FOLDER, topic_id)
     os.makedirs(dest_proc, exist_ok=True)
     os.makedirs(dest_err, exist_ok=True)
 
@@ -368,6 +384,7 @@ async def process_topic_folder_async(topic_id, folder_path):
             safe_move_file(src, dest_err)
 
     if success_count > 0:
+        log.info(f"--- Creating topic {topic_id} ---")
         await asyncio.to_thread(register_topic_safe, topic_id)
 
     if not os.listdir(folder_path):
