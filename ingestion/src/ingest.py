@@ -56,9 +56,10 @@ logging.basicConfig(
 log = logging.getLogger("IngestWorker")
 
 # Directories
-WATCH_FOLDER = BASE_DIR / os.environ.get("WATCH_FOLDER", "./watch_folders/")
-PROCESSED_FOLDER = BASE_DIR / os.environ.get("PROCESSED_FOLDER", "./processed_folders/")
-ERROR_FOLDER = BASE_DIR / os.environ.get("ERROR_FOLDER", "./error_folders/")
+DATA_FOLDER = os.environ.get("DATA_FOLDER", BASE_DIR)
+WATCH_FOLDER = os.path.join(DATA_FOLDER, "watch")
+PROCESSED_FOLDER = os.path.join(DATA_FOLDER, "processed")
+ERROR_FOLDER = os.path.join(DATA_FOLDER, "error")
 
 for folder in [WATCH_FOLDER, PROCESSED_FOLDER, ERROR_FOLDER]:
     os.makedirs(folder, exist_ok=True)
