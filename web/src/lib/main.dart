@@ -545,7 +545,7 @@ class _ChatScreenState extends State<ChatScreen> {
 
               // Construct the Nginx URL
               final String url =
-                  "http://ia-download.intranet.provincia.lucca/downloads/$topic/$fileName";
+                  "${AppSettings.downloadDocumentUrl}/$topic/$fileName";
 
               // Wrapper to enable cursor change on hover
               return MouseRegion(
