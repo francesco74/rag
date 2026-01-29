@@ -5,12 +5,13 @@ import logging
 import uuid
 import pathlib
 import asyncio
-import hashlib
 import mysql.connector
 import numpy as np
+import requests
+import trafilatura
+from urllib.parse import urlparse, urljoin
 from dotenv import load_dotenv
-# Add this to your imports
-from google.api_core import exceptions as google_exceptions
+
 
 # Image & PDF Processing
 import fitz  # PyMuPDF
@@ -20,7 +21,8 @@ from PIL import Image
 import google.generativeai as genai
 
 # Vector DB
-from qdrant_client import QdrantClient, models
+from qdrant_client import models
+from qdrant_client import AsyncQdrantClient
 
 # Text Splitting
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -30,22 +32,29 @@ from aiolimiter import AsyncLimiter
 from tenacity import (
     retry,
     stop_after_attempt,
-    wait_exponential,
+    wait_random_exponential,
     retry_if_exception_type
 )
+from google.api_core.exceptions import ResourceExhausted, ServiceUnavailable
+
 
 # ==============================================================================
-# 1. CONFIGURATION & SETUP
+# 1. CONFIGURATION & LOGGING SETUP
 # ==============================================================================
+
+GEMINI_RETRY = retry(
+    retry=retry_if_exception_type((ResourceExhausted, ServiceUnavailable)),
+    wait=wait_random_exponential(multiplier=2, max=60),
+    stop=stop_after_attempt(6),
+    before_sleep=lambda retry_state: log.warning(f"Rate limit hit. Retrying in {retry_state.next_action.sleep}s...")
+)
 
 CROP_OCR_LIMIT = 50
 VARIANCE_LIMIT = 15
-SLEEP_TIME = 60
 CHUNK_SIZE = 750
 CHUNK_OVERLAP = 150
 
 load_dotenv()
-
 BASE_DIR = pathlib.Path(__file__).parent.resolve()
 
 # Logging Configuration
@@ -57,46 +66,38 @@ logging.basicConfig(
 )
 log = logging.getLogger("IngestWorker")
 
-# Directories
-DATA_FOLDER = os.environ.get("DATA_FOLDER", BASE_DIR)
-WATCH_FOLDER = os.path.join(DATA_FOLDER, "watch")
-PROCESSED_FOLDER = os.path.join(DATA_FOLDER, "processed")
-ERROR_FOLDER = os.path.join(DATA_FOLDER, "error")
+# --- DIRECTORY CREATION LOGIC ---
+DATA_FOLDER = pathlib.Path(os.environ.get("DATA_FOLDER", str(BASE_DIR)))
+WATCH_FOLDER = DATA_FOLDER / "watch"
+PROCESSED_FOLDER = DATA_FOLDER / "processed"
+ERROR_FOLDER = DATA_FOLDER / "error"
 
-for folder in [WATCH_FOLDER, PROCESSED_FOLDER, ERROR_FOLDER]:
-    os.makedirs(folder, exist_ok=True)
+# Ensure all directories exist
+for folder in [DATA_FOLDER, WATCH_FOLDER, PROCESSED_FOLDER, ERROR_FOLDER]:
+    if not folder.exists():
+        log.info(f"Creating directory: {folder}")
+        folder.mkdir(parents=True, exist_ok=True)
 
-log.info(f"Monitoring: {WATCH_FOLDER}")
+log.info(f"System paths initialized. Monitoring: {WATCH_FOLDER}")
 
 # --- Google AI Configuration ---
 try:
     GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
-    if not GOOGLE_API_KEY:
-        raise ValueError("GOOGLE_API_KEY is missing.")
-    
     genai.configure(api_key=GOOGLE_API_KEY)
-    
     OCR_MODEL_NAME = "gemini-2.5-flash"
     EMBEDDING_MODEL_NAME = "gemini-embedding-001"
-    
-    log.info(f"AI Clients Init: OCR={OCR_MODEL_NAME}, Embed={EMBEDDING_MODEL_NAME}")
+    log.debug(f"AI Models: OCR={OCR_MODEL_NAME}, Embed={EMBEDDING_MODEL_NAME}")
 except Exception as e:
-    log.critical(f"Google AI Init Failed: {e}")
-    exit(1)
+    log.critical(f"Google AI Init Failed: {e}"); exit(1)
 
 # --- Qdrant Configuration ---
-QDRANT_HOST = os.environ.get("QDRANT_HOST", "localhost")
-QDRANT_PORT = int(os.environ.get("QDRANT_PORT", 6333))
-QDRANT_COLLECTION = "document_chunks"
-
 try:
-    qdrant_client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
-    log.info(f"Qdrant Connected: {QDRANT_HOST}:{QDRANT_PORT}")
+    qdrant_client = AsyncQdrantClient(host=os.environ.get("QDRANT_HOST", "localhost"), port=int(os.environ.get("QDRANT_PORT", 6333)))
+    QDRANT_COLLECTION = "document_chunks"
+    CACHE_COLLECTION = "semantic_cache"
 except Exception as e:
-    log.critical(f"Qdrant Init Failed: {e}")
-    exit(1)
+    log.critical(f"Qdrant Init Failed: {e}"); exit(1)
 
-# --- MySQL Configuration ---
 db_config = {
     "host": os.environ.get("DB_HOST", "localhost"),
     "user": os.environ.get("DB_USER"),
@@ -105,333 +106,339 @@ db_config = {
     "connect_timeout": 10
 }
 
-# --- Text Splitter ---
 text_splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
-    encoding_name="cl100k_base", 
-    chunk_size=CHUNK_SIZE, 
-    chunk_overlap=CHUNK_OVERLAP,
+    encoding_name="cl100k_base", chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP,
     separators=["\n\n", "\n", ". ", " ", ""]
 )
-
-# ==============================================================================
-# 2. ASYNC CONTROLS
-# ==============================================================================
 
 CONCURRENCY_LIMIT = asyncio.Semaphore(2)
 GEMINI_LIMITER = AsyncLimiter(max_rate=10, time_period=60)
 
 # ==============================================================================
-# 3. HELPER FUNCTIONS
+# 2. HELPER FUNCTIONS
 # ==============================================================================
 
-def get_db_connection():
+async def initialize_qdrant_collection():
     try:
-        return mysql.connector.connect(**db_config)
-    except mysql.connector.Error as err:
-        log.error(f"MySQL Connect Error: {err}")
+        if not await qdrant_client.collection_exists(QDRANT_COLLECTION):
+            log.info(f"Initial setup: Creating Qdrant collection '{QDRANT_COLLECTION}'")
+            await qdrant_client.create_collection(
+                collection_name=QDRANT_COLLECTION,
+                vectors_config=models.VectorParams(size=768, distance=models.Distance.COSINE)
+            )
+            
+            # Create indexes for faster retrieval filtering
+            await qdrant_client.create_payload_index(QDRANT_COLLECTION, "topic_id", models.PayloadSchemaType.KEYWORD)
+            await qdrant_client.create_payload_index(QDRANT_COLLECTION, "source", models.PayloadSchemaType.KEYWORD)
+            log.info("Qdrant Collection and Indexes Initialized.")
+
+        # 2. Initialize Semantic Cache Collection
+        # Note: CACHE_COLLECTION should be defined as "semantic_cache"
+        if not await qdrant_client.collection_exists(CACHE_COLLECTION):
+            log.info(f"Initial setup: Creating Cache collection '{CACHE_COLLECTION}'")
+            await qdrant_client.create_collection(
+                collection_name=CACHE_COLLECTION,
+                vectors_config=models.VectorParams(
+                    size=768, 
+                    distance=models.Distance.COSINE
+                )
+            )
+            # Index topic in cache to allow topic-specific cache clearing if needed
+            await qdrant_client.create_payload_index(CACHE_COLLECTION, "topic", models.PayloadSchemaType.KEYWORD)
+            log.info(f"Cache collection '{CACHE_COLLECTION}' initialized.")
+    except Exception as e:
+        log.error(f"Qdrant Setup Error: {e}")
+
+def get_db_connection():
+    try: return mysql.connector.connect(**db_config)
+    except Exception as e: 
+        log.warning(f"Database connection failed: {e}")
         return None
 
 def register_topic_safe(topic_id):
     conn = get_db_connection()
     if not conn: return False
-    
-    description = f"Documents related to {topic_id.replace('_', ' ').title()}"
-    sql = """
-    INSERT INTO topics (topic_id, description) 
-    VALUES (%s, %s)
-    ON DUPLICATE KEY UPDATE description = VALUES(description)
-    """
     try:
         with conn.cursor() as cursor:
-            cursor.execute(sql, (topic_id, description))
+            cursor.execute("INSERT INTO topics (topic_id, description) VALUES (%s, %s) ON DUPLICATE KEY UPDATE topic_id=topic_id", 
+                           (topic_id, f"Knowledge base for {topic_id}"))
             conn.commit()
-        log.info(f"Topic '{topic_id}' synced to DB.")
+        log.info(f"Topic metadata synced: {topic_id}")
         return True
-    except Exception as e:
-        log.error(f"MySQL Write Error: {e}")
+    except Exception as e: 
+        log.error(f"MySQL Registration Error: {e}")
         return False
-    finally:
-        conn.close()
+    finally: conn.close()
 
 def safe_move_file(src_path, dest_folder):
-    """Safely moves a file, overwriting if it exists."""
     try:
-        filename = os.path.basename(src_path)
-        dest_path = os.path.join(dest_folder, filename)
-        
-        # If file exists in destination, remove it first to ensure overwrite
-        if os.path.exists(dest_path):
-            os.remove(dest_path)
-            
-        shutil.move(src_path, dest_path)
-    except Exception as e:
-        log.error(f"Failed to move {src_path} to {dest_folder}: {e}")
+        src = pathlib.Path(src_path)
+        dest = pathlib.Path(dest_folder) / src.name
+        if dest.exists(): dest.unlink()
+        shutil.move(str(src), str(dest))
+        log.debug(f"Cleanup: Moved {src.name} to {dest.parent.name}")
+    except Exception as e: log.error(f"File Management Error: {e}")
 
 def clean_text(text):
-    """Cleans text to improve RAG quality."""
     if not text: return ""
-    # Fix hyphenated words at line breaks (e.g. "integ-\nration" -> "integration")
-    text = text.replace("-\n", "")
-    # Remove excessive whitespace
-    text = " ".join(text.split())
-    return text
-
-async def wait_for_file_stability(file_path, timeout=10):
-    """Waits until file size stops changing (file is fully copied)."""
-    start_time = time.time()
-    last_size = -1
-    
-    while True:
-        try:
-            current_size = os.path.getsize(file_path)
-        except FileNotFoundError:
-            return False # File disappeared
-
-        if current_size == last_size:
-            return True # Size hasn't changed in 1 second, it's stable
-        
-        last_size = current_size
-        
-        if time.time() - start_time > timeout:
-            log.error(f"File {file_path} is unstable (still copying?)")
-            return False
-            
-        await asyncio.sleep(1)
+    return " ".join(text.replace("-\n", "").split())
 
 def extract_text_from_pdf_sync(file_path):
     text_by_page = []
+    log.debug(f"Starting PDF Extraction: {pathlib.Path(file_path).name}")
     try:
         with fitz.open(file_path) as doc:
             for page_num, page in enumerate(doc):
                 rect = page.rect
-                
-                if rect.height > 200:
-                    clip_rect = fitz.Rect(0, CROP_OCR_LIMIT, rect.width, rect.height - CROP_OCR_LIMIT)
-                else:
-                    clip_rect = rect
-
-                # 1. Digital Text
+                clip_rect = fitz.Rect(0, CROP_OCR_LIMIT, rect.width, rect.height - CROP_OCR_LIMIT) if rect.height > 200 else rect
                 page_text = page.get_text(sort=True, clip=clip_rect).strip()
                 
-                # 2. Heuristic Check
                 if len(page_text) < 50:
-                    mat = fitz.Matrix(2, 2)
-                    pix = page.get_pixmap(matrix=mat, alpha=False, clip=clip_rect)
+                    log.debug(f"Page {page_num+1} triggered OCR (low text density)")
+                    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False, clip=clip_rect)
                     img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-                    
-                    stat = np.array(img.convert('L'))
-                    if stat.std() < VARIANCE_LIMIT:
-                        log.debug(f"Page {page_num+1} seems blank. Skipping.")
-                        continue
-
-                    text_by_page.append((page_num + 1, img))
+                    if np.array(img.convert('L')).std() > VARIANCE_LIMIT:
+                        text_by_page.append((page_num + 1, img))
                 else:
-                    # Apply Text Cleaning here
-                    cleaned_text = clean_text(page_text)
-                    if cleaned_text:
-                        text_by_page.append((page_num + 1, cleaned_text))
-                    
+                    text_by_page.append((page_num + 1, clean_text(page_text)))
         return text_by_page
     except Exception as e:
-        log.error(f"PDF Read Error {file_path}: {e}")
-        return []
+        log.error(f"Critical PDF Read Error {file_path}: {e}"); return []
 
-# --- Async Gemini Wrappers ---
+def download_linked_file(url, topic_folder):
+    log.info(f"Scraper: Downloading linked asset -> {url}")
+    try:
+        response = requests.get(url, stream=True, timeout=15)
+        if response.status_code == 200:
+            filename = os.path.basename(urlparse(url).path) or f"dl_{uuid.uuid4().hex[:8]}"
+            save_path = topic_folder / filename
+            with open(save_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192): f.write(chunk)
+            with open(str(save_path) + ".meta", "w", encoding="utf-8") as f: f.write(url)
+            return filename
+    except Exception as e: log.warning(f"Failed asset download: {e}")
+    return None
 
-@retry(wait=wait_exponential(multiplier=1, min=2, max=60), stop=stop_after_attempt(5), reraise=True)
+def scrape_web_page(url, topic_folder):
+    log.info(f"Scraper: Analyzing URL -> {url}")
+    try:
+        html = trafilatura.fetch_url(url)
+        if not html: return None
+        main_text = trafilatura.extract(html, include_comments=False)
+        import re
+        links = re.findall(r'href=[\'"]?([^\'" >]+)', html)
+        for link in links:
+            if link.lower().endswith('.pdf'):
+                download_linked_file(urljoin(url, link), topic_folder)
+        return main_text
+    except Exception as e:
+        log.error(f"Scraper Logic Error: {e}")
+        return None
+
+# ==============================================================================
+# 3. ASYNC WRAPPERS (WITH 429 LOGGING)
+# ==============================================================================
+
+@GEMINI_RETRY
 async def async_ocr_generate(image_input):
     async with GEMINI_LIMITER:
+        log.debug("API Call: Gemini Vision OCR")
         model = genai.GenerativeModel(OCR_MODEL_NAME)
-        response = await model.generate_content_async(
-            ["Transcribe this image exactly. Do not say 'Here is the text'.", image_input]
-        )
+        response = await model.generate_content_async(["Transcribe this document image precisely:", image_input])
         return clean_text(response.text.strip())
 
-# Update the retry decorator to catch ResourceExhausted
-@retry(
-    retry=retry_if_exception_type((
-        google_exceptions.ResourceExhausted, 
-        google_exceptions.ServiceUnavailable,
-        TimeoutError
-    )),
-    wait=wait_exponential(multiplier=2, min=5, max=120), # Wait longer (up to 2 mins)
-    stop=stop_after_attempt(10), # Try more times before giving up
-    reraise=True
-)
+@GEMINI_RETRY
 async def async_embed_batch(batch_texts):
+    if not batch_texts: return []
     async with GEMINI_LIMITER:
-        # Check if the batch is empty to save an API call
-        if not batch_texts: 
-            return []
-            
-        result = await asyncio.to_thread(
-            genai.embed_content,
-            model=EMBEDDING_MODEL_NAME,
-            content=batch_texts,
-            task_type="RETRIEVAL_DOCUMENT",
-            output_dimensionality=768
-        )
+        log.debug(f"API Call: Embedding {len(batch_texts)} chunks")
+        result = await asyncio.to_thread(genai.embed_content, model=EMBEDDING_MODEL_NAME, content=batch_texts, 
+                                            task_type="RETRIEVAL_DOCUMENT", output_dimensionality=768)
         return result['embedding']
+        
 
 # ==============================================================================
-# 4. CORE PIPELINE
+# 4. PIPELINE
 # ==============================================================================
 
-async def process_single_file_async(topic_id, file_path):
+async def process_single_file_async(topic_id, file_path, root_folder):
     async with CONCURRENCY_LIMIT:
-        filename = os.path.basename(file_path)
-        log.info(f"Processing: {filename}")
+        file_path = pathlib.Path(file_path)
+        filename = file_path.name
+        meta_path = file_path.with_suffix(file_path.suffix + ".meta")
 
-        if not await wait_for_file_stability(file_path):
-            return False
-        
-        extracted_content = []
-        
         try:
-            # --- 1. EXTRACTION ---
+            relative_path_str = str(file_path.relative_to(root_folder)).replace("\\", "/")
+        except ValueError:
+            relative_path_str = filename # Fallback if path logic fails
+        
+        origin_url = None
+        if meta_path.exists():
+            with open(meta_path, 'r') as f: origin_url = f.read().strip()
+            meta_path.unlink()
+
+        source_name = origin_url if origin_url else relative_path_str
+        log.info(f"--- Processing: {source_name} ---")
+
+        try:
+            full_text = ""
             if filename.lower().endswith(".pdf"):
-                raw_pages = await asyncio.to_thread(extract_text_from_pdf_sync, file_path)
-                
-                for page_num, item in raw_pages:
-                    if isinstance(item, str):
-                        extracted_content.append(item)
-                    elif isinstance(item, Image.Image):
-                        log.info(f"OCR scanning page {page_num} of {filename}...")
-                        text = await async_ocr_generate(item)
-                        if text: extracted_content.append(text)
-
+                pages = await asyncio.to_thread(extract_text_from_pdf_sync, str(file_path))
+                texts = []
+                for p_num, item in pages:
+                    texts.append(item if isinstance(item, str) else await async_ocr_generate(item))
+                full_text = "\n\n".join(texts)
             elif filename.lower().endswith((".png", ".jpg", ".jpeg")):
-                img = await asyncio.to_thread(Image.open, file_path)
-                text = await async_ocr_generate(img)
-                if text: extracted_content.append(text)
+                full_text = await async_ocr_generate(Image.open(file_path))
+            elif filename.lower().endswith(".txt"):
+                with open(file_path, 'r', encoding='utf-8') as f: full_text = f.read()
+
+            if not full_text: 
+                log.warning(f"Skipping {filename}: No readable text.")
+                return False
             
-            else:
-                log.warning(f"Skipping unsupported type: {filename}")
-                return False
+            # Creates 'file.jpg.ocr' containing the raw text
+            ocr_path = file_path.with_suffix(file_path.suffix + ".ocr")
+            with open(ocr_path, "w", encoding="utf-8") as f_ocr:
+                f_ocr.write(full_text)
+            log.debug(f"Saved OCR result to {ocr_path.name}")
+            # -----------------------------------------
 
-            full_text = "\n\n".join([t for t in extracted_content if t])
-            if not full_text:
-                log.warning(f"No text extracted: {filename}")
-                return False
-
-            # --- 2. CHUNKING ---
             chunks = text_splitter.split_text(full_text)
-            if not chunks: return False
-
-            # --- 3. EMBEDDING ---
-            all_vectors = []
-            batch_size = 50 
+            log.debug(f"Document chunked: {len(chunks)} segments")
             
-            for i in range(0, len(chunks), batch_size):
-                batch = chunks[i:i+batch_size]
-                batch_vectors = await async_embed_batch(batch)
-                all_vectors.extend(batch_vectors)
+            all_vectors = []
+            for i in range(0, len(chunks), 50):
+                all_vectors.extend(await async_embed_batch(chunks[i:i+50]))
 
-            # --- 4. UPSERTING ---
-            points = []
-            for i, vector in enumerate(all_vectors):
-                unique_sig = f"{topic_id}_{filename}_{i}"
-                chunk_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, unique_sig))
-
-                points.append(models.PointStruct(
-                    id=chunk_id, 
-                    vector=vector,
+            points = [
+                models.PointStruct(
+                    id=str(uuid.uuid4()), 
+                    vector=vec, 
                     payload={
-                        "topic_id": topic_id,
-                        "source_file": filename,
-                        "chunk_index": i,
-                        "content": chunks[i]
+                        "topic_id": topic_id, 
+                        "source": source_name, 
+                        "chunk_index": idx, 
+                        "content": chunks[idx]
                     }
-                ))
-
-            UPSERT_BATCH_SIZE = 100
-            for i in range(0, len(points), UPSERT_BATCH_SIZE):
-                sub_points = points[i : i + UPSERT_BATCH_SIZE]
-                await asyncio.to_thread(
-                    qdrant_client.upsert,
+                )
+                for idx, vec in enumerate(all_vectors)
+            ]
+            
+            # Before upserting loop
+            log.info(f"Removing existing chunks for source: {source_name}")
+            await qdrant_client.delete(
+                collection_name=QDRANT_COLLECTION,
+                points_selector=models.FilterSelector(  
+                    filter=models.Filter(
+                        must=[
+                            models.FieldCondition(
+                                key="source",
+                                match=models.MatchValue(value=source_name)
+                            )
+                        ]
+                    )
+                )
+            )
+            
+            for i in range(0, len(points), 100):
+                await qdrant_client.upsert(
                     collection_name=QDRANT_COLLECTION,
-                    points=sub_points
+                    points=points[i:i+100]
                 )
             
-            log.info(f"✅ Indexed {len(points)} chunks: {filename}")
+            log.info(f"Success: Indexed {filename}")
             return True
-
         except Exception as e:
-            log.error(f"❌ Failed {filename}: {e}")
-            return False
+            log.error(f"Process Failure {filename}: {e}", exc_info=True); return False
 
 async def process_topic_folder_async(topic_id, folder_path):
-    log.info(f"--- Topic: {topic_id} ---")
+    folder_path = pathlib.Path(folder_path)
+    log.info(f"====== Topic Start: {topic_id} ======")
     
-    files = [f for f in os.listdir(folder_path) if os.path.isfile(os.path.join(folder_path, f))]
-    if not files: return
+    # 1. URL Batch (PARALLELIZED)
+    url_file = folder_path / "urls.txt"
+    if url_file.exists():
+        log.info(f"Scraping URLs from {url_file.name}")
+        with open(url_file, 'r') as f:
+            urls = [l.strip() for l in f if l.strip().startswith("http")]
 
-    dest_proc = os.path.join(PROCESSED_FOLDER, topic_id)
-    dest_err = os.path.join(ERROR_FOLDER, topic_id)
-    os.makedirs(dest_proc, exist_ok=True)
-    os.makedirs(dest_err, exist_ok=True)
+        # Wrapper for parallel execution
+        async def process_url(u):
+            return u, await asyncio.to_thread(scrape_web_page, u, folder_path)
 
-    tasks = [process_single_file_async(topic_id, os.path.join(folder_path, f)) for f in files]
+        # Run all scrapes concurrently
+        url_tasks = [process_url(u) for u in urls]
+        url_results = await asyncio.gather(*url_tasks)
+
+        for url, text in url_results:
+            if text:
+                v_name = f"web_{uuid.uuid4().hex[:8]}.txt"
+                v_path = folder_path / v_name
+                with open(v_path, 'w', encoding='utf-8') as f_v: f_v.write(text)
+                with open(str(v_path) + ".meta", 'w', encoding='utf-8') as f_m: f_m.write(url)
+        
+        await asyncio.to_thread(safe_move_file, str(url_file), PROCESSED_FOLDER / topic_id)
+
+    # 2. File Batch
+    all_files = [
+        p for p in folder_path.rglob("*") 
+        if p.is_file() and not p.name.endswith(".meta") and p.name != "urls.txt"
+    ]
+    
+    if not all_files:
+        log.info(f"No files found in {topic_id} (checked subdirectories).")
+    else:
+        log.info(f"Found {len(all_files)} files to ingest recursively.")
+    
+    tasks = [process_single_file_async(topic_id, p, folder_path) for p in all_files]
     results = await asyncio.gather(*tasks)
 
-    success_count = 0
-    for filename, success in zip(files, results):
-        src = os.path.join(folder_path, filename)
-        if success:
-            safe_move_file(src, dest_proc)
-            success_count += 1
-        else:
-            safe_move_file(src, dest_err)
+    for file_path_obj, success in zip(all_files, results):
+        # Calculate relative path to keep structure (e.g., "sub/image.png")
+        relative_path = file_path_obj.relative_to(folder_path)
+        
+        root_dest = PROCESSED_FOLDER if success else ERROR_FOLDER
+        final_dest = root_dest / topic_id / relative_path
+        
+        # Ensure parent sub-folders exist in destination
+        os.makedirs(final_dest.parent, exist_ok=True)
+        
+        # 1. Move Main File
+        await asyncio.to_thread(safe_move_file, file_path_obj, final_dest.parent)
 
-    if success_count > 0:
-        log.info(f"--- Creating topic {topic_id} ---")
-        await asyncio.to_thread(register_topic_safe, topic_id)
-
-    if not os.listdir(folder_path):
-        os.rmdir(folder_path)
-
-# ==============================================================================
-# 5. MAIN EXECUTION
-# ==============================================================================
-
-def initialize_qdrant_collection():
-    try:
-        if not qdrant_client.collection_exists(QDRANT_COLLECTION):
-            qdrant_client.create_collection(
-                collection_name=QDRANT_COLLECTION,
-                vectors_config=models.VectorParams(size=768, distance=models.Distance.COSINE)
-            )
-            qdrant_client.create_payload_index(QDRANT_COLLECTION, "topic_id", models.PayloadSchemaType.KEYWORD)
-            # Added source_file index for better management later
-            qdrant_client.create_payload_index(QDRANT_COLLECTION, "source_file", models.PayloadSchemaType.KEYWORD)
-            log.info("Qdrant Collection Initialized.")
-    except Exception as e:
-        log.error(f"Qdrant Init Error: {e}")
-
-async def main_loop():
-    log.info("--- Async Ingestion Service Started ---")
+        # 2. Move Sibling OCR File (if it exists)
+        # This looks for 'file.jpg.ocr' created in the previous step
+        ocr_sibling = file_path_obj.with_suffix(file_path_obj.suffix + ".ocr")
+        if ocr_sibling.exists():
+            # It will land in processed/topic/sub/file.jpg.ocr
+            await asyncio.to_thread(safe_move_file, ocr_sibling, final_dest.parent)
     
-    try:
-        folders = [f for f in os.listdir(WATCH_FOLDER) if os.path.isdir(os.path.join(WATCH_FOLDER, f))]
-        
-        if not folders:
-            await asyncio.sleep(SLEEP_TIME)
-            exit(0)
+    if any(results): 
+        # FIX: Syntax for to_thread
+        await asyncio.to_thread(register_topic_safe, topic_id)
+    
+    for root, dirs, files in os.walk(folder_path, topdown=False):
+        for name in dirs:
+            try:
+                os.rmdir(os.path.join(root, name))
+            except OSError:
+                pass # Directory not empty
 
-        for topic_id in folders:
-            await process_topic_folder_async(topic_id, os.path.join(WATCH_FOLDER, topic_id))
-        
-        await asyncio.sleep(SLEEP_TIME)
+    log.info(f"====== Topic End: {topic_id} ======")
 
-    except asyncio.CancelledError:
-        log.info("Service stopping...")
-        
-    except Exception as e:
-        log.error(f"Main Loop Error: {e}", exc_info=True)
+async def main_run():
+    log.info("Ingestion Worker Active - One Shot Run")
+    await initialize_qdrant_collection()
+
+    folders = [f for f in os.listdir(WATCH_FOLDER) if (WATCH_FOLDER / f).is_dir()]
+    if not folders:
+        log.info("No work found in watch folder.")
+        return
+
+    for tid in folders: 
+        await process_topic_folder_async(tid, WATCH_FOLDER / tid)
+    log.info("Run finished.")
 
 if __name__ == "__main__":
-    initialize_qdrant_collection()
-    try:
-        asyncio.run(main_loop())
-    except KeyboardInterrupt:
-        pass
+    asyncio.run(main_run())

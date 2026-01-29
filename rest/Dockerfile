@@ -6,10 +6,12 @@ WORKDIR /app
 
 # --- Install System Dependencies ---
 # Update package lists and install LibreOffice.
-# Using --no-install-recommends keeps the image size smaller.
 # Cleaning up apt lists afterward also reduces image size.
 RUN apt-get update && \
-    apt-get clean && \
+    apt-get install -y --no-install-recommends \
+    gcc \
+    python3-dev \
+    && apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
 # --- Install Python Dependencies ---
@@ -27,11 +29,8 @@ RUN python -c "from sentence_transformers.cross_encoder import CrossEncoder; Cro
 COPY src/. .
 
 # --- Configure and Run ---
-# Make port 8080 available to the world outside this container
-EXPOSE 8080
-
-# Make port 8080 available to the world outside this container
+# Make port 5000 available to the world outside this container
 EXPOSE 5000
 
 # Define the command to run the app using Gunicorn for production
-CMD ["sh", "-c", "gunicorn --workers 4 --bind 0.0.0.0:5000 --timeout 300 app:app"]
+CMD ["sh", "-c", "gunicorn --worker-class gevent --workers 4 --bind 0.0.0.0:5000 --timeout 300 app:app"]
