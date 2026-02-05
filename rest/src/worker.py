@@ -6,9 +6,10 @@ from celery import Celery
 from mysql.connector import pooling
 from qdrant_client import QdrantClient, models
 import google.generativeai as genai
-from sentence_transformers.cross_encoder import CrossEncoder
+from optimum.onnxruntime import ORTModelForSequenceClassification
+from transformers import AutoTokenizer
+import torch
 import random
-
 from dotenv import load_dotenv
 
 from tenacity import (
@@ -20,6 +21,9 @@ from tenacity import (
 from google.api_core.exceptions import ResourceExhausted, ServiceUnavailable
 
 load_dotenv()
+
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
 
 # ==============================================================================
 # 1. CONFIGURATION & LOGGING
@@ -120,17 +124,18 @@ except Exception as e:
     log.critical(f"Failed to initialize Gemini: {e}")
 
 # --- D. Cross-Encoder (The Heavy Lifter) ---
+RERANK_BATCH_SIZE = 32
 RERANKER_MODEL = None
 try:
     log.info("Loading Cross-Encoder model...")
-    # FORCE CPU DEVICE
-    RERANKER_MODEL = CrossEncoder(
-        'BAAI/bge-reranker-v2-m3', 
-        max_length=1024,
-        device="cpu",  # <--- CRITICAL CHANGE
-        automodel_args={"torch_dtype": "auto"} 
+    model_path = "./model_onnx"
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    RERANKER_MODEL = ORTModelForSequenceClassification.from_pretrained(
+        model_path, 
+        provider="CPUExecutionProvider"
     )
-    log.info("Cross-Encoder loaded successfully on CPU.")
+    
+    log.info("RERANKER_MODEL loaded successfully.")
 except Exception as e:
     log.critical(f"Failed to load Cross-Encoder: {e}")
 
@@ -354,10 +359,23 @@ def retrieve_chunks(query, vector, topic_id):
         # 3. Re-ranking
         # ======================================================================
         if RERANKER_MODEL:
-            log.info("Re-ranking candidates...")
+            log.info(f"Re-ranking {len(candidates)} candidates...")
             pairs = [(query, doc.payload.get('content', '')) for doc in candidates]
-            scores = RERANKER_MODEL.predict(pairs)
+            
+            
+            scores = []
+            for i in range(0, len(pairs), RERANK_BATCH_SIZE):
+                batch = pairs[i:i + RERANK_BATCH_SIZE]
+                inputs = tokenizer(batch, padding=True, truncation=True, max_length=512, return_tensors="pt")
+                with torch.no_grad():
+                    outputs = RERANKER_MODEL(**inputs)
+                    batch_scores = outputs.logits.view(-1).float().tolist()
+                    scores.scores.extend(batch_scores)
+
+            # Accoppiamo i punteggi ai documenti e ordiniamo
             scored_docs = sorted(zip(scores, candidates), key=lambda x: x[0], reverse=True)
+            
+            # Prendiamo solo i top richiesti dopo averli processati TUTTI
             top_docs = [doc for score, doc in scored_docs[:RERANK_SIZE]]
         else:
             top_docs = candidates[:RERANK_SIZE]

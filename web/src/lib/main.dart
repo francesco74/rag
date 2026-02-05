@@ -92,7 +92,7 @@ class _ChatScreenState extends State<ChatScreen> {
     _messages.insert(
       0,
       ChatMessage(
-        text: "<p>Hello! Ask me anything about the documents I have.</p>",
+        text: "<p>Ciao! Chiedimi qualunque cosa sui documenti che conosco.</p>",
         isSystemMessage: true,
       ),
     );
@@ -115,7 +115,7 @@ class _ChatScreenState extends State<ChatScreen> {
 
     // Safety 1: Set a maximum timeout (e.g., 60 seconds)
     final DateTime startTime = DateTime.now();
-    const int timeoutSeconds = 60;
+    const int timeoutSeconds = 180;
 
     // Safety 2: Track consecutive network errors to avoid crashing on a single blip
     int consecutiveErrors = 0;

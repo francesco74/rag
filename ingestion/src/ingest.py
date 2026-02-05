@@ -32,8 +32,10 @@ from aiolimiter import AsyncLimiter
 from tenacity import (
     retry,
     stop_after_attempt,
+    wait_exponential,
     wait_random_exponential,
-    retry_if_exception_type
+    retry_if_exception_type,
+    RetryError
 )
 from google.api_core.exceptions import ResourceExhausted, ServiceUnavailable
 
@@ -44,8 +46,8 @@ from google.api_core.exceptions import ResourceExhausted, ServiceUnavailable
 
 GEMINI_RETRY = retry(
     retry=retry_if_exception_type((ResourceExhausted, ServiceUnavailable)),
-    wait=wait_random_exponential(multiplier=2, max=60),
-    stop=stop_after_attempt(6),
+    wait=wait_random_exponential(multiplier=2, min=10, max=80),
+    stop=stop_after_attempt(20),
     before_sleep=lambda retry_state: log.warning(f"Rate limit hit. Retrying in {retry_state.next_action.sleep}s...")
 )
 
@@ -267,14 +269,17 @@ async def process_single_file_async(topic_id, file_path, root_folder):
         filename = file_path.name
         meta_path = file_path.with_suffix(file_path.suffix + ".meta")
 
+        # Fallback relative path string for metadata/source tracking
         try:
             relative_path_str = str(file_path.relative_to(root_folder)).replace("\\", "/")
         except ValueError:
-            relative_path_str = filename # Fallback if path logic fails
+            relative_path_str = filename 
         
         origin_url = None
         if meta_path.exists():
             with open(meta_path, 'r') as f: origin_url = f.read().strip()
+            # We don't unlink meta_path here yet, as we might want to keep it if processing fails
+            # (Optional: decide if you want to move .meta files too. For now, we usually consume them)
             meta_path.unlink()
 
         source_name = origin_url if origin_url else relative_path_str
@@ -295,17 +300,19 @@ async def process_single_file_async(topic_id, file_path, root_folder):
 
             if not full_text: 
                 log.warning(f"Skipping {filename}: No readable text.")
+                # Move to ERROR immediately
+                await finalize_file_move(file_path, root_folder, topic_id, success=False)
                 return False
             
             # Creates 'file.jpg.ocr' containing the raw text
             ocr_path = file_path.with_suffix(file_path.suffix + ".ocr")
             with open(ocr_path, "w", encoding="utf-8") as f_ocr:
                 f_ocr.write(full_text)
-            log.debug(f"Saved OCR result to {ocr_path.name}")
+            
             # -----------------------------------------
-
+            # Embedding & Qdrant Upsert Logic
+            # -----------------------------------------
             chunks = text_splitter.split_text(full_text)
-            log.debug(f"Document chunked: {len(chunks)} segments")
             
             all_vectors = []
             for i in range(0, len(chunks), 50):
@@ -325,7 +332,6 @@ async def process_single_file_async(topic_id, file_path, root_folder):
                 for idx, vec in enumerate(all_vectors)
             ]
             
-            # Before upserting loop
             log.info(f"Removing existing chunks for source: {source_name}")
             await qdrant_client.delete(
                 collection_name=QDRANT_COLLECTION,
@@ -348,9 +354,53 @@ async def process_single_file_async(topic_id, file_path, root_folder):
                 )
             
             log.info(f"Success: Indexed {filename}")
+            
+            # --- IMMEDIATE MOVE ON SUCCESS ---
+            await finalize_file_move(file_path, root_folder, topic_id, success=True)
             return True
+
+        except RetryError:
+             log.error(f"CRITICAL: Rate limit persistence failed for {filename}. Moving to error.")
+             # --- IMMEDIATE MOVE ON FAILURE ---
+             await finalize_file_move(file_path, root_folder, topic_id, success=False)
+             return False
         except Exception as e:
-            log.error(f"Process Failure {filename}: {e}", exc_info=True); return False
+            log.error(f"Process Failure {filename}: {e}", exc_info=True)
+            # --- IMMEDIATE MOVE ON FAILURE ---
+            await finalize_file_move(file_path, root_folder, topic_id, success=False)
+            return False
+        
+async def finalize_file_move(file_path, root_folder, topic_id, success):
+    """
+    Moves a file and its associated .ocr artifact to the appropriate destination immediately.
+    """
+    try:
+        # Calculate relative path (e.g., "subfolder/image.png")
+        try:
+            relative_path = file_path.relative_to(root_folder)
+        except ValueError:
+            # Fallback if path logic fails (shouldn't happen given flow)
+            relative_path = pathlib.Path(file_path.name)
+
+        # Determine Destination
+        dest_root = PROCESSED_FOLDER if success else ERROR_FOLDER
+        final_dest = dest_root / topic_id / relative_path
+        
+        # Ensure parent sub-folders exist in destination
+        final_dest.parent.mkdir(parents=True, exist_ok=True)
+        
+        # 1. Move Main File
+        await asyncio.to_thread(safe_move_file, file_path, final_dest.parent)
+
+        # 2. Move Sibling OCR File (if it exists)
+        ocr_sibling = file_path.with_suffix(file_path.suffix + ".ocr")
+        if ocr_sibling.exists():
+            await asyncio.to_thread(safe_move_file, ocr_sibling, final_dest.parent)
+            
+        log.info(f"Moved {'[SUCCESS]' if success else '[ERROR]'} : {file_path.name}")
+        
+    except Exception as e:
+        log.error(f"Failed to move file {file_path.name}: {e}")
 
 async def process_topic_folder_async(topic_id, folder_path):
     folder_path = pathlib.Path(folder_path)
@@ -363,11 +413,9 @@ async def process_topic_folder_async(topic_id, folder_path):
         with open(url_file, 'r') as f:
             urls = [l.strip() for l in f if l.strip().startswith("http")]
 
-        # Wrapper for parallel execution
         async def process_url(u):
             return u, await asyncio.to_thread(scrape_web_page, u, folder_path)
 
-        # Run all scrapes concurrently
         url_tasks = [process_url(u) for u in urls]
         url_results = await asyncio.gather(*url_tasks)
 
@@ -378,6 +426,7 @@ async def process_topic_folder_async(topic_id, folder_path):
                 with open(v_path, 'w', encoding='utf-8') as f_v: f_v.write(text)
                 with open(str(v_path) + ".meta", 'w', encoding='utf-8') as f_m: f_m.write(url)
         
+        # Move the urls.txt file to processed immediately after scraping
         await asyncio.to_thread(safe_move_file, str(url_file), PROCESSED_FOLDER / topic_id)
 
     # 2. File Batch
@@ -389,35 +438,19 @@ async def process_topic_folder_async(topic_id, folder_path):
     if not all_files:
         log.info(f"No files found in {topic_id} (checked subdirectories).")
     else:
-        log.info(f"Found {len(all_files)} files to ingest recursively.")
+        log.info(f"Found {len(all_files)} files to ingest. Starting tasks...")
     
+    # Create tasks
     tasks = [process_single_file_async(topic_id, p, folder_path) for p in all_files]
+    
+    # Wait for all tasks to complete (files move individually during this await)
     results = await asyncio.gather(*tasks)
 
-    for file_path_obj, success in zip(all_files, results):
-        # Calculate relative path to keep structure (e.g., "sub/image.png")
-        relative_path = file_path_obj.relative_to(folder_path)
-        
-        root_dest = PROCESSED_FOLDER if success else ERROR_FOLDER
-        final_dest = root_dest / topic_id / relative_path
-        
-        # Ensure parent sub-folders exist in destination
-        os.makedirs(final_dest.parent, exist_ok=True)
-        
-        # 1. Move Main File
-        await asyncio.to_thread(safe_move_file, file_path_obj, final_dest.parent)
-
-        # 2. Move Sibling OCR File (if it exists)
-        # This looks for 'file.jpg.ocr' created in the previous step
-        ocr_sibling = file_path_obj.with_suffix(file_path_obj.suffix + ".ocr")
-        if ocr_sibling.exists():
-            # It will land in processed/topic/sub/file.jpg.ocr
-            await asyncio.to_thread(safe_move_file, ocr_sibling, final_dest.parent)
-    
+    # 3. Final Metadata & Cleanup
     if any(results): 
-        # FIX: Syntax for to_thread
         await asyncio.to_thread(register_topic_safe, topic_id)
     
+    # Cleanup empty directories in Watch folder
     for root, dirs, files in os.walk(folder_path, topdown=False):
         for name in dirs:
             try:
