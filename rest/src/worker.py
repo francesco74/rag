@@ -1,17 +1,26 @@
+"""
+RAG Worker with Optimized Reranker
+Replaces the slow reranker with batched, multi-threaded version.
+
+Expected improvement: 94s → ~5-10s for 59 documents
+"""
+
 import os
 import logging
 import time
 import uuid
 from celery import Celery
+from celery.schedules import crontab
+from celery.signals import worker_shutdown
 from mysql.connector import pooling
 from qdrant_client import QdrantClient, models
 import google.generativeai as genai
-from optimum.onnxruntime import ORTModelForSequenceClassification
-from transformers import AutoTokenizer
-import torch
-import random
 from dotenv import load_dotenv
 
+# Use the optimized reranker
+from reranker import ONNXReranker, RerankResult
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from tenacity import (
     retry,
     stop_after_attempt,
@@ -22,17 +31,14 @@ from google.api_core.exceptions import ResourceExhausted, ServiceUnavailable
 
 load_dotenv()
 
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
 
 # ==============================================================================
 # 1. CONFIGURATION & LOGGING
 # ==============================================================================
 
-# Configure Logging for the Worker
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - [WORKER] - %(levelname)s - %(message)s'
+    format='%(asctime)s - [WORKER-%(process)d] - %(levelname)s - %(message)s'
 )
 log = logging.getLogger("rag_queue")
 
@@ -40,22 +46,36 @@ log = logging.getLogger("rag_queue")
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
 PROMPTS_DIR = os.path.join(os.path.dirname(__file__), 'prompts')
 
-# Constants
-RERANK_SIZE = 15
+# Reranking Configuration (OPTIMIZED)
+RERANK_SIZE = int(os.environ.get("RERANK_SIZE", 25))
+RERANK_TRUNCATE = int(os.environ.get("RERANK_TRUNCATE", 1200))
+RERANK_BATCH_SIZE = int(os.environ.get("RERANK_BATCH_SIZE", 32))  # Now used!
+RERANK_MAX_LENGTH = int(os.environ.get("RERANK_MAX_LENGTH", 512))
+
+ONNX_MODEL_CACHE_PATH = os.environ.get(
+    "RERANKER_MODEL_PATH", 
+    "./model_cache/mmarco-mMiniLMv2-L12-H384-v1"
+)
+
+
 QDRANT_SIZE = 20
 MAX_CONTEXT_CHARS = 30000 
 
 FORCE_TOPIC = os.environ.get("TOPIC", None)
+MAX_AGE_SECONDS = 86400  # 24 hours
 
-MAX_AGE_SECONDS=86400
-
+# Gemini Retry Configuration
 GEMINI_RETRY = retry(
     retry=retry_if_exception_type((ResourceExhausted, ServiceUnavailable)),
     wait=wait_random_exponential(multiplier=2, max=60),
     stop=stop_after_attempt(6),
-    before_sleep=lambda retry_state: log.warning(f"Rate limit hit. Retrying in {retry_state.next_action.sleep}s...")
+    before_sleep=lambda retry_state: log.warning(
+        f"Rate limit hit. Retrying in {retry_state.next_action.sleep}s..."
+    )
 )
 
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["ONNXRUNTIME_EXECUTION_MODE"] = "PARALLEL"
 
 
 # ==============================================================================
@@ -63,17 +83,20 @@ GEMINI_RETRY = retry(
 # ==============================================================================
 celery_app = Celery('rag_queue', broker=REDIS_URL, backend=REDIS_URL)
 celery_app.conf.update(
-    result_expires=3600,  # Results are deleted from Redis after 1 hour (3600 seconds)
-    worker_concurrency=1 
+    result_expires=3600,
+    worker_concurrency=1,
+    task_acks_late=True,
+    task_reject_on_worker_lost=True
 )
 
 # ==============================================================================
-# 3. GLOBAL MODEL & DB INITIALIZATION (Runs ONCE on startup)
+# 3. GLOBAL MODEL & DB INITIALIZATION
 # ==============================================================================
 
 log.info("Initializing Worker Resources...")
 
 # --- A. Database Connection Pool ---
+db_pool = None
 try:
     db_config = {
         "host": os.environ.get("DB_HOST", "localhost"),
@@ -88,85 +111,93 @@ try:
         pool_reset_session=True,
         **db_config
     )
-    log.info("MySQL Connection Pool created.")
+    log.info("✓ MySQL Connection Pool created.")
 except Exception as e:
-    log.critical(f"Failed to create DB Pool: {e}")
-    db_pool = None
+    log.critical(f"✗ Failed to create DB Pool: {e}")
+    raise
 
 # --- B. Qdrant Client ---
+qdrant_client = None
 try:
     QDRANT_HOST = os.environ.get("QDRANT_HOST", "localhost")
     QDRANT_PORT = int(os.environ.get("QDRANT_PORT", 6333))
     qdrant_client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
     QDRANT_COLLECTION = "document_chunks"
     CACHE_COLLECTION = "semantic_cache"
-    log.info(f"Qdrant client connected to {QDRANT_HOST}:{QDRANT_PORT}")
+    
+    qdrant_client.get_collections()
+    log.info(f"✓ Qdrant client connected to {QDRANT_HOST}:{QDRANT_PORT}")
 except Exception as e:
-    log.critical(f"Failed to connect to Qdrant: {e}")
-    qdrant_client = None
+    log.critical(f"✗ Failed to connect to Qdrant: {e}")
+    raise
 
 # --- C. Google Gemini ---
 try:
     GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
     if not GOOGLE_API_KEY:
-        log.warning("GOOGLE_API_KEY not set!")
-    else:
-        log.debug("Using GOOGLE_API_KEY {GOOGLE_API_KEY}")
-
-        genai.configure(api_key=GOOGLE_API_KEY)
-        # Initialize specialized models
-        EMBEDDING_MODEL = "gemini-embedding-001"
-        TRANSFORM_MODEL = genai.GenerativeModel("gemini-2.5-flash")
-        ROUTER_MODEL = genai.GenerativeModel("gemini-2.5-flash")
-        GENERATOR_MODEL = genai.GenerativeModel("gemini-2.5-flash")
-        log.info("Gemini models configured.")
-except Exception as e:
-    log.critical(f"Failed to initialize Gemini: {e}")
-
-# --- D. Cross-Encoder (The Heavy Lifter) ---
-RERANK_BATCH_SIZE = 32
-RERANKER_MODEL = None
-try:
-    log.info("Loading Cross-Encoder model...")
-    model_path = "./model_onnx"
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
-    RERANKER_MODEL = ORTModelForSequenceClassification.from_pretrained(
-        model_path, 
-        provider="CPUExecutionProvider"
-    )
+        raise ValueError("GOOGLE_API_KEY environment variable not set!")
     
-    log.info("RERANKER_MODEL loaded successfully.")
+    log.info(f"Using GOOGLE_API_KEY: {GOOGLE_API_KEY[:8]}***")
+
+    genai.configure(api_key=GOOGLE_API_KEY)
+    
+    EMBEDDING_MODEL = "gemini-embedding-001"
+    TRANSFORM_MODEL = genai.GenerativeModel("gemini-2.5-flash")
+    ROUTER_MODEL = genai.GenerativeModel("gemini-2.5-flash")
+    GENERATOR_MODEL = genai.GenerativeModel("gemini-2.5-flash")
+    
+    log.info("✓ Gemini models configured.")
 except Exception as e:
-    log.critical(f"Failed to load Cross-Encoder: {e}")
+    log.critical(f"✗ Failed to initialize Gemini: {e}")
+    raise
+
+# --- D. OPTIMIZED Cross-Encoder Reranker ---
+#ONNX_MODEL_CACHE_PATH = "./model_cache/bge-reranker-v2-m3-ONNX-int8"
+ONNX_MODEL_CACHE_PATH = "./model_cache/mmarco-mMiniLMv2-L12-H384-v1"
+_RERANKER_INSTANCE = None # Singleton holder
+
+# --- E. Thread Pool for Parallel Operations ---
+executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="rag_worker")
 
 # ==============================================================================
 # 4. HELPER FUNCTIONS
 # ==============================================================================
 
 def get_db_connection():
-    if not db_pool: return None
+    """Get a connection from the pool."""
+    if not db_pool:
+        log.error("DB pool not initialized!")
+        return None
     try:
         return db_pool.get_connection()
     except Exception as e:
         log.error(f"Error getting connection from pool: {e}")
         return None
 
+
 def load_prompt_template(filename):
+    """Load a prompt template from the prompts directory."""
     try:
         file_path = os.path.join(PROMPTS_DIR, filename)
         with open(file_path, 'r', encoding='utf-8') as f:
             return f.read()
+    except FileNotFoundError:
+        log.error(f"Prompt template '{filename}' not found. Using fallback.")
+        return "{context_str}\n\nQuestion: {query}\n\nAnswer:"
     except Exception as e:
         log.error(f"Error loading prompt {filename}: {e}")
-        return "{context_str}\n{query}"
+        return "{context_str}\n\nQuestion: {query}\n\nAnswer:"
 
 
+# ==============================================================================
+# 5. GEMINI API FUNCTIONS (With Retry Logic)
+# ==============================================================================
 
 @GEMINI_RETRY
 def embed_query(query):
-    log.info(f"Gemini EMBEDDING request: '{query}'")
+    """Generate embedding for a query with retry logic."""
+    log.debug(f"Embedding query: '{query[:50]}...'")
     
-    # Removed try/except so Tenacity can catch RateLimit errors
     result = genai.embed_content(
         model=EMBEDDING_MODEL,
         content=query,
@@ -175,39 +206,121 @@ def embed_query(query):
     )
     return result['embedding']
 
+
 @GEMINI_RETRY
 def transform_query(history, query):
-    if not history: return query
-        
-    history_str = "\n".join([f"{msg.get('role', 'user')}: {msg.get('text', '')}" for msg in history])
-    prompt = load_prompt_template("query_rewriter").format(history_str=history_str, query=query)
+    """Transform conversational query into standalone query."""
+    if not history:
+        log.debug("No history provided, using original query.")
+        return query
     
-    # Log the full prompt
-    log.info(f"Gemini TRANSFORM request:\n{prompt}")
+    history_str = "\n".join([
+        f"{msg.get('role', 'user')}: {msg.get('text', '')}" 
+        for msg in history
+    ])
+    
+    prompt = load_prompt_template("query_rewriter").format(
+        history_str=history_str, 
+        query=query
+    )
+    
+    log.debug(f"Transforming query with history context...")
     
     response = TRANSFORM_MODEL.generate_content(prompt)
-    log.info(f"Gemini TRANSFORM response: '{response.text.strip()}'")
-    return response.text.strip()
+    transformed = response.text.strip()
+    
+    log.info(f"Query transformed: '{query}' → '{transformed}'")
+    return transformed
+
 
 @GEMINI_RETRY
 def route_query_to_topic(standalone_query, topics):
-    topic_list_str = "\n".join([f"- {t['topic_id']}: {t['description']}" for t in topics])
-    prompt = load_prompt_template("topic_finder").format(topic_string=topic_list_str, standalone_query=standalone_query)
+    """Route query to most relevant topic using AI."""
+    topic_list_str = "\n".join([
+        f"- {t['topic_id']}: {t['description']}" 
+        for t in topics
+    ])
     
-    # Log the full prompt
-    log.info(f"Gemini ROUTING request:\n{prompt}")
+    prompt = load_prompt_template("topic_finder").format(
+        topic_string=topic_list_str, 
+        standalone_query=standalone_query
+    )
+    
+    log.debug("Routing query to topic...")
     
     response = ROUTER_MODEL.generate_content(prompt)
-    topic_id = response.text.strip().replace("`", "").replace("'", "")
+    topic_id = response.text.strip().replace("`", "").replace("'", "").replace('"', "")
     
-    log.info(f"Gemini ROUTING response: '{topic_id}'")
-    
-    if topic_id in [t['topic_id'] for t in topics]:
+    valid_topics = [t['topic_id'] for t in topics]
+    if topic_id in valid_topics:
+        log.info(f"Query routed to topic: '{topic_id}'")
         return topic_id
+    
+    log.warning(f"AI returned invalid topic '{topic_id}'. Available: {valid_topics}")
     return None
 
+
+@GEMINI_RETRY
+def extract_keywords_with_ai(query):
+    """Extract significant keywords using AI."""
+    prompt = load_prompt_template("extract_keywords").format(query=query)
+    
+    response = TRANSFORM_MODEL.generate_content(prompt)
+    cleaned_text = response.text.strip()
+    
+    log.debug(f"AI extracted keywords: '{cleaned_text}'")
+    
+    keywords = cleaned_text.replace(",", " ").replace(".", "").split()
+    keywords = [w.lower() for w in keywords if len(w) > 2]
+    
+    return list(dict.fromkeys(keywords))
+
+
+@GEMINI_RETRY
+def generate_answer(query, rich_context, topic_id, topics_list):
+    """Generate final answer using retrieved context."""
+    formatted_chunks = []
+    curr_len = 0
+    
+    for item in rich_context:
+        chunk = f"[Source: {item['source']}]\n{item['content']}\n\n"
+        if curr_len + len(chunk) < MAX_CONTEXT_CHARS:
+            formatted_chunks.append(chunk)
+            curr_len += len(chunk)
+        else:
+            break
+    
+    context_str = "".join(formatted_chunks)
+    
+    topic_details = next(
+        (t for t in topics_list if t['topic_id'] == topic_id), 
+        None
+    )
+    
+    if topic_details:
+        prompt_file = topic_details.get('prompt') or 'general'
+    else:
+        prompt_file = 'general'
+    
+    prompt_tmpl = load_prompt_template(prompt_file)
+    prompt = prompt_tmpl.format(context_str=context_str, query=query)
+    
+    log.info(f"Generating answer (prompt: {len(prompt)} chars, "
+             f"chunks: {len(rich_context)})")
+    
+    response = GENERATOR_MODEL.generate_content(prompt)
+    return response.text.strip()
+
+
+# ==============================================================================
+# 6. SEMANTIC CACHE FUNCTIONS
+# ==============================================================================
+
 def check_semantic_cache(query_vector):
-    if not qdrant_client: return None
+    """Check if similar query exists in cache."""
+    if not qdrant_client:
+        return None
+    
     try:
         hits = qdrant_client.query_points(
             collection_name=CACHE_COLLECTION,
@@ -215,43 +328,24 @@ def check_semantic_cache(query_vector):
             limit=1,
             score_threshold=0.95
         ).points
-        if hits:
-            log.info("Cache HIT.")
-            return hits[0].payload
-    except Exception:
-        pass
-    return None
-
-def prune_semantic_cache():
-    """
-    Deletes cache entries older than max_age_seconds (Default: 24 hours).
-    """
-    if not qdrant_client: return
-
-    try:
-        # Calculate the cutoff timestamp (Current Time - Max Age)
-        cutoff_time = time.time() - MAX_AGE_SECONDS
         
-        # Qdrant Delete Operation
-        qdrant_client.delete(
-            collection_name=CACHE_COLLECTION,
-            points_selector=models.FilterSelector(
-                filter=models.Filter(
-                    must=[
-                        models.FieldCondition(
-                            key="timestamp",
-                            range=models.Range(lt=cutoff_time) # "Less Than" cutoff
-                        )
-                    ]
-                )
-            )
-        )
-        log.info(f"Cache Pruned: Deleted entries older than {MAX_AGE_SECONDS}s.")
+        if hits:
+            log.info(f"✓ Cache HIT (similarity: {hits[0].score:.3f})")
+            return hits[0].payload
+        
+        log.debug("Cache MISS")
+        return None
+        
     except Exception as e:
-        log.error(f"Failed to prune cache: {e}")
+        log.error(f"Cache check failed: {e}")
+        return None
+
 
 def save_to_semantic_cache(query_vector, original_query, answer, sources, topic_id):
-    if not qdrant_client: return
+    """Save successful response to semantic cache."""
+    if not qdrant_client:
+        return
+    
     try:
         point = models.PointStruct(
             id=str(uuid.uuid4()),
@@ -266,123 +360,211 @@ def save_to_semantic_cache(query_vector, original_query, answer, sources, topic_
         )
 
         qdrant_client.upsert(collection_name=CACHE_COLLECTION, points=[point])
-
-        if random.random() < 0.05:
-            log.info("Triggering background cache cleanup...")
-            prune_semantic_cache()
-     
+        log.debug("Cache entry saved.")
+        
     except Exception as e:
-        log.error(f"Cache save/prune failed: {e}")
+        log.error(f"Cache save failed: {e}")
+
+
+@celery_app.task(name="prune_semantic_cache")
+def prune_semantic_cache():
+    """Delete cache entries older than MAX_AGE_SECONDS."""
+    if not qdrant_client:
+        log.warning("Qdrant client not available for cache pruning.")
+        return
+    
+    try:
+        cutoff_time = time.time() - MAX_AGE_SECONDS
+        
+        qdrant_client.delete(
+            collection_name=CACHE_COLLECTION,
+            points_selector=models.FilterSelector(
+                filter=models.Filter(
+                    must=[
+                        models.FieldCondition(
+                            key="timestamp",
+                            range=models.Range(lt=cutoff_time)
+                        )
+                    ]
+                )
+            )
+        )
+        
+        log.info(f"✓ Cache pruned (entries older than {MAX_AGE_SECONDS}s removed).")
+        
+    except Exception as e:
+        log.error(f"Cache pruning failed: {e}")
+
+
+@celery_app.on_after_configure.connect
+def setup_periodic_tasks(sender, **kwargs):
+    """Setup scheduled tasks."""
+    sender.add_periodic_task(
+        crontab(minute=0),
+        prune_semantic_cache.s(),
+        name='hourly-cache-cleanup'
+    )
+    log.info("✓ Scheduled task: Cache cleanup every hour")
+
+
+# ==============================================================================
+# 7. DOCUMENT RETRIEVAL (With OPTIMIZED Reranking)
+# ==============================================================================
 
 def retrieve_chunks(query, vector, topic_id):
     """
-    Hybrid Search with Client-Side 'Min-Match' Filtering.
-    This bypasses the Pydantic ValidationError completely.
+    Hybrid retrieval with OPTIMIZED reranking.
+    
+    Expected: 94s → ~5-10s for 59 documents
     """
-    if not qdrant_client: 
-        log.error("Qdrant client not available.")
+    if not qdrant_client:
+        log.error("Qdrant client not available!")
         return [], []
     
     try:
         log.info(f"Retrieving chunks for topic '{topic_id}'...")
         fused_hits = {}
         
-        # ======================================================================
-        # 1. Vector Search (Semantic)
-        # ======================================================================
-        v_res = qdrant_client.query_points(
-            collection_name=QDRANT_COLLECTION,
-            query=vector,
-            limit=QDRANT_SIZE,
-            query_filter=models.Filter(must=[models.FieldCondition(key="topic_id", match=models.MatchValue(value=topic_id))])
-        )
+        # ==================================================================
+        # PARALLEL SEARCH
+        # ==================================================================
+        def vector_search():
+            """Semantic vector search."""
+            res = qdrant_client.query_points(
+                collection_name=QDRANT_COLLECTION,
+                query=vector,
+                limit=QDRANT_SIZE,
+                query_filter=models.Filter(
+                    must=[models.FieldCondition(
+                        key="topic_id", 
+                        match=models.MatchValue(value=topic_id)
+                    )]
+                )
+            )
+            log.info(f"Vector search: {len(res.points)} hits")
+            return res.points
         
-        v_count = len(v_res.points)
-        log.info(f"Vector Search found {v_count} hits.")
-        for hit in v_res.points: fused_hits[hit.id] = hit
-
-        # ======================================================================
-        # 2. Keyword Search (Manual Filtering)
-        # ======================================================================
-        keywords = [w.lower() for w in query.split() if len(w) > 3]
-        
-        if keywords:
-            # Calculate threshold (e.g., need 2 matches out of 4 keywords)
-            min_match = max(1, len(keywords) // 2) if len(keywords) >= 4 else 1
-            log.info(f"Keyword Search: {keywords} (Looking for >= {min_match} matches)")
+        def keyword_search():
+            """Keyword search with AI extraction."""
+            try:
+                keywords = extract_keywords_with_ai(query)
+                log.info(f"Keywords extracted: {keywords}")
+            except Exception as e:
+                log.warning(f"AI keyword extraction failed: {e}. Using fallback.")
+                keywords = [w.lower() for w in query.split() if len(w) > 3]
+                keywords = list(dict.fromkeys(keywords))
             
-            should_cond = [models.FieldCondition(key="content", match=models.MatchText(text=w)) for w in keywords]
+            if not keywords:
+                log.info("No valid keywords - skipping keyword search.")
+                return []
             
-            # --- SAFE QUERY: Ask for ANY match (OR logic) ---
+            min_match = (
+                len(keywords) if len(keywords) <= 2 
+                else max(1, int(len(keywords) * 0.6))
+            )
+            
+            log.debug(f"Min-match threshold: {min_match}/{len(keywords)}")
+            
+            should_cond = [
+                models.FieldCondition(key="content", match=models.MatchText(text=w))
+                for w in keywords
+            ]
+            
             k_res = qdrant_client.scroll(
                 collection_name=QDRANT_COLLECTION,
                 scroll_filter=models.Filter(
-                    must=[models.FieldCondition(key="topic_id", match=models.MatchValue(value=topic_id))],
+                    must=[models.FieldCondition(
+                        key="topic_id", 
+                        match=models.MatchValue(value=topic_id)
+                    )],
                     should=should_cond
-                    # min_should_match removed to prevent Pydantic error
                 ),
-                # Fetch double the size to ensure we have enough candidates after filtering
-                limit=QDRANT_SIZE * 2, 
+                limit=QDRANT_SIZE * 2,
                 with_payload=True
             )
             
             k_hits_raw = k_res[0]
-            k_valid_count = 0
-            new_hits = 0
+            valid_hits = []
             
-            # --- MANUAL FILTERING (The "Min Match" Logic) ---
             for hit in k_hits_raw:
                 content = hit.payload.get("content", "").lower()
-                
-                # Count how many keywords appear in this document
                 matches = sum(1 for w in keywords if w in content)
                 
-                # Strict Check: Only keep if matches >= min_match
                 if matches >= min_match:
-                    k_valid_count += 1
-                    if hit.id not in fused_hits: 
+                    valid_hits.append(hit)
+            
+            log.info(f"Keyword search: {len(k_hits_raw)} raw → {len(valid_hits)} valid")
+            return valid_hits
+        
+        # Execute searches in parallel
+        futures = {
+            executor.submit(vector_search): "vector",
+            executor.submit(keyword_search): "keyword"
+        }
+        
+        for future in as_completed(futures):
+            search_type = futures[future]
+            try:
+                hits = future.result()
+                for hit in hits:
+                    if hit.id not in fused_hits:
                         fused_hits[hit.id] = hit
-                        new_hits += 1
-            
-            log.info(f"Keyword Search: {len(k_hits_raw)} raw hits -> {k_valid_count} valid ({new_hits} unique added).")
-        else:
-            log.info("Skipping Keyword Search (no valid keywords).")
-
+            except Exception as e:
+                log.error(f"{search_type.capitalize()} search failed: {e}", exc_info=True)
+        
         candidates = list(fused_hits.values())
-        if not candidates: 
-            log.warning("No documents found in Vector or Keyword search.")
+        
+        if not candidates:
+            log.warning("No documents found in vector or keyword search.")
             return [], []
-
-        log.info(f"Total Unique Candidates before Re-ranking: {len(candidates)}")
-
-        # ======================================================================
-        # 3. Re-ranking
-        # ======================================================================
-        if RERANKER_MODEL:
-            log.info(f"Re-ranking {len(candidates)} candidates...")
-            pairs = [(query, doc.payload.get('content', '')) for doc in candidates]
+        
+        log.info(f"Total unique candidates: {len(candidates)}")
+        
+        # ==================================================================
+        # OPTIMIZED RERANKING (THE FIX!)
+        # ==================================================================
+        top_docs = []
+        
+        reranker = get_reranker()
+        
+        if reranker and candidates:
+            log.info(f"Reranking {len(candidates)} candidates...")
+            docs_content = [c.payload.get("content", "")[:RERANK_TRUNCATE] for c in candidates]
             
-            
-            scores = []
-            for i in range(0, len(pairs), RERANK_BATCH_SIZE):
-                batch = pairs[i:i + RERANK_BATCH_SIZE]
-                inputs = tokenizer(batch, padding=True, truncation=True, max_length=512, return_tensors="pt")
-                with torch.no_grad():
-                    outputs = RERANKER_MODEL(**inputs)
-                    batch_scores = outputs.logits.view(-1).float().tolist()
-                    scores.scores.extend(batch_scores)
-
-            # Accoppiamo i punteggi ai documenti e ordiniamo
-            scored_docs = sorted(zip(scores, candidates), key=lambda x: x[0], reverse=True)
-            
-            # Prendiamo solo i top richiesti dopo averli processati TUTTI
-            top_docs = [doc for score, doc in scored_docs[:RERANK_SIZE]]
+            try:
+                start_rr = time.time()
+                
+                # Run reranking (Lazy loaded instance)
+                reranked_results = reranker.rerank(query, docs_content)
+                
+                for res in reranked_results[:RERANK_SIZE]:
+                    top_docs.append(candidates[res.index])
+                
+                elapsed = time.time() - start_rr
+                log.info(f"⚡ Reranking completed in {elapsed:.2f}s")
+                
+            except Exception as e:
+                log.error(f"Reranking failed: {e}", exc_info=True)
+                top_docs = candidates[:RERANK_SIZE]
         else:
+            log.warning("Reranker not initialized or unavailable.")
             top_docs = candidates[:RERANK_SIZE]
 
-        # 4. Format
-        rich_context = [{"content": d.payload.get("content", ""), "source": d.payload.get("source", "")} for d in top_docs]
-        unique_sources = list({d['source']: {"file": d['source']} for d in rich_context}.values())
+        # ==================================================================
+        # FORMAT OUTPUT
+        # ==================================================================
+        rich_context = [
+            {
+                "content": d.payload.get("content", ""),
+                "source": d.payload.get("source", "")
+            }
+            for d in top_docs
+        ]
+        
+        unique_sources = list({
+            d['source']: {"file": d['source']} 
+            for d in rich_context
+        }.values())
         
         return rich_context, unique_sources
         
@@ -390,86 +572,78 @@ def retrieve_chunks(query, vector, topic_id):
         log.error(f"Retrieval process failed: {e}", exc_info=True)
         return [], []
 
-@GEMINI_RETRY
-def generate_answer(query, rich_context, topic_id, topics_list):
-    # Construct Context String
-    formatted_chunks = []
-    curr_len = 0
-    for item in rich_context:
-        chunk = f"[Source: {item['source']}]\n{item['content']}\n\n"
-        if curr_len + len(chunk) < MAX_CONTEXT_CHARS:
-            formatted_chunks.append(chunk)
-            curr_len += len(chunk)
-        else:
-            break
-    
-    topic_details = next((t for t in topics_list if t['topic_id'] == topic_id), None)
-    prompt_file = topic_details['prompt'] if topic_details and topic_details.get('prompt') else "general"
-    
-    prompt_tmpl = load_prompt_template(prompt_file)
-    prompt = prompt_tmpl.format(context_str="".join(formatted_chunks), query=query)
-    
-    # Log the prompt (Truncated if too massive, to keep logs readable)
-    log.info(f"Gemini GENERATION request (Prompt Length: {len(prompt)} chars).")
-    log.debug(f"Full Prompt Preview:\n{prompt}...[truncated]...")
-    
-    response = GENERATOR_MODEL.generate_content(prompt)
-    return response.text.strip()
+
+
+def get_reranker():
+    """
+    Lazy loader for the Reranker.
+    Ensures initialization happens INSIDE the worker process, avoiding deadlocks.
+    """
+    global _RERANKER_INSTANCE
+    if _RERANKER_INSTANCE is None:
+        try:
+            log.info("Initializing ONNX Reranker (Lazy Load)...")
+            num_threads = os.cpu_count() or 4
+
+            # CRITICAL FIX 3: num_threads=1
+            # We want the WORKER to be the unit of parallelism, not the matrix math.
+            # This prevents 32 threads fighting for resources inside one worker.
+            _RERANKER_INSTANCE = ONNXReranker(
+                model_folder=ONNX_MODEL_CACHE_PATH,
+                batch_size=RERANK_BATCH_SIZE,
+                max_length=RERANK_MAX_LENGTH,
+                num_threads=num_threads
+            )
+            log.info("✓ Reranker initialized successfully.")
+        except Exception as e:
+            log.error(f"✗ Failed to lazy load Reranker: {e}")
+            _RERANKER_INSTANCE = False # Mark as failed so we don't retry every time
+            
+    return _RERANKER_INSTANCE if _RERANKER_INSTANCE is not False else None
 
 # ==============================================================================
-# 5. THE MAIN CELERY TASK
-# ==============================================================================
-
-@celery_app.task(bind=True, name="rag_queue")
-# ==============================================================================
-# 5. THE MAIN CELERY TASK
+# 8. MAIN CELERY TASK
 # ==============================================================================
 
 @celery_app.task(bind=True, name="rag_queue")
 def process_rag_query(self, query, history):
-    """
-    The main entry point for the worker.
-    """
+    """Main RAG processing pipeline with optimized reranking."""
     start_time = time.time()
-    log.info(f"Task received. Query: {query[:30]}...")
+    task_id = self.request.id
+    log.info(f"[{task_id}] Task started: '{query[:50]}...'")
     
     conn = None
+    
     try:
-        # ----------------------------------------------------------------------
-        # 1. Transform Query
-        # ----------------------------------------------------------------------
+        # 1. Query Transformation
         try:
-            # This calls the @GEMINI_RETRY decorated function
-            # If it hits RateLimit, it will retry 6 times automatically.
             standalone_query = transform_query(history, query)
         except Exception as e:
-            # If retries fail completely (e.g., after 60s), fall back to original query
-            log.warning(f"Query Transformation failed after retries: {e}")
+            log.warning(f"Query transformation failed: {e}")
             standalone_query = query
         
-        # ----------------------------------------------------------------------
-        # 2. Embed Query
-        # ----------------------------------------------------------------------
+        # 2. Embedding
         try:
             query_vector = embed_query(standalone_query)
         except Exception as e:
-            # Embedding is critical. If this fails, we cannot proceed.
-            log.error(f"Embedding failed after retries: {e}")
+            log.error(f"Embedding failed: {e}")
             return {
-                "error": "AI Service Unavailable", 
-                "message": "The AI engine is currently overloaded. Please try again in a minute.",
+                "error": "AI Service Unavailable",
+                "message": "The AI service is currently overloaded. Please try again.",
                 "status": "failed"
             }
         
         if not query_vector:
-            return {"error": "Embedding returned None", "status": "failed"}
-
-        # ----------------------------------------------------------------------
+            return {
+                "error": "Embedding Failed",
+                "message": "Unable to process your question. Please try rephrasing.",
+                "status": "failed"
+            }
+        
         # 3. Cache Check
-        # ----------------------------------------------------------------------
         cached = check_semantic_cache(query_vector)
         if cached:
-            log.info("Returning cached response.")
+            log.info(f"[{task_id}] Returning cached response.")
             return {
                 "answer": cached['answer'],
                 "sources": cached['sources'],
@@ -477,12 +651,11 @@ def process_rag_query(self, query, history):
                 "cached": True,
                 "status": "success"
             }
-
-        # ----------------------------------------------------------------------
-        # 4. DB Operations (Get Topics)
-        # ----------------------------------------------------------------------
+        
+        # 4. Load Topics
         conn = get_db_connection()
-        if not conn: raise ValueError("DB Connection failed")
+        if not conn:
+            raise ValueError("Database connection failed")
         
         topics = []
         with conn.cursor(dictionary=True) as cursor:
@@ -490,78 +663,106 @@ def process_rag_query(self, query, history):
             topics = cursor.fetchall()
         
         if not topics:
-             log.warning("No topics found in DB.")
-             return {"error": "System Configuration Error", "message": "No topics configured.", "status": "failed"}
-
-        # ----------------------------------------------------------------------
-        # 5. Route Query
-        # ----------------------------------------------------------------------
-        topic_id = FORCE_TOPIC
-        try:
-            if not topic_id:
-                topic_id = route_query_to_topic(standalone_query, topics)
-        except Exception as e:
-            log.error(f"Routing failed after retries: {e}")
-            
-        if not topic_id:
-            # Fallback strategy: If routing fails, maybe default to a 'general' topic or fail gracefully
+            log.error("No topics configured!")
             return {
-                "error": "No matching topic found",
-                "message": "I couldn't identify a relevant topic for your question based on the available documents.",
+                "error": "System Configuration Error",
+                "message": "The system is not properly configured.",
                 "status": "failed"
             }
-        else:
-            log.debug(f"Query routed to topic: {topic_id}")
-
-        # ----------------------------------------------------------------------
-        # 6. Retrieve Documents (Hybrid Search)
-        # ----------------------------------------------------------------------
+        
+        # 5. Topic Routing
+        topic_id = FORCE_TOPIC
+        
+        if not topic_id:
+            try:
+                topic_id = route_query_to_topic(standalone_query, topics)
+            except Exception as e:
+                log.error(f"Routing failed: {e}")
+        
+        if not topic_id:
+            return {
+                "error": "No Matching Topic",
+                "message": "I couldn't identify a relevant topic for your question.",
+                "status": "failed"
+            }
+        
+        log.info(f"[{task_id}] Routed to topic: '{topic_id}'")
+        
+        # 6. Document Retrieval (WITH OPTIMIZED RERANKING!)
         context, sources = retrieve_chunks(standalone_query, query_vector, topic_id)
+        
         if not context:
             return {
-                "error": "No context found",
-                "message": f"I identified the topic as '{topic_id}', but I couldn't find specific documents matching your query.",
+                "error": "No Relevant Documents",
+                "message": f"I couldn't find specific information to answer your question.",
                 "topic": topic_id,
                 "status": "failed"
             }
-
-        # ----------------------------------------------------------------------
-        # 7. Generate Answer
-        # ----------------------------------------------------------------------
+        
+        # 7. Answer Generation
         try:
             answer = generate_answer(standalone_query, context, topic_id, topics)
         except Exception as e:
-             log.error(f"Generation failed after retries: {e}")
-             return {
-                 "error": "AI Generation Failed", 
-                 "message": "I found the documents, but the AI service is currently overloaded and couldn't generate an answer.", 
-                 "status": "failed"
-             }
+            log.error(f"Answer generation failed: {e}")
+            return {
+                "error": "Generation Failed",
+                "message": "I found documents but couldn't generate an answer.",
+                "status": "failed"
+            }
         
-        # ----------------------------------------------------------------------
-        # 8. Save to Cache
-        # ----------------------------------------------------------------------
-        # Only cache valid answers (avoid caching "I don't know" or empty responses)
-        if answer and len(answer) > 10 and "could not find" not in answer.lower():
-            save_to_semantic_cache(query_vector, standalone_query, answer, sources, topic_id)
-
+        # 8. Cache Valid Responses
+        if answer and len(answer) > 20 and "could not find" not in answer.lower():
+            save_to_semantic_cache(
+                query_vector, 
+                standalone_query, 
+                answer, 
+                sources, 
+                topic_id
+            )
+        
         duration = time.time() - start_time
-        log.info(f"Task completed successfully in {duration:.2f}s")
+        log.info(f"[{task_id}] ✓ Completed in {duration:.2f}s")
         
         return {
             "answer": answer,
             "sources": sources,
             "topic": topic_id,
+            "cached": False,
             "status": "success"
         }
-
+    
     except Exception as e:
-        log.critical(f"Unhandled Worker Exception: {e}", exc_info=True)
+        log.critical(f"[{task_id}] ✗ Unhandled exception: {e}", exc_info=True)
         return {
             "error": "Internal Processing Error",
-            "message": "An unexpected error occurred in the AI worker.",
+            "message": "An unexpected error occurred.",
             "status": "failed"
         }
+    
     finally:
         if conn and conn.is_connected():
             conn.close()
+
+
+# ==============================================================================
+# 9. WORKER LIFECYCLE
+# ==============================================================================
+
+@worker_shutdown.connect
+def cleanup_worker(**kwargs):
+    """Cleanup resources on shutdown."""
+    log.info("Worker shutting down - cleaning up resources...")
+    
+    if executor:
+        executor.shutdown(wait=True)
+        log.info("✓ Thread pool closed.")
+    
+    if qdrant_client:
+        try:
+            qdrant_client.close()
+            log.info("✓ Qdrant connection closed.")
+        except Exception as e:
+            log.warning(f"Error closing Qdrant: {e}")
+    
+    log.info("Worker cleanup complete.")
+

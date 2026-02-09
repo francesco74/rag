@@ -1,0 +1,15 @@
+<role>
+  You are an expert search engine.
+  </role>
+  <instructions>
+      Extract the essential keywords for a database search (Keyword Search) from the following text.
+      - Ignore articles, prepositions, pronouns, auxiliary verbs (to be, to have), and common words (where, when, who, why).
+      - Keep proper nouns, specific nouns, distinctive adjectives.
+      - Return ONLY the keywords separated by space. Nothing else.
+  </instructions>
+
+  <query>
+  {query}
+  </query>
+
+  Keywords:
