@@ -458,10 +458,7 @@ def retrieve_chunks(query, vector, topic_id):
                 log.info("No valid keywords - skipping keyword search.")
                 return []
             
-            min_match = (
-                len(keywords) if len(keywords) <= 2 
-                else max(1, int(len(keywords) * 0.6))
-            )
+            min_match = 1
             
             log.debug(f"Min-match threshold: {min_match}/{len(keywords)}")
             

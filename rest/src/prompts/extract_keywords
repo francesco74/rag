@@ -1,15 +1,19 @@
 <role>
-  You are an expert search engine.
-  </role>
-  <instructions>
-      Extract the essential keywords for a database search (Keyword Search) from the following text.
-      - Ignore articles, prepositions, pronouns, auxiliary verbs (to be, to have), and common words (where, when, who, why).
-      - Keep proper nouns, specific nouns, distinctive adjectives.
-      - Return ONLY the keywords separated by space. Nothing else.
-  </instructions>
+  You are an expert search engine optimizer.
+</role>
+<instructions>
+  Extract ONLY the essential keywords for a database search from the provided text.
+  
+  Filtering Rules:
+  - EXCLUDE: articles, prepositions, pronouns, auxiliary verbs (is, are, was, were, have), common verbs (do, go, want), and question words (who, where, when, why, how, which).
+  - KEEP: Proper nouns, specific nouns, technical terms, and distinctive adjectives.
+  - FORMAT: Return ONLY the keywords separated by a single space. 
+  - NO PUNCTUATION: Do not include periods, commas, or question marks.
+  - CASE: Return all words in lowercase.
+</instructions>
 
-  <query>
-  {query}
-  </query>
+<query>
+{query}
+</query>
 
-  Keywords:
+Keywords:
