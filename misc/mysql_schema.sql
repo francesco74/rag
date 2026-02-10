@@ -66,4 +66,8 @@ ALTER TABLE `topics`
 --
 ALTER TABLE `failed_queries`
   MODIFY `id` int NOT NULL AUTO_INCREMENT;
+
+ALTER TABLE `chat_feedback`
+  MODIFY `id` int NOT NULL AUTO_INCREMENT;
+
 COMMIT;

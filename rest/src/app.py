@@ -7,6 +7,7 @@ from flask_cors import CORS
 from celery import Celery
 from celery.result import AsyncResult
 import mysql.connector
+import json
 
 from dotenv import load_dotenv
 
@@ -156,14 +157,17 @@ def feedback_handler():
         answer = data.get("answer")
         topic_id = data.get("topic_id")
         rating = data.get("rating")
+
+        history = data.get("history", [])
+        history_json = json.dumps(history)
         
         if not all([query, answer, rating is not None]):
             return jsonify({"error": "Missing fields"}), 400
 
         conn = mysql.connector.connect(**db_config)
         cursor = conn.cursor()
-        sql = "INSERT INTO chat_feedback (user_query, ai_response, topic_id, rating) VALUES (%s, %s, %s, %s)"
-        cursor.execute(sql, (query, answer, topic_id, rating))
+        sql = "INSERT INTO chat_feedback (user_query, ai_response, topic_id, rating, chat_history) VALUES (%s, %s, %s, %s, %s)"
+        cursor.execute(sql, (query, answer, topic_id, rating, history_json))
         conn.commit()
         cursor.close()
         conn.close()

@@ -49,7 +49,7 @@ PROMPTS_DIR = os.path.join(os.path.dirname(__file__), 'prompts')
 # Reranking Configuration (OPTIMIZED)
 RERANK_SIZE = int(os.environ.get("RERANK_SIZE", 25))
 RERANK_TRUNCATE = int(os.environ.get("RERANK_TRUNCATE", 1200))
-RERANK_BATCH_SIZE = int(os.environ.get("RERANK_BATCH_SIZE", 32))  # Now used!
+RERANK_BATCH_SIZE = int(os.environ.get("RERANK_BATCH_SIZE", 32))  
 RERANK_MAX_LENGTH = int(os.environ.get("RERANK_MAX_LENGTH", 512))
 
 ONNX_MODEL_CACHE_PATH = os.environ.get(
@@ -307,6 +307,8 @@ def generate_answer(query, rich_context, topic_id, topics_list):
     
     log.info(f"Generating answer (prompt: {len(prompt)} chars, "
              f"chunks: {len(rich_context)})")
+    
+    log.debug(f"Context... {context_str}... ")
     
     response = GENERATOR_MODEL.generate_content(prompt)
     return response.text.strip()

@@ -134,6 +134,19 @@ async def initialize_qdrant_collection():
             await qdrant_client.create_payload_index(QDRANT_COLLECTION, "source", models.PayloadSchemaType.KEYWORD)
             log.info("Qdrant Collection and Indexes Initialized.")
 
+            log.info(f"Creating Full-Text index on '{QDRANT_COLLECTION}.content' for keyword search")
+            await qdrant_client.create_payload_index(
+                collection_name=QDRANT_COLLECTION,
+                field_name="content",
+                field_schema=models.TextIndexParams(
+                    type="text",
+                    tokenizer=models.TokenizerType.WORD,
+                    min_token_len=2,
+                    max_token_len=20,
+                    lowercase=True
+                )
+            )
+
         # 2. Initialize Semantic Cache Collection
         # Note: CACHE_COLLECTION should be defined as "semantic_cache"
         if not await qdrant_client.collection_exists(CACHE_COLLECTION):
@@ -148,6 +161,7 @@ async def initialize_qdrant_collection():
             # Index topic in cache to allow topic-specific cache clearing if needed
             await qdrant_client.create_payload_index(CACHE_COLLECTION, "topic", models.PayloadSchemaType.KEYWORD)
             log.info(f"Cache collection '{CACHE_COLLECTION}' initialized.")
+
     except Exception as e:
         log.error(f"Qdrant Setup Error: {e}")
 

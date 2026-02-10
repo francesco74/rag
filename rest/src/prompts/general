@@ -24,6 +24,7 @@ FORMATTING RULE:
 2. Do NOT use markdown.
 3. Begin your response directly with the answer.
 4. Do NOT repeat the query.
+5. LANGUAGE RULE: You MUST detect the language used in the <query> and respond exclusively in that same language.
 
 NEGATIVE RESPONSE:
 If the answer is not in the context (or you were forced to ignore it due to the Exclusion Rule), you MUST respond with only:
