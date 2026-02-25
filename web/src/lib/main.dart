@@ -56,6 +56,7 @@ class ChatMessage {
 
   // Store feedback state
   FeedbackStatus feedback;
+  bool isSourcesExpanded;
 
   ChatMessage({
     required this.text,
@@ -64,6 +65,7 @@ class ChatMessage {
     this.sources = const [],
     this.isError = false,
     this.isSystemMessage = false,
+    this.isSourcesExpanded = false,
     this.feedback = FeedbackStatus.none,
   }) : role = isUser ? 'user' : 'model';
 }
@@ -94,6 +96,156 @@ class _ChatScreenState extends State<ChatScreen> {
       ChatMessage(
         text: "<p>Ciao! Chiedimi qualunque cosa sui documenti che conosco.</p>",
         isSystemMessage: true,
+      ),
+    );
+  }
+
+  /// Builds the static project information header at the top of the chat
+  Widget _buildProjectInfoHeader() {
+    final theme = Theme.of(context);
+
+    return Container(
+      margin: const EdgeInsets.only(bottom: 24.0, top: 16.0),
+      decoration: BoxDecoration(
+        color: theme.colorScheme.surfaceContainerHighest.withAlpha(128),
+        borderRadius: BorderRadius.circular(16.0),
+        border: Border.all(color: theme.colorScheme.outlineVariant, width: 1),
+      ),
+      child: FutureBuilder<String>(
+        future: DefaultAssetBundle.of(
+          context,
+        ).loadString('assets/html/welcome.html'),
+        builder: (context, snapshot) {
+          if (snapshot.connectionState == ConnectionState.waiting) {
+            return const Padding(
+              padding: EdgeInsets.all(48.0),
+              child: Center(child: CircularProgressIndicator()),
+            );
+          }
+          if (snapshot.hasError || !snapshot.hasData) {
+            return Padding(
+              padding: const EdgeInsets.all(24.0),
+              child: Text(
+                "Errore nel caricamento del messaggio di benvenuto.",
+                style: theme.textTheme.bodyMedium!.copyWith(
+                  color: theme.colorScheme.error,
+                ),
+                textAlign: TextAlign.center,
+              ),
+            );
+          }
+
+          return Html(
+            data: snapshot.data,
+            // Replace HTML elements with native Flutter widgets
+            extensions: [
+              TagExtension(
+                tagsToExtend: {"a"}, // <--- Change this line
+                builder: (extensionContext) {
+                  final url = extensionContext.attributes['href'];
+                  final text = extensionContext.element?.text ?? 'Link';
+
+                  // If it's one of our buttons (<a class="btn">)
+                  if (extensionContext.classes.contains("btn")) {
+                    return Padding(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 4.0,
+                        vertical: 8.0,
+                      ),
+                      child: OutlinedButton(
+                        style: OutlinedButton.styleFrom(
+                          side: BorderSide(
+                            color: theme.colorScheme.primary,
+                            width: 1.5,
+                          ),
+                          foregroundColor: theme.colorScheme.primary,
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 20.0,
+                            vertical: 12.0,
+                          ),
+                        ),
+                        onPressed: () {
+                          if (url != null) _launchUrl(url);
+                        },
+                        child: Text(
+                          text,
+                          style: const TextStyle(fontWeight: FontWeight.bold),
+                        ),
+                      ),
+                    );
+                  }
+
+                  // Fallback: If it's just a normal <a> tag without the class
+                  return GestureDetector(
+                    onTap: () {
+                      if (url != null) _launchUrl(url);
+                    },
+                    child: Text(
+                      text,
+                      style: TextStyle(
+                        color: theme.colorScheme.primary,
+                        decoration: TextDecoration.underline,
+                      ),
+                    ),
+                  );
+                },
+              ),
+            ],
+            style: {
+              "body": Style(
+                margin: Margins.zero,
+                padding: HtmlPaddings.all(24.0),
+                backgroundColor: Colors.transparent,
+                color: theme.colorScheme.onSurface,
+                fontFamily: 'sans-serif',
+                textAlign: TextAlign.center,
+              ),
+              ".icon": Style(
+                fontSize: FontSize(48.0),
+                margin: Margins.only(bottom: 16.0),
+              ),
+              "h1": Style(
+                fontSize: FontSize(22.0),
+                fontWeight: FontWeight.bold,
+                color: theme.colorScheme.primary,
+                margin: Margins.only(bottom: 12.0),
+              ),
+              "p": Style(
+                fontSize: FontSize(16.0),
+                color: theme.colorScheme.onSurfaceVariant,
+                margin: Margins.only(bottom: 20.0),
+              ),
+              // Optional: Help center the newly injected Flutter buttons
+              ".links": Style(
+                textAlign: TextAlign.center,
+                margin: Margins.only(bottom: 16.0),
+              ),
+              ".divider": Style(
+                height: Height(1.0),
+                backgroundColor: theme.colorScheme.outlineVariant,
+                margin: Margins.symmetric(vertical: 20.0),
+              ),
+              ".disclaimer": Style(
+                backgroundColor: theme.colorScheme.errorContainer.withAlpha(50),
+                border: Border.all(color: theme.colorScheme.error),
+                padding: HtmlPaddings.all(15.0),
+                textAlign: TextAlign.left,
+              ),
+              ".disclaimer-title": Style(
+                color: theme.colorScheme.onErrorContainer,
+                fontWeight: FontWeight.bold,
+                margin: Margins.only(bottom: 5.0),
+                textAlign: TextAlign.center,
+              ),
+              ".disclaimer-text": Style(
+                fontSize: FontSize(13.0),
+                fontStyle: FontStyle.italic,
+                color: theme.colorScheme.onErrorContainer.withAlpha(200),
+                textAlign: TextAlign.center,
+              ),
+            },
+          );
+        },
       ),
     );
   }
@@ -414,8 +566,11 @@ class _ChatScreenState extends State<ChatScreen> {
               controller: _scrollController,
               reverse: true, // Makes the list start from the bottom
               padding: const EdgeInsets.all(16.0),
-              itemCount: _messages.length,
+              itemCount: _messages.length + 1,
               itemBuilder: (context, index) {
+                if (index == _messages.length) {
+                  return _buildProjectInfoHeader();
+                }
                 return _buildMessageBubble(_messages[index]);
               },
             ),
@@ -578,6 +733,7 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   /// Builds the source chips for an AI message
+  /// Builds the source chips for an AI message (Expandable)
   Widget _buildSources(ChatMessage message) {
     if (message.isUser || message.sources.isEmpty) {
       return const SizedBox.shrink();
@@ -588,57 +744,91 @@ class _ChatScreenState extends State<ChatScreen> {
 
     return Padding(
       padding: const EdgeInsets.only(top: 12.0),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          // Title text (Selectable due to parent SelectionArea)
-          Text(
-            "Sources (from topic: $topic):",
-            style: theme.textTheme.bodySmall!.copyWith(
-              fontWeight: FontWeight.bold,
-              color: theme.colorScheme.onSurface.withAlpha(204),
-            ),
-          ),
-          const SizedBox(height: 8.0),
-
-          // Chips
-          Wrap(
-            spacing: 8.0,
-            runSpacing: 4.0,
-            children: message.sources.map((source) {
-              final String fileName = source['file'] ?? 'Unknown File';
-
-              // Construct the Nginx URL
-              final String url =
-                  "${AppSettings.downloadDocumentUrl}/$topic/$fileName";
-
-              // Wrapper to enable cursor change on hover
-              return MouseRegion(
+      // StatefulBuilder lets us rebuild ONLY this small widget when clicked,
+      // rather than rebuilding the entire chat history list.
+      child: StatefulBuilder(
+        builder: (context, setLocalState) {
+          return Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              // --- CLICKABLE HEADER ---
+              MouseRegion(
                 cursor: SystemMouseCursors.click,
                 child: GestureDetector(
-                  // Use GestureDetector or InkWell
-                  onTap: () => _launchUrl(url),
-                  child: Chip(
-                    mouseCursor: SystemMouseCursors
-                        .click, // 2. Set cursor directly on the Chip
-                    avatar: Icon(
-                      Icons.link,
-                      size: 16,
-                      color: theme.colorScheme.secondary,
-                    ),
-                    label: Text(fileName),
-                    labelStyle: theme.textTheme.labelSmall,
-                    backgroundColor: theme.colorScheme.secondaryContainer,
-                    labelPadding: const EdgeInsets.symmetric(horizontal: 8.0),
-                    visualDensity: VisualDensity.compact,
-                    // Optional: adds a slight "clickable" feel
-                    side: BorderSide(color: theme.colorScheme.outlineVariant),
+                  onTap: () {
+                    // Toggle the state and trigger a local rebuild
+                    setLocalState(() {
+                      message.isSourcesExpanded = !message.isSourcesExpanded;
+                    });
+                  },
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      // Arrow icon that changes direction based on state
+                      Icon(
+                        message.isSourcesExpanded
+                            ? Icons.keyboard_arrow_down
+                            : Icons.keyboard_arrow_right,
+                        size: 20,
+                        color: theme.colorScheme.onSurface.withAlpha(204),
+                      ),
+                      const SizedBox(width: 4.0),
+                      Text(
+                        "Fonti analizzate: ${message.sources.length}",
+                        style: theme.textTheme.bodySmall!.copyWith(
+                          fontWeight: FontWeight.bold,
+                          color: theme.colorScheme.onSurface.withAlpha(204),
+                        ),
+                      ),
+                    ],
                   ),
                 ),
-              );
-            }).toList(),
-          ),
-        ],
+              ),
+
+              // --- EXPANDABLE CHIPS AREA ---
+              AnimatedSize(
+                duration: const Duration(milliseconds: 250),
+                curve: Curves.easeInOut,
+                alignment: Alignment.topCenter,
+                child: message.isSourcesExpanded
+                    ? Padding(
+                        padding: const EdgeInsets.only(top: 8.0, left: 8.0),
+                        child: Wrap(
+                          spacing: 8.0,
+                          runSpacing: 4.0,
+                          children: message.sources.map((source) {
+                            final String fileName =
+                                source['file'] ?? 'File sconosciuto';
+                            final String url =
+                                "${AppSettings.downloadDocumentUrl}/$topic/$fileName";
+
+                            return ActionChip(
+                              onPressed: () => _launchUrl(url),
+                              avatar: Icon(
+                                Icons.link,
+                                size: 16,
+                                color: theme.colorScheme.secondary,
+                              ),
+                              label: Text(fileName),
+                              labelStyle: theme.textTheme.labelSmall,
+                              backgroundColor:
+                                  theme.colorScheme.secondaryContainer,
+                              labelPadding: const EdgeInsets.symmetric(
+                                horizontal: 8.0,
+                              ),
+                              visualDensity: VisualDensity.compact,
+                              side: BorderSide(
+                                color: theme.colorScheme.outlineVariant,
+                              ),
+                            );
+                          }).toList(),
+                        ),
+                      )
+                    : const SizedBox.shrink(), // Takes up zero space when collapsed
+              ),
+            ],
+          );
+        },
       ),
     );
   }
@@ -668,7 +858,7 @@ class _ChatScreenState extends State<ChatScreen> {
                 autocorrect: true,
                 enableSuggestions: true,
                 decoration: InputDecoration(
-                  hintText: "Send a message...",
+                  hintText: "Sottoponi la domanda...",
                   filled: true,
                   fillColor: theme.colorScheme.surfaceContainerHighest,
                   border: OutlineInputBorder(

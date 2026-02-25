@@ -58,7 +58,8 @@ ONNX_MODEL_CACHE_PATH = os.environ.get(
 )
 
 
-QDRANT_SIZE = 20
+QDRANT_SYNTATIC_SIZE = 20
+QDRANT_SEMANTIC_SIZE = 30
 MAX_CONTEXT_CHARS = 30000 
 
 FORCE_TOPIC = os.environ.get("TOPIC", None)
@@ -229,7 +230,7 @@ def transform_query(history, query):
     response = TRANSFORM_MODEL.generate_content(prompt)
     transformed = response.text.strip()
     
-    log.info(f"Query transformed: '{query}' → '{transformed}'")
+    log.debug(f"Query transformed: '{query}' → '{transformed}'")
     return transformed
 
 
@@ -264,11 +265,12 @@ def route_query_to_topic(standalone_query, topics):
 def extract_keywords_with_ai(query):
     """Extract significant keywords using AI."""
     prompt = load_prompt_template("extract_keywords").format(query=query)
+    log.info(f"input prompt'{prompt}'")
     
     response = TRANSFORM_MODEL.generate_content(prompt)
     cleaned_text = response.text.strip()
     
-    log.debug(f"AI extracted keywords: '{cleaned_text}'")
+    log.info(f"AI extracted keywords: '{cleaned_text}'")
     
     keywords = cleaned_text.replace(",", " ").replace(".", "").split()
     keywords = [w.lower() for w in keywords if len(w) > 2]
@@ -328,7 +330,7 @@ def check_semantic_cache(query_vector):
             collection_name=CACHE_COLLECTION,
             query=query_vector,
             limit=1,
-            score_threshold=0.95
+            score_threshold=0.97
         ).points
         
         if hits:
@@ -435,7 +437,7 @@ def retrieve_chunks(query, vector, topic_id):
             res = qdrant_client.query_points(
                 collection_name=QDRANT_COLLECTION,
                 query=vector,
-                limit=QDRANT_SIZE,
+                limit=QDRANT_SEMANTIC_SIZE,
                 query_filter=models.Filter(
                     must=[models.FieldCondition(
                         key="topic_id", 
@@ -478,7 +480,7 @@ def retrieve_chunks(query, vector, topic_id):
                     )],
                     should=should_cond
                 ),
-                limit=QDRANT_SIZE * 2,
+                limit=QDRANT_SYNTATIC_SIZE * 2,
                 with_payload=True
             )
             
@@ -669,7 +671,7 @@ def process_rag_query(self, query, history):
                 "status": "failed"
             }
         
-        # 5. Topic Routing
+        # 5. Topic Routing\
         topic_id = FORCE_TOPIC
         
         if not topic_id:
@@ -677,6 +679,8 @@ def process_rag_query(self, query, history):
                 topic_id = route_query_to_topic(standalone_query, topics)
             except Exception as e:
                 log.error(f"Routing failed: {e}")
+        else:
+            log.debug(f"Forced topic: {topic_id}")
         
         if not topic_id:
             return {
