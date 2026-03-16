@@ -6,7 +6,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from celery import Celery
 from celery.result import AsyncResult
-import mysql.connector
+from mysql.connector import pooling
 import json
 
 from dotenv import load_dotenv
@@ -24,7 +24,9 @@ logging.basicConfig(
 log = logging.getLogger("api_gateway")
 
 app = Flask(__name__)
-CORS(app)  # Enable CORS for frontend access
+
+ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "http://localhost:3000").split(",")
+CORS(app, origins=ALLOWED_ORIGINS)  # Enable CORS for frontend access
 
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
 celery_client = Celery(
@@ -34,6 +36,20 @@ celery_client = Celery(
 )
 
 load_dotenv()
+
+try:
+    db_pool = pooling.MySQLConnectionPool(
+        pool_name="api_pool",
+        pool_size=5,
+        pool_reset_session=True,
+        host=os.environ.get("DB_HOST", "localhost"),
+        user=os.environ.get("DB_USER"),
+        password=os.environ.get("DB_PASS"),
+        database=os.environ.get("DB_NAME", "rag_system")
+    )
+except Exception as e:
+    log.critical(f"Failed to initialize API DB Pool: {e}")
+    # Consider whether the app should crash here if the DB is critical
 
 # ==============================================================================
 # MIDDLEWARE
@@ -71,8 +87,11 @@ def chat_handler():
         query = data.get("query")
         history = data.get("history", [])
 
-        if not query:
-            return jsonify({"error": "Bad Request", "message": "Missing 'query' field"}), 400
+        if not query or not isinstance(query, str) or len(query.strip()) == 0:
+            return jsonify({"error": "Bad Request", "message": "Valid 'query' string is required"}), 400
+        
+        if len(query) > 2000:
+            return jsonify({"error": "Payload Too Large", "message": "Query exceeds maximum length"}), 413
 
         log.info(f"Received query: '{query[:50]}...'. Offloading to Worker.")
 
@@ -91,8 +110,8 @@ def chat_handler():
         }), 202
 
     except Exception as e:
-        log.error(f"Failed to dispatch task: {e}")
-        return jsonify({"error": "Internal Server Error", "message": str(e)}), 500
+        log.error(f"[{request.request_id}] Failed to dispatch task: {e}", exc_info=True)
+        return jsonify({"error": "Internal Server Error", "message": "Failed to queue task."}), 500
 
 @app.route("/status/<task_id>", methods=["GET"])
 def get_task_status(task_id):
@@ -139,13 +158,7 @@ def get_task_status(task_id):
 # or move it to a worker if you expect massive scale.
 
 
-# Re-define minimal DB config for app.py (Worker has its own)
-db_config = {
-    "host": os.environ.get("DB_HOST", "localhost"),
-    "user": os.environ.get("DB_USER"),
-    "password": os.environ.get("DB_PASS"),
-    "database": os.environ.get("DB_NAME", "rag_system")
-}
+
 
 @app.route("/feedback", methods=["POST"])
 def feedback_handler():
@@ -159,23 +172,34 @@ def feedback_handler():
         rating = data.get("rating")
 
         history = data.get("history", [])
-        history_json = json.dumps(history)
         
         if not all([query, answer, rating is not None]):
             return jsonify({"error": "Missing fields"}), 400
-
-        conn = mysql.connector.connect(**db_config)
+        
+        history_json = json.dumps(history)
+        
+        conn = db_pool.get_connection()
         cursor = conn.cursor()
+
         sql = "INSERT INTO chat_feedback (user_query, ai_response, topic_id, rating, chat_history) VALUES (%s, %s, %s, %s, %s)"
         cursor.execute(sql, (query, answer, topic_id, rating, history_json))
         conn.commit()
-        cursor.close()
-        conn.close()
-        
         return jsonify({"status": "success"}), 200
+
     except Exception as e:
-        log.error(f"Feedback error: {e}")
-        return jsonify({"error": str(e)}), 500
+        log.error(f"[{request.request_id}] Feedback DB error: {e}", exc_info=True)
+        
+        if conn:
+            conn.rollback()
+
+        return jsonify({"error": "Internal database error"}), 500
+    
+    finally:
+        # FIX: Guaranteed connection closure
+        if cursor:
+            cursor.close()
+        if conn and conn.is_connected():
+            conn.close()
 
 if __name__ == "__main__":
     # In production, Gunicorn starts the app, so this is just for local debug

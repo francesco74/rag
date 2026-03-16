@@ -1,15 +1,9 @@
-"""
-RAG Worker with Optimized Reranker
-Replaces the slow reranker with batched, multi-threaded version.
-
-Expected improvement: 94s → ~5-10s for 59 documents
-"""
-
 import os
 import logging
 import time
 import uuid
 from celery import Celery
+from celery.signals import worker_process_init, worker_shutdown
 from celery.schedules import crontab
 from celery.signals import worker_shutdown
 from mysql.connector import pooling
@@ -86,9 +80,57 @@ celery_app = Celery('rag_queue', broker=REDIS_URL, backend=REDIS_URL)
 celery_app.conf.update(
     result_expires=3600,
     worker_concurrency=1,
+    worker_prefetch_multiplier=1,   
     task_acks_late=True,
     task_reject_on_worker_lost=True
 )
+
+# ==============================================================================
+# PROCESS-SAFE INITIALIZATION (THE CRITICAL FIX)
+# ==============================================================================
+# Globals assigned strictly AFTER the fork
+db_pool = None
+qdrant_client = None
+_RERANKER_INSTANCE = None
+
+EMBEDDING_MODEL = "gemini-embedding-001"
+TRANSFORM_MODEL = None
+ROUTER_MODEL = None
+GENERATOR_MODEL = None
+
+@worker_process_init.connect
+def init_worker_process(**kwargs):
+    """
+    Initializes network connections and models ONLY after Celery forks the process.
+    Prevents Socket Corruption and BrokenPipeErrors.
+    """
+    global db_pool, qdrant_client, TRANSFORM_MODEL, ROUTER_MODEL, GENERATOR_MODEL
+    log.info("Initializing Worker Resources (Post-Fork)...")
+
+    try:
+        db_pool = pooling.MySQLConnectionPool(
+            pool_name=f"worker_pool_{os.getpid()}",
+            pool_size=3,
+            pool_reset_session=True,
+            host=os.environ.get("DB_HOST", "localhost"),
+            user=os.environ.get("DB_USER", "root"),
+            password=os.environ.get("DB_PASS", "password"),
+            database=os.environ.get("DB_NAME", "rag_system")
+        )
+        qdrant_client = QdrantClient(
+            host=os.environ.get("QDRANT_HOST", "localhost"), 
+            port=int(os.environ.get("QDRANT_PORT", 6333))
+        )
+        genai.configure(api_key=os.environ.get("GOOGLE_API_KEY"))
+        
+        # Instantiate models here
+        TRANSFORM_MODEL = genai.GenerativeModel("gemini-2.5-flash")
+        ROUTER_MODEL = genai.GenerativeModel("gemini-2.5-flash")
+        GENERATOR_MODEL = genai.GenerativeModel("gemini-2.5-flash")
+        log.info("✓ Resources successfully initialized for this process.")
+    except Exception as e:
+        log.critical(f"✗ Failed to initialize worker resources: {e}")
+        raise
 
 # ==============================================================================
 # 3. GLOBAL MODEL & DB INITIALIZATION
@@ -155,10 +197,7 @@ except Exception as e:
 # --- D. OPTIMIZED Cross-Encoder Reranker ---
 #ONNX_MODEL_CACHE_PATH = "./model_cache/bge-reranker-v2-m3-ONNX-int8"
 ONNX_MODEL_CACHE_PATH = "./model_cache/mmarco-mMiniLMv2-L12-H384-v1"
-_RERANKER_INSTANCE = None # Singleton holder
-
-# --- E. Thread Pool for Parallel Operations ---
-executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="rag_worker")
+_RERANKER_INSTANCE = None # Singleton holder for the reranker, initialized lazily inside the worker process to avoid deadlocks.
 
 # ==============================================================================
 # 4. HELPER FUNCTIONS
@@ -474,11 +513,17 @@ def retrieve_chunks(query, vector, topic_id):
             k_res = qdrant_client.scroll(
                 collection_name=QDRANT_COLLECTION,
                 scroll_filter=models.Filter(
-                    must=[models.FieldCondition(
-                        key="topic_id", 
-                        match=models.MatchValue(value=topic_id)
-                    )],
-                    should=should_cond
+                    must=[
+                        # Condition 1: Must match the topic exactly
+                        models.FieldCondition(
+                            key="topic_id", 
+                            match=models.MatchValue(value=topic_id)
+                        ),
+                        # Condition 2: Must match AT LEAST ONE of the keywords
+                        models.Filter(
+                            should=should_cond
+                        )
+                    ]
                 ),
                 limit=QDRANT_SYNTATIC_SIZE * 2,
                 with_payload=True
@@ -498,20 +543,14 @@ def retrieve_chunks(query, vector, topic_id):
             return valid_hits
         
         # Execute searches in parallel
-        futures = {
-            executor.submit(vector_search): "vector",
-            executor.submit(keyword_search): "keyword"
-        }
-        
-        for future in as_completed(futures):
-            search_type = futures[future]
-            try:
-                hits = future.result()
-                for hit in hits:
-                    if hit.id not in fused_hits:
-                        fused_hits[hit.id] = hit
-            except Exception as e:
-                log.error(f"{search_type.capitalize()} search failed: {e}", exc_info=True)
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = {executor.submit(vector_search): "vector", executor.submit(keyword_search): "keyword"}
+            for future in as_completed(futures):
+                try:
+                    for hit in future.result():
+                        if hit.id not in fused_hits: fused_hits[hit.id] = hit
+                except Exception as e:
+                    log.error(f"{futures[future]} search failed: {e}")
         
         candidates = list(fused_hits.values())
         
@@ -751,21 +790,6 @@ def process_rag_query(self, query, history):
 # 9. WORKER LIFECYCLE
 # ==============================================================================
 
-@worker_shutdown.connect
 def cleanup_worker(**kwargs):
-    """Cleanup resources on shutdown."""
-    log.info("Worker shutting down - cleaning up resources...")
-    
-    if executor:
-        executor.shutdown(wait=True)
-        log.info("✓ Thread pool closed.")
-    
-    if qdrant_client:
-        try:
-            qdrant_client.close()
-            log.info("✓ Qdrant connection closed.")
-        except Exception as e:
-            log.warning(f"Error closing Qdrant: {e}")
-    
-    log.info("Worker cleanup complete.")
+    if qdrant_client: qdrant_client.close()
 
