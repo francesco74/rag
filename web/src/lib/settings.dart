@@ -10,6 +10,7 @@ external EnvConfigJS? get envConfigJS;
 extension type EnvConfigJS._(JSObject _) implements JSObject {
   external String? get DOCUMENT_URL;
   external String? get REST_URL;
+  external String? get PROJECT_NAME;
 }
 
 class AppSettings {
@@ -35,5 +36,13 @@ class AppSettings {
     
     // If the runtime value is missing or null, fall back to the safe default
     return runtimeValue ?? _downloadDocumentUrl;
+  }
+
+  static String get projectName {
+    // Read from JavaScript first (Runtime value)
+    final projectName = envConfigJS?.PROJECT_NAME;
+
+    return projectName ?? "Archivio Ian Greenlees";
+
   }
 }

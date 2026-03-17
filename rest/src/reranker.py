@@ -225,4 +225,11 @@ class ONNXReranker:
         if results:
             log.info(f"Top Result: Score {results[0].score:.4f} (Index {results[0].index})")
             
+            top_k = min(10, len(results))
+            log.info(f"--- Top {top_k} Reranked Documents ---")
+            for i, res in enumerate(results[:top_k]):
+                # Grab a snippet of the document for context (handle safely)
+                snippet = documents[res.index][:80].replace('\n', ' ')
+                log.debug(f"  Rank {i+1:2d} | Score: {res.score: .4f} | Index: {res.index:3d} | Text: {snippet}...")
+            
         return results

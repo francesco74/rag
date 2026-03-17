@@ -1,48 +1,96 @@
-/*
- * ====================================================================
- * RAG AI Chat App (Flutter Client - Web Only)
- * ====================================================================
- */
-
 import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:flutter_html/flutter_html.dart'; // For rendering HTML
 import 'package:url_launcher/url_launcher.dart'; // For opening links
 import 'settings.dart'; // Import the settings file
+import 'app_translations.dart'; // Import the translations file
 
 void main() {
   runApp(const AiChatApp());
 }
+
+// 1. Define our custom themes
+enum AppTheme { light, dark, highContrast }
+
+// 2. Create the Notifier (defaults to light)
+final ValueNotifier<AppTheme> themeNotifier = ValueNotifier(AppTheme.light);
+
+// Status enum for feedback
+enum FeedbackStatus { none, like, dislike }
 
 class AiChatApp extends StatelessWidget {
   const AiChatApp({super.key});
 
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
-      title: 'AI Chat',
-      debugShowCheckedModeBanner: false,
-      theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: Colors.blue,
-          brightness: Brightness.dark,
-        ),
-        // Define a contrasting selection color for dark theme
-        // This ensures selected text is visible against the bubble background
-        textSelectionTheme: TextSelectionThemeData(
-          selectionColor: Colors.white.withAlpha(100),
-          selectionHandleColor: Colors.white,
-        ),
-        useMaterial3: true,
-      ),
-      home: const ChatScreen(),
+    return ValueListenableBuilder<AppTheme>(
+      valueListenable: themeNotifier,
+      builder: (_, AppTheme currentTheme, __) {
+        return ValueListenableBuilder<AppLang>(
+          valueListenable: langNotifier,
+          builder: (_, AppLang currentLang, __) {
+            // Define the 3 themes dynamically
+            ThemeData activeTheme;
+            switch (currentTheme) {
+              case AppTheme.light:
+                activeTheme = ThemeData(
+                  colorScheme: ColorScheme.fromSeed(
+                    seedColor: Colors.blue,
+                    brightness: Brightness.light,
+                  ),
+                  textSelectionTheme: TextSelectionThemeData(
+                    selectionColor: Colors.blue.withAlpha(70),
+                    selectionHandleColor: Colors.blue,
+                  ),
+                  useMaterial3: true,
+                );
+                break;
+              case AppTheme.dark:
+                activeTheme = ThemeData(
+                  colorScheme: ColorScheme.fromSeed(
+                    seedColor: Colors.blue,
+                    brightness: Brightness.dark,
+                  ),
+                  textSelectionTheme: TextSelectionThemeData(
+                    selectionColor: Colors.white.withAlpha(100),
+                    selectionHandleColor: Colors.white,
+                  ),
+                  useMaterial3: true,
+                );
+                break;
+              case AppTheme.highContrast:
+                // High contrast uses a pure black background, pure white text, and bright yellow accents
+                activeTheme = ThemeData(
+                  colorScheme: const ColorScheme.highContrastDark(
+                    primary: Colors.yellowAccent,
+                    onPrimary: Colors.black,
+                    secondary: Colors.cyanAccent,
+                    surface: Colors.black,
+                    onSurface: Colors.white,
+                    error: Colors.redAccent,
+                  ),
+                  textSelectionTheme: TextSelectionThemeData(
+                    selectionColor: Colors.yellowAccent.withAlpha(100),
+                    selectionHandleColor: Colors.yellowAccent,
+                  ),
+                  useMaterial3: true,
+                );
+                break;
+            }
+
+            return MaterialApp(
+              title: AppSettings.projectName,
+              debugShowCheckedModeBanner: false,
+              theme: activeTheme, // Inject the active theme here
+              home: const ChatScreen(),
+            );
+          },
+        );
+      },
     );
   }
 }
-
-// Status enum for feedback
-enum FeedbackStatus { none, like, dislike }
 
 // Data model for a chat message
 class ChatMessage {
@@ -94,7 +142,7 @@ class _ChatScreenState extends State<ChatScreen> {
     _messages.insert(
       0,
       ChatMessage(
-        text: "<p>Ciao! Chiedimi qualunque cosa sui documenti che conosco.</p>",
+        text: AppTranslations.get('welcome_msg', langNotifier.value),
         isSystemMessage: true,
       ),
     );
@@ -112,9 +160,9 @@ class _ChatScreenState extends State<ChatScreen> {
         border: Border.all(color: theme.colorScheme.outlineVariant, width: 1),
       ),
       child: FutureBuilder<String>(
-        future: DefaultAssetBundle.of(
-          context,
-        ).loadString('assets/html/welcome.html'),
+        future: DefaultAssetBundle.of(context).loadString(
+          AppTranslations.get('welcome_html_path', langNotifier.value),
+        ),
         builder: (context, snapshot) {
           if (snapshot.connectionState == ConnectionState.waiting) {
             return const Padding(
@@ -208,7 +256,7 @@ class _ChatScreenState extends State<ChatScreen> {
                 fontSize: FontSize(22.0),
                 fontWeight: FontWeight.bold,
                 color: theme.colorScheme.primary,
-                margin: Margins.only(bottom: 12.0),
+                margin: Margins.only(bottom: 4.0),
               ),
               "p": Style(
                 fontSize: FontSize(16.0),
@@ -226,22 +274,33 @@ class _ChatScreenState extends State<ChatScreen> {
                 margin: Margins.symmetric(vertical: 20.0),
               ),
               ".disclaimer": Style(
-                backgroundColor: theme.colorScheme.errorContainer.withAlpha(50),
-                border: Border.all(color: theme.colorScheme.error),
-                padding: HtmlPaddings.all(15.0),
-                textAlign: TextAlign.left,
+                backgroundColor: theme.colorScheme.secondaryContainer,
+                padding: HtmlPaddings.all(16.0),
+                border: Border(
+                  left: BorderSide(
+                    color: theme.colorScheme.secondary,
+                    width: 4.0,
+                  ),
+                  // Removing the other borders keeps it modern and clean
+                ),
+                margin: Margins.only(top: 16.0),
               ),
               ".disclaimer-title": Style(
-                color: theme.colorScheme.onErrorContainer,
+                color: theme.colorScheme.onSecondaryContainer,
                 fontWeight: FontWeight.bold,
-                margin: Margins.only(bottom: 5.0),
-                textAlign: TextAlign.center,
+                fontSize: FontSize(16.0),
+                margin: Margins.only(bottom: 8.0),
               ),
               ".disclaimer-text": Style(
+                fontSize: FontSize(14.0),
+                color: theme.colorScheme.onSecondaryContainer,
+              ),
+              ".project": Style(
                 fontSize: FontSize(13.0),
                 fontStyle: FontStyle.italic,
                 color: theme.colorScheme.onErrorContainer.withAlpha(200),
                 textAlign: TextAlign.center,
+                margin: Margins.only(bottom: 4.0),
               ),
             },
           );
@@ -276,7 +335,7 @@ class _ChatScreenState extends State<ChatScreen> {
     while (true) {
       // Check Timeout
       if (DateTime.now().difference(startTime).inSeconds > timeoutSeconds) {
-        throw Exception("Timeout: The request took too long to process.");
+        throw Exception(AppTranslations.get('timeout', langNotifier.value));
       }
 
       // 1. Wait before checking (Dynamic Backoff is cleaner, but 2s is fine)
@@ -312,7 +371,9 @@ class _ChatScreenState extends State<ChatScreen> {
         consecutiveErrors++;
         // If we hit max errors, THEN crash. Otherwise, retry.
         if (consecutiveErrors >= maxErrors) {
-          throw Exception("Connection lost. Unable to retrieve status.");
+          throw Exception(
+            AppTranslations.get('connection_lost', langNotifier.value),
+          );
         }
       }
     }
@@ -383,7 +444,7 @@ class _ChatScreenState extends State<ChatScreen> {
           _addMessage(
             ChatMessage(
               text:
-                  "<p><strong>Error:</strong> ${resultData['error'] ?? resultData['message']}</p>",
+                  "<p><strong>${AppTranslations.get('error', langNotifier.value)}:</strong> ${resultData['error'] ?? resultData['message']}</p>",
               isError: true,
               isSystemMessage: true,
             ),
@@ -406,7 +467,7 @@ class _ChatScreenState extends State<ChatScreen> {
         _addMessage(
           ChatMessage(
             text:
-                "<p>Server Error (${response.statusCode}): ${data['message'] ?? 'Unknown error'}</p>",
+                "<p>${AppTranslations.get('error', langNotifier.value)} (${response.statusCode}): ${data['message'] ?? AppTranslations.get('unknown_error', langNotifier.value)}</p>",
             isError: true,
             isSystemMessage: true,
           ),
@@ -416,7 +477,8 @@ class _ChatScreenState extends State<ChatScreen> {
       // Network Error or Polling Error
       _addMessage(
         ChatMessage(
-          text: "<p>Connection failed. Error: ${e.toString()}</p>",
+          text:
+              "<p>${AppTranslations.get('connection_lost', langNotifier.value)} (${e.toString()})</p>",
           isError: true,
           isSystemMessage: true,
         ),
@@ -479,8 +541,10 @@ class _ChatScreenState extends State<ChatScreen> {
 
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text("Thank you for your feedback!"),
+          SnackBar(
+            content: Text(
+              AppTranslations.get('feedback_received', langNotifier.value),
+            ),
             duration: Duration(seconds: 1),
           ),
         );
@@ -488,8 +552,10 @@ class _ChatScreenState extends State<ChatScreen> {
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text("Failed to send feedback."),
+          SnackBar(
+            content: Text(
+              AppTranslations.get('feedback_error', langNotifier.value),
+            ),
             duration: Duration(seconds: 1),
           ),
         );
@@ -517,7 +583,8 @@ class _ChatScreenState extends State<ChatScreen> {
       // Show an error message if it fails to launch
       _addMessage(
         ChatMessage(
-          text: "<p>Could not open the document: $urlString</p>",
+          text:
+              "${AppTranslations.get('document_error', langNotifier.value)} ($urlString)",
           isError: true,
           isSystemMessage: true,
         ),
@@ -533,8 +600,8 @@ class _ChatScreenState extends State<ChatScreen> {
     });
 
     ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(
-        content: Text("Chat history cleared."),
+      SnackBar(
+        content: Text(AppTranslations.get('chat_cleared', langNotifier.value)),
         duration: Duration(seconds: 2),
       ),
     );
@@ -548,12 +615,74 @@ class _ChatScreenState extends State<ChatScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text("AI Document Chat"),
+        title: Text(AppSettings.projectName),
         actions: [
-          // Clear Chat Button
+          // --- LANGUAGE TOGGLE ---
+          ValueListenableBuilder<AppLang>(
+            valueListenable: langNotifier,
+            builder: (_, AppLang currentLang, __) {
+              return TextButton(
+                onPressed: () {
+                  // Flip the language
+                  langNotifier.value = currentLang == AppLang.it
+                      ? AppLang.en
+                      : AppLang.it;
+
+                  // Optional: Clear chat so the welcome message resets to the new language
+                  _clearChat();
+                },
+                child: Text(
+                  currentLang == AppLang.it ? "🇮🇹 IT" : "🇬🇧 EN",
+                  style: TextStyle(
+                    fontSize: 16,
+                    color: Theme.of(context).colorScheme.onSurface,
+                  ),
+                ),
+              );
+            },
+          ),
+
+          // --- THEME TOGGLE (Your existing code) ---
+          ValueListenableBuilder<AppTheme>(
+            valueListenable: themeNotifier,
+            builder: (_, AppTheme currentTheme, __) {
+              // Decide which icon to show based on the current theme
+              IconData themeIcon;
+              if (currentTheme == AppTheme.light) {
+                themeIcon = Icons.dark_mode;
+              } else if (currentTheme == AppTheme.dark) {
+                themeIcon = Icons.contrast; // The high-contrast icon
+              } else {
+                themeIcon = Icons.light_mode;
+              }
+
+              return IconButton(
+                icon: Icon(themeIcon),
+                tooltip: AppTranslations.get(
+                  'toggle_theme',
+                  langNotifier.value,
+                ), // Translated tooltip
+                onPressed: () {
+                  // Cycle through the themes
+                  if (currentTheme == AppTheme.light) {
+                    themeNotifier.value = AppTheme.dark;
+                  } else if (currentTheme == AppTheme.dark) {
+                    themeNotifier.value = AppTheme.highContrast;
+                  } else {
+                    themeNotifier.value = AppTheme.light;
+                  }
+                },
+              );
+            },
+          ),
+
+          // --- CLEAR CHAT BUTTON ---
           IconButton(
             icon: const Icon(Icons.delete_sweep_outlined),
-            tooltip: "Clear Chat",
+            tooltip: AppTranslations.get(
+              'clear_chat',
+              langNotifier.value,
+            ), // Translated!
             onPressed: _isLoading ? null : _clearChat,
           ),
           const SizedBox(width: 8),
@@ -652,7 +781,10 @@ class _ChatScreenState extends State<ChatScreen> {
                             : theme.colorScheme.onSurfaceVariant,
                       ),
                       onPressed: () => _sendFeedback(message, true),
-                      tooltip: "Good response",
+                      tooltip: AppTranslations.get(
+                        'good_response',
+                        langNotifier.value,
+                      ),
                     ),
                     IconButton(
                       icon: Icon(
@@ -665,7 +797,10 @@ class _ChatScreenState extends State<ChatScreen> {
                             : theme.colorScheme.onSurfaceVariant,
                       ),
                       onPressed: () => _sendFeedback(message, false),
-                      tooltip: "Bad response",
+                      tooltip: AppTranslations.get(
+                        'bad_response',
+                        langNotifier.value,
+                      ),
                     ),
                   ],
                 ),
@@ -740,7 +875,9 @@ class _ChatScreenState extends State<ChatScreen> {
     }
 
     final theme = Theme.of(context);
-    final String topic = message.topic ?? "unknown_topic";
+    final String topic =
+        message.topic ??
+        AppTranslations.get('unknown_topic', langNotifier.value);
 
     return Padding(
       padding: const EdgeInsets.only(top: 12.0),
@@ -774,7 +911,7 @@ class _ChatScreenState extends State<ChatScreen> {
                       ),
                       const SizedBox(width: 4.0),
                       Text(
-                        "Fonti analizzate: ${message.sources.length}",
+                        "${AppTranslations.get('sources', langNotifier.value)} ${message.sources.length}",
                         style: theme.textTheme.bodySmall!.copyWith(
                           fontWeight: FontWeight.bold,
                           color: theme.colorScheme.onSurface.withAlpha(204),
@@ -798,7 +935,11 @@ class _ChatScreenState extends State<ChatScreen> {
                           runSpacing: 4.0,
                           children: message.sources.map((source) {
                             final String fileName =
-                                source['file'] ?? 'File sconosciuto';
+                                source['file'] ??
+                                AppTranslations.get(
+                                  'unknown_file',
+                                  langNotifier.value,
+                                );
                             final String url =
                                 "${AppSettings.downloadDocumentUrl}/$topic/$fileName";
 
@@ -807,10 +948,16 @@ class _ChatScreenState extends State<ChatScreen> {
                               avatar: Icon(
                                 Icons.link,
                                 size: 16,
-                                color: theme.colorScheme.secondary,
+                                // 1. Match the icon color to the text
+                                color: theme.colorScheme.onSecondaryContainer,
                               ),
                               label: Text(fileName),
-                              labelStyle: theme.textTheme.labelSmall,
+                              // 2. Force the text color to contrast properly with the background
+                              labelStyle: theme.textTheme.labelSmall?.copyWith(
+                                color: theme.colorScheme.onSecondaryContainer,
+                                fontWeight: FontWeight
+                                    .bold, // Optional: helps with readability
+                              ),
                               backgroundColor:
                                   theme.colorScheme.secondaryContainer,
                               labelPadding: const EdgeInsets.symmetric(
@@ -818,7 +965,9 @@ class _ChatScreenState extends State<ChatScreen> {
                               ),
                               visualDensity: VisualDensity.compact,
                               side: BorderSide(
-                                color: theme.colorScheme.outlineVariant,
+                                // 3. Ensure the border contrasts well too
+                                color: theme.colorScheme.onSecondaryContainer
+                                    .withAlpha(50),
                               ),
                             );
                           }).toList(),
@@ -858,7 +1007,7 @@ class _ChatScreenState extends State<ChatScreen> {
                 autocorrect: true,
                 enableSuggestions: true,
                 decoration: InputDecoration(
-                  hintText: "Sottoponi la domanda...",
+                  hintText: AppTranslations.get('ask_hint', langNotifier.value),
                   filled: true,
                   fillColor: theme.colorScheme.surfaceContainerHighest,
                   border: OutlineInputBorder(

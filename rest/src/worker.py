@@ -560,11 +560,7 @@ def retrieve_chunks(query, vector, topic_id):
         
         log.info(f"Total unique candidates: {len(candidates)}")
         
-        # ==================================================================
-        # OPTIMIZED RERANKING (THE FIX!)
-        # ==================================================================
         top_docs = []
-        
         reranker = get_reranker()
         
         if reranker and candidates:
