@@ -5,6 +5,7 @@ import 'package:flutter_html/flutter_html.dart'; // For rendering HTML
 import 'package:url_launcher/url_launcher.dart'; // For opening links
 import 'settings.dart'; // Import the settings file
 import 'app_translations.dart'; // Import the translations file
+import 'package:flutter/services.dart'; 
 
 void main() {
   runApp(const AiChatApp());
@@ -18,6 +19,10 @@ final ValueNotifier<AppTheme> themeNotifier = ValueNotifier(AppTheme.light);
 
 // Status enum for feedback
 enum FeedbackStatus { none, like, dislike }
+
+class ToggleThemeIntent extends Intent {
+  const ToggleThemeIntent();
+}
 
 class AiChatApp extends StatelessWidget {
   const AiChatApp({super.key});
@@ -79,11 +84,34 @@ class AiChatApp extends StatelessWidget {
                 break;
             }
 
-            return MaterialApp(
-              title: AppSettings.projectName,
-              debugShowCheckedModeBanner: false,
-              theme: activeTheme, // Inject the active theme here
-              home: const ChatScreen(),
+            return Shortcuts(
+              shortcuts: <ShortcutActivator, Intent>{
+                // Binds Alt + T (or Option + T on Mac) to our Intent
+                const SingleActivator(LogicalKeyboardKey.keyT, alt: true): const ToggleThemeIntent(),
+              },
+              child: Actions(
+                actions: <Type, Action<Intent>>{
+                  ToggleThemeIntent: CallbackAction<ToggleThemeIntent>(
+                    onInvoke: (ToggleThemeIntent intent) {
+                      // Cycle through the themes
+                      if (currentTheme == AppTheme.light) {
+                        themeNotifier.value = AppTheme.dark;
+                      } else if (currentTheme == AppTheme.dark) {
+                        themeNotifier.value = AppTheme.highContrast;
+                      } else {
+                        themeNotifier.value = AppTheme.light;
+                      }
+                      return null;
+                    },
+                  ),
+                },
+                child: MaterialApp(
+                  title: AppSettings.projectName, // Uses your external settings
+                  debugShowCheckedModeBanner: false,
+                  theme: activeTheme, // Applies the selected theme
+                  home: const ChatScreen(),
+                ),
+              ),
             );
           },
         );

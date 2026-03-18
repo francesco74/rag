@@ -15,6 +15,16 @@
 !web/src/assets/**
 !web/src/assets/html/**
 
+!web/docker-entrypoint.sh
+!web/Dockerfile
+!web/nginx.conf
+
+!LICENSE
+!README.MD
+!README-TECH.MD
+!TECH.MD
+
+
 rest/model_cache/
 ingestion/src/error/
 ingestion/src/watch/
