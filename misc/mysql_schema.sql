@@ -41,6 +41,20 @@ CREATE TABLE `topics` (
   `prompt` varchar(100) DEFAULT NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
+CREATE TABLE IF NOT EXISTS system_logs (
+    log_id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    log_level VARCHAR(15) NOT NULL,       -- e.g., 'ERROR', 'CRITICAL', 'WARNING'
+    message TEXT NOT NULL,                -- The actual log message (TEXT to hold stack traces)
+    file_name VARCHAR(255),               -- The python script name
+    line_no INT,                          -- The line number where the error occurred
+    pod_name VARCHAR(255) DEFAULT NULL,   -- The Kubernetes Pod name
+    
+    -- Indexes for faster querying when your log table grows
+    INDEX idx_log_level (log_level),
+    INDEX idx_created_at (created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
 --
 -- Indici per le tabelle scaricate
 --

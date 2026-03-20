@@ -27,6 +27,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # --- Copy Application Code ---
 # Copy the rest of the application code into the container
 COPY src/ingest.py .
+COPY src/db_logger.py .
 
 # --- Configure and Run ---
 # Make port 8080 available to the world outside this container

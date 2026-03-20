@@ -5,7 +5,6 @@ import uuid
 import pathlib
 import asyncio
 import mysql.connector
-import numpy as np
 from PIL import Image
 from urllib.parse import urlparse, urljoin
 from dotenv import load_dotenv
@@ -42,6 +41,8 @@ from tenacity import (
 )
 from google.api_core.exceptions import ResourceExhausted, ServiceUnavailable
 
+from db_logger import MySQLLogHandler, get_db_connection
+
 
 # ==============================================================================
 # 1. CONFIGURATION & LOGGING SETUP
@@ -51,12 +52,17 @@ load_dotenv()
 BASE_DIR = pathlib.Path(__file__).parent.resolve()
 
 log_level = os.environ.get("LOG_LEVEL", "DEBUG").upper() # Set to DEBUG for deep tracing
+log_format = '%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s'
+
 logging.basicConfig(
     level=log_level,
     format='%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s',
     handlers=[logging.StreamHandler()]
 )
 log = logging.getLogger("IngestWorker")
+db_handler = MySQLLogHandler()
+db_handler.setFormatter(logging.Formatter(log_format))
+log.addHandler(db_handler)
 log.info("Starting Ingestion Worker Initialization...")
 
 # --- DIRECTORY CREATION LOGIC ---
@@ -188,13 +194,6 @@ async def initialize_qdrant_collection():
     except Exception as e:
         log.error(f"Qdrant Setup Error: {e}")
 
-def get_db_connection():
-    try: 
-        log.debug(f"Attempting MySQL connection to {db_config['host']}...")
-        return mysql.connector.connect(**db_config)
-    except Exception as e: 
-        log.warning(f"Database connection failed: {e}")
-        return None
 
 def register_topic_safe(topic_id):
     conn = get_db_connection()
