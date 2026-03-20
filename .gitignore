@@ -7,9 +7,11 @@
 !web/src/lib/
 !web/src/assets/
 !web/src/assets/html/
+!misc/
 
 !ingestion/**
 !rest/**
+!misc/**
 !web/src/web/**
 !web/src/lib/**
 !web/src/assets/**
