@@ -8,9 +8,10 @@ import mysql.connector
 from PIL import Image
 from urllib.parse import urlparse, urljoin
 from dotenv import load_dotenv
+import traceback
 
 # Web & Networking
-import requests
+import httpx
 import trafilatura
 
 # Document Processing
@@ -19,6 +20,7 @@ import pymupdf4llm   # Native PDF to Markdown extraction
 
 # Google Gemini (GenAI)
 import google.generativeai as genai
+from google.generativeai.types import HarmCategory, HarmBlockThreshold
 
 # Vector DB
 from qdrant_client import models
@@ -43,6 +45,9 @@ from google.api_core.exceptions import ResourceExhausted, ServiceUnavailable
 
 from db_logger import MySQLLogHandler, get_db_connection
 
+import io
+from google.cloud import vision
+
 
 # ==============================================================================
 # 1. CONFIGURATION & LOGGING SETUP
@@ -51,7 +56,7 @@ from db_logger import MySQLLogHandler, get_db_connection
 load_dotenv()
 BASE_DIR = pathlib.Path(__file__).parent.resolve()
 
-log_level = os.environ.get("LOG_LEVEL", "DEBUG").upper() # Set to DEBUG for deep tracing
+log_level = os.environ.get("LOG_LEVEL", "DEBUG").upper() 
 log_format = '%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s'
 
 logging.basicConfig(
@@ -80,12 +85,20 @@ for folder in [DATA_FOLDER, WATCH_FOLDER, PROCESSED_FOLDER, ERROR_FOLDER]:
 try:
     GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
     genai.configure(api_key=GOOGLE_API_KEY)
-    OCR_MODEL_NAME = "gemini-2.5-flash"
+    OCR_MODEL_NAME = os.environ.get("OCR_MODEL_NAME", "gemini-3-flash-preview")
     EMBEDDING_MODEL_NAME = "gemini-embedding-001" 
     log.info(f"AI Models Configured: OCR='{OCR_MODEL_NAME}', Embeddings='{EMBEDDING_MODEL_NAME}', API Key {GOOGLE_API_KEY[:10]}...")
 except Exception as e:
     log.critical(f"Google AI Init Failed: {e}")
     exit(1)
+
+
+try:
+    vision_client = vision.ImageAnnotatorClient()
+    log.info("Google Cloud Vision fallback client initialized successfully.")
+except Exception as e:
+    log.error(f"Google Cloud Vision Init Failed (Fallback disabled): {e}")
+    vision_client = None
 
 # --- Qdrant & DB Configuration ---
 try:
@@ -131,32 +144,45 @@ text_splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
     encoding_name="cl100k_base", chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP, separators=["\n\n", "\n", ". ", " ", ""]
 )
 
+http_client = httpx.AsyncClient(timeout=20.0, follow_redirects=True)
 
-def download_linked_file(url, topic_folder):
+async def download_linked_file_async(url, topic_folder):
+    """Refactored to be non-blocking using httpx."""
     log.info(f"Scraper: Downloading linked asset -> {url}")
     try:
-        response = requests.get(url, stream=True, timeout=15)
-        if response.status_code == 200:
-            filename = os.path.basename(urlparse(url).path) or f"dl_{uuid.uuid4().hex[:8]}"
-            save_path = topic_folder / filename
-            with open(save_path, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192): f.write(chunk)
-            with open(str(save_path) + ".meta", "w", encoding="utf-8") as f: f.write(url)
-            return filename
+        async with http_client.stream("GET", url) as response:
+            if response.status_code == 200:
+                filename = os.path.basename(urlparse(url).path) or f"dl_{uuid.uuid4().hex[:8]}"
+                save_path = topic_folder / filename
+                
+                # Offload blocking write to thread
+                def _save():
+                    with open(save_path, 'wb') as f:
+                        for chunk in response.iter_bytes(): f.write(chunk)
+                    with open(str(save_path) + ".meta", "w", encoding="utf-8") as f: f.write(url)
+                
+                await asyncio.to_thread(_save)
+                return filename
     except Exception as e: log.warning(f"Failed asset download: {e}")
     return None
 
-def scrape_web_page(url, topic_folder):
+async def scrape_web_page_async(url, topic_folder):
+    """Refactored to be non-blocking."""
     log.info(f"Scraper: Analyzing URL -> {url}")
     try:
-        html = trafilatura.fetch_url(url)
+        response = await http_client.get(url)
+        html = response.text if response.status_code == 200 else None
         if not html: return None
+        
         main_text = trafilatura.extract(html, include_comments=False)
         import re
-        links = re.findall(r'href=[\'"]?([^\'" >]+)', html)
-        for link in links:
-            if link.lower().endswith('.pdf'):
-                download_linked_file(urljoin(url, link), topic_folder)
+        links = re.findall(r'href=[\'"]?([^\'" >]+\.pdf)', html, re.I)
+        
+        # Process downloads in parallel
+        if links:
+            tasks = [download_linked_file_async(urljoin(url, link), topic_folder) for link in links]
+            await asyncio.gather(*tasks)
+            
         return main_text
     except Exception as e:
         log.error(f"Scraper Logic Error: {e}")
@@ -212,10 +238,11 @@ def register_topic_safe(topic_id):
         conn.close()
 
 def safe_move_file(src_path, dest_folder):
+    """Kept as synchronous, but will be called via asyncio.to_thread in pipeline."""
     try:
         src = pathlib.Path(src_path)
         dest = pathlib.Path(dest_folder) / src.name
-        log.debug(f"Moving file from {src} to {dest}")
+        if not src.exists(): return # Avoid error if already moved
         if dest.exists(): dest.unlink()
         shutil.move(str(src), str(dest))
     except Exception as e: 
@@ -229,21 +256,71 @@ def clean_text(text):
 # 3. EXTRACTION & AI GENERATION
 # ==============================================================================
 
+def _cloud_vision_fallback(image: Image.Image) -> str:
+    """Synchronous Cloud Vision API call, executed in a thread."""
+    if not vision_client:
+        raise ValueError("Cloud Vision client is not initialized. Cannot perform fallback.")
+    
+    log.info("Executing Google Cloud Vision document text detection...")
+    
+    # Convert PIL Image to bytes for Cloud Vision
+    img_byte_arr = io.BytesIO()
+    image.save(img_byte_arr, format='PNG')
+    content = img_byte_arr.getvalue()
+
+    vision_image = vision.Image(content=content)
+    
+    # Use document_text_detection for dense text/handwriting
+    response = vision_client.document_text_detection(image=vision_image)
+    
+    if response.error.message:
+        raise Exception(f"Cloud Vision API Error: {response.error.message}")
+        
+    return response.full_text_annotation.text
+
+
 @GEMINI_RETRY
 async def async_ocr_generate(image_input, as_markdown=False):
     async with GEMINI_LIMITER:
         model = genai.GenerativeModel(OCR_MODEL_NAME)
+        
         if as_markdown:
             log.debug("Calling Gemini Vision API (Markdown Mode)...")
-            prompt = "Transcribe this document image. Format the output strictly as Markdown. Preserve all tables, headings, and lists exactly as they appear."
+            prompt = "Transcribe the text in this image precisely. Format the output strictly as Markdown."
         else:
             log.debug("Calling Gemini Vision API (Raw Text Mode)...")
-            prompt = "Transcribe this document image precisely as raw text:"
+            prompt = "Transcribe the text in this image precisely as raw text."
             
-        response = await model.generate_content_async([prompt, image_input])
-        text_length = len(response.text) if response.text else 0
-        log.debug(f"Gemini API returned {text_length} characters.")
-        return clean_text(response.text.strip())
+        try:
+            response = await model.generate_content_async(
+                [prompt, image_input],
+                safety_settings={
+                    HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
+                    HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
+                    HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
+                    HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
+                }
+            )
+            
+            # DEFENSIVE CHECK: Catch the Gemini block
+            if not response.candidates or not response.candidates[0].content.parts:
+                reason = getattr(response.candidates[0], "finish_reason", "Unknown") if response.candidates else "Unknown"
+                
+                # Check if it is a Recitation (4) block. If so, trigger the fallback.
+                if reason == 4 or str(reason) == "FinishReason.RECITATION":
+                    log.warning("Gemini API blocked page (RECITATION). Engaging Cloud Vision API fallback...")
+                    fallback_text = await asyncio.to_thread(_cloud_vision_fallback, image_input)
+                    return clean_text(fallback_text.strip())
+                else:
+                    # If it blocked for a different safety reason, bubble it up
+                    raise ValueError(f"Gemini API Blocked Page. Exact Finish Reason: {reason}")
+            
+            return clean_text(response.text.strip())
+            
+        except Exception as e:
+            # Re-raise so the pipeline catches it and writes to the .log file
+            raise ValueError(f"OCR Generation Failed: {e}")
+
 
 async def extract_hybrid_markdown_from_pdf_async(file_path):
     log.info(f"Starting Hybrid PDF Extraction for: {pathlib.Path(file_path).name}")
@@ -261,6 +338,8 @@ async def extract_hybrid_markdown_from_pdf_async(file_path):
                 log.debug(f"Page {p_num+1}: Low text density detected ({len(text)} chars). Flagging for Vision OCR.")
                 pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False, clip=clip_rect)
                 img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                del pix 
+                
                 return {"type": "image", "content": img}
             else:
                 log.debug(f"Page {p_num+1}: Sufficient text density. Extracting native Markdown.")
@@ -278,12 +357,15 @@ async def extract_hybrid_markdown_from_pdf_async(file_path):
             if page_data["type"] == "image":
                 gemini_md = await async_ocr_generate(page_data["content"], as_markdown=True)
                 md_pages.append(gemini_md)
+
+                del page_data["content"]
             else:
                 md_pages.append(page_data["content"])
 
         final_md = "\n\n---\n\n".join(md_pages)
         log.info(f"Completed Hybrid PDF Extraction. Total generated Markdown size: {len(final_md)} characters.")
         return final_md
+    
     except Exception as e:
         log.error(f"Critical Hybrid PDF Read Error {file_path}: {e}")
         return ""
@@ -325,7 +407,7 @@ async def process_single_file_async(topic_id, file_path, root_folder):
         if meta_path.exists():
             log.debug(f"Found metadata file: {meta_path.name}")
             with open(meta_path, 'r') as f: origin_url = f.read().strip()
-            meta_path.unlink()
+            #meta_path.unlink()
 
         source_name = origin_url if origin_url else relative_path_str
         log.debug(f"Assigned source identifier: {source_name}")
@@ -342,14 +424,20 @@ async def process_single_file_async(topic_id, file_path, root_folder):
             elif filename.lower().endswith((".png", ".jpg", ".jpeg")):
                 log.info(f"Routing '{filename}' to Raw Image OCR.")
                 full_text = await async_ocr_generate(Image.open(file_path), as_markdown=True)
-                is_markdown = filename.lower().endswith(".md")
+                is_markdown = True
             elif filename.lower().endswith((".txt", ".md")):
                 log.info(f"Routing '{filename}' to standard text read.")
-                with open(file_path, 'r', encoding='utf-8') as f: full_text = f.read()
+                full_text = await asyncio.to_thread(file_path.read_text, encoding='utf-8')
                 is_markdown = filename.lower().endswith(".md")
 
             if not full_text: 
                 log.warning(f"Aborting '{filename}': No readable text was extracted.")
+
+                # Write an explicit error log file
+                log_file = file_path.with_suffix(".log")
+                error_msg = "Ingestion Error: No readable text was extracted.\nPossible causes: The document is entirely blank, corrupt, or Gemini blocked the content due to copyright/safety filters."
+                await asyncio.to_thread(log_file.write_text, error_msg, encoding="utf-8")
+
                 await finalize_file_move(file_path, root_folder, topic_id, success=False)
                 return False
             
@@ -357,8 +445,7 @@ async def process_single_file_async(topic_id, file_path, root_folder):
             artifact_ext = ".md" if is_markdown else ".ocr"
             artifact_path = file_path.with_suffix(file_path.suffix + artifact_ext)
             log.debug(f"Writing extracted text artifact to {artifact_path.name}")
-            with open(artifact_path, "w", encoding="utf-8") as f_art: 
-                f_art.write(full_text)
+            await asyncio.to_thread(artifact_path.write_text, full_text, encoding="utf-8")
             
             # --- TWO-PASS CHUNKING LOGIC ---
             log.debug("Initiating chunking process...")
@@ -407,6 +494,9 @@ async def process_single_file_async(topic_id, file_path, root_folder):
             
             for i in range(0, len(points), 100):
                 await qdrant_client.upsert(collection_name=QDRANT_COLLECTION, points=points[i:i+100])
+
+            # Cleanup metadata file if it exists
+            if meta_path.exists(): await asyncio.to_thread(meta_path.unlink)
             
             log.info(f"SUCCESS: Finished processing and indexing '{filename}'.")
             await finalize_file_move(file_path, root_folder, topic_id, success=True)
@@ -414,6 +504,12 @@ async def process_single_file_async(topic_id, file_path, root_folder):
 
         except Exception as e:
             log.error(f"Process Failure for '{filename}': {e}", exc_info=True)
+
+            # Write the exception traceback to the log file
+            log_file = file_path.with_suffix(".log")
+            error_msg = f"Critical Ingestion Exception:\n{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
+            await asyncio.to_thread(log_file.write_text, error_msg, encoding="utf-8")
+
             await finalize_file_move(file_path, root_folder, topic_id, success=False)
             return False
 
@@ -436,6 +532,10 @@ async def finalize_file_move(file_path, root_folder, topic_id, success):
             if artifact_sibling.exists():
                 log.debug(f"Finalizing file: moving artifact {artifact_sibling.name} to {final_dest.parent}")
                 await asyncio.to_thread(safe_move_file, artifact_sibling, final_dest.parent)
+
+        error_log_sibling = file_path.with_suffix(".log")
+        if error_log_sibling.exists():
+            await asyncio.to_thread(safe_move_file, error_log_sibling, final_dest.parent)
             
         status_tag = '[SUCCESS]' if success else '[ERROR]'
         log.info(f"File lifecycle complete: {status_tag} {file_path.name}")
@@ -448,40 +548,50 @@ async def process_topic_folder_async(topic_id, folder_path):
     
     # 1. URL Batch (PARALLELIZED)
     url_file = folder_path / "urls.txt"
+    urls = []
     if url_file.exists():
         log.info(f"Scraping URLs from {url_file.name}")
         with open(url_file, 'r') as f:
             urls = [l.strip() for l in f if l.strip().startswith("http")]
 
-        async def process_url(u):
-            return u, await asyncio.to_thread(scrape_web_page, u, folder_path)
-
-        url_tasks = [process_url(u) for u in urls]
+        # Run scraper in parallel
+        url_tasks = [scrape_web_page_async(u, folder_path) for u in urls]
         url_results = await asyncio.gather(*url_tasks)
 
-        for url, text in url_results:
+        for i, text in enumerate(url_results):
             if text:
                 v_name = f"web_{uuid.uuid4().hex[:8]}.txt"
                 v_path = folder_path / v_name
                 with open(v_path, 'w', encoding='utf-8') as f_v: f_v.write(text)
-                with open(str(v_path) + ".meta", 'w', encoding='utf-8') as f_m: f_m.write(url)
+                with open(str(v_path) + ".meta", 'w', encoding='utf-8') as f_m: f_m.write(urls[i])
         
-        # Move the urls.txt file to processed immediately after scraping
         await asyncio.to_thread(safe_move_file, str(url_file), PROCESSED_FOLDER / topic_id)
 
     # 2. File Batch
-    all_files = [
+    all_files_gen = (
         p for p in folder_path.rglob("*") 
-        if p.is_file() and not p.name.endswith(".meta") and p.name != "urls.txt"
-    ]
+        if p.is_file() and not p.name.endswith((".meta", ".ocr", ".md")) and p.name != "urls.txt"
+    )
     
-    if not all_files:
-        log.info(f"No documents found to ingest in topic folder '{topic_id}'.")
-    else:
-        log.info(f"Topic '{topic_id}' has {len(all_files)} files ready for ingestion.")
+    log.info(f"Scanning Topic '{topic_id}' for files ready for ingestion...")
     
-    tasks = [process_single_file_async(topic_id, p, folder_path) for p in all_files]
-    results = await asyncio.gather(*tasks)
+    results = []
+    batch = []
+    CHUNK_SIZE = 5  # Number of files to process simultaneously. Adjust based on RAM.
+
+    for p in all_files_gen:
+        batch.append(process_single_file_async(topic_id, p, folder_path))
+        
+        # When the batch hits the limit, execute it and clear it
+        if len(batch) >= CHUNK_SIZE:
+            batch_results = await asyncio.gather(*batch)
+            results.extend(batch_results)
+            batch = [] # Free the memory used by these task objects
+            
+    # Execute any remaining tasks that didn't fill the last chunk
+    if batch:
+        batch_results = await asyncio.gather(*batch)
+        results.extend(batch_results)
 
     # 3. Final Metadata & Cleanup
     if any(results): 
@@ -489,27 +599,33 @@ async def process_topic_folder_async(topic_id, folder_path):
         await asyncio.to_thread(register_topic_safe, topic_id)
     
     log.debug("Cleaning up empty directories in watch folder...")
-    for root, dirs, files in os.walk(folder_path, topdown=False):
-        for name in dirs:
-            try: os.rmdir(os.path.join(root, name))
-            except OSError: pass
+    def _cleanup():
+        for root, dirs, files in os.walk(folder_path, topdown=False):
+            for name in dirs:
+                try: os.rmdir(os.path.join(root, name))
+                except OSError: pass
+    await asyncio.to_thread(_cleanup)
 
     log.info(f"====== Topic End: '{topic_id}' ======")
 
 async def main_run():
     log.info("Ingestion Worker Active - Beginning One Shot Run")
-    await initialize_qdrant_collection()
+    try:
+        await initialize_qdrant_collection()
 
-    folders = [f for f in os.listdir(WATCH_FOLDER) if (WATCH_FOLDER / f).is_dir()]
-    if not folders:
-        log.info("No topic folders found in watch directory. Exiting.")
-        return
+        folders = [f for f in os.listdir(WATCH_FOLDER) if (WATCH_FOLDER / f).is_dir()]
+        if not folders:
+            log.info("No topic folders found in watch directory. Exiting.")
+            return
 
-    log.info(f"Found {len(folders)} topic folders: {folders}")
-    for tid in folders: 
-        await process_topic_folder_async(tid, WATCH_FOLDER / tid)
-    
-    log.info("One Shot Run Finished Successfully.")
+        log.info(f"Found {len(folders)} topic folders: {folders}")
+        for tid in folders: 
+            await process_topic_folder_async(tid, WATCH_FOLDER / tid)
+        
+        log.info("One Shot Run Finished Successfully.")
+    finally:
+        # Ensures connection pool is closed to prevent OS socket leaks
+        await http_client.aclose()
 
 if __name__ == "__main__":
     asyncio.run(main_run())
