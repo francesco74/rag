@@ -104,7 +104,8 @@ except Exception as e:
 try:
     qdrant_client = AsyncQdrantClient(
         host=os.environ.get("QDRANT_HOST", "localhost"), 
-        port=int(os.environ.get("QDRANT_PORT", 6333))
+        port=int(os.environ.get("QDRANT_PORT", 6333)),
+        timeout=60.0
     )
     QDRANT_COLLECTION = "document_chunks"
     CACHE_COLLECTION = "semantic_cache"

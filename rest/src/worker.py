@@ -5,10 +5,10 @@ import uuid
 from celery import Celery
 from celery.signals import worker_process_init, worker_shutdown
 from celery.schedules import crontab
-from celery.signals import worker_shutdown
 from mysql.connector import pooling
 from qdrant_client import QdrantClient, models
 import google.generativeai as genai
+
 from dotenv import load_dotenv
 
 # Use the optimized reranker
@@ -72,6 +72,8 @@ GEMINI_RETRY = retry(
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["ONNXRUNTIME_EXECUTION_MODE"] = "PARALLEL"
 
+QDRANT_COLLECTION = "document_chunks"
+CACHE_COLLECTION = "semantic_cache"
 
 # ==============================================================================
 # 2. CELERY INITIALIZATION
@@ -82,7 +84,9 @@ celery_app.conf.update(
     worker_concurrency=1,
     worker_prefetch_multiplier=1,   
     task_acks_late=True,
-    task_reject_on_worker_lost=True
+    task_reject_on_worker_lost=True,
+    worker_max_tasks_per_child=100,  # Restart worker after 100 tasks
+    worker_max_memory_per_child=2000000, # 2GB limit
 )
 
 # ==============================================================================
@@ -124,92 +128,30 @@ def init_worker_process(**kwargs):
         genai.configure(api_key=os.environ.get("GOOGLE_API_KEY"))
         
         # Instantiate models here
-        TRANSFORM_MODEL = genai.GenerativeModel("gemini-2.5-flash")
-        ROUTER_MODEL = genai.GenerativeModel("gemini-2.5-flash")
-        GENERATOR_MODEL = genai.GenerativeModel("gemini-2.5-flash")
+        OCR_MODEL_NAME = os.environ.get("OCR_MODEL_NAME", "gemini-3-flash-preview")
+        TRANSFORM_MODEL = genai.GenerativeModel(OCR_MODEL_NAME)
+        ROUTER_MODEL = genai.GenerativeModel(OCR_MODEL_NAME)
+        GENERATOR_MODEL = genai.GenerativeModel(OCR_MODEL_NAME)
         log.info("✓ Resources successfully initialized for this process.")
     except Exception as e:
         log.critical(f"✗ Failed to initialize worker resources: {e}")
         raise
 
-# ==============================================================================
-# 3. GLOBAL MODEL & DB INITIALIZATION
-# ==============================================================================
-
-log.info("Initializing Worker Resources...")
-
-# --- A. Database Connection Pool ---
-db_pool = None
-try:
-    db_config = {
-        "host": os.environ.get("DB_HOST", "localhost"),
-        "user": os.environ.get("DB_USER", "root"),
-        "password": os.environ.get("DB_PASS", "password"),
-        "database": os.environ.get("DB_NAME", "rag_system")
-    }
-
-    db_pool = pooling.MySQLConnectionPool(
-        pool_name="worker_pool",
-        pool_size=5,
-        pool_reset_session=True,
-        **db_config
-    )
-    log.info("✓ MySQL Connection Pool created.")
-except Exception as e:
-    log.critical(f"✗ Failed to create DB Pool: {e}")
-    raise
-
-# --- B. Qdrant Client ---
-qdrant_client = None
-try:
-    QDRANT_HOST = os.environ.get("QDRANT_HOST", "localhost")
-    QDRANT_PORT = int(os.environ.get("QDRANT_PORT", 6333))
-    qdrant_client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
-    QDRANT_COLLECTION = "document_chunks"
-    CACHE_COLLECTION = "semantic_cache"
-    
-    qdrant_client.get_collections()
-    log.info(f"✓ Qdrant client connected to {QDRANT_HOST}:{QDRANT_PORT}")
-except Exception as e:
-    log.critical(f"✗ Failed to connect to Qdrant: {e}")
-    raise
-
-# --- C. Google Gemini ---
-try:
-    GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
-    if not GOOGLE_API_KEY:
-        raise ValueError("GOOGLE_API_KEY environment variable not set!")
-    
-    log.info(f"Using GOOGLE_API_KEY: {GOOGLE_API_KEY[:8]}***")
-
-    genai.configure(api_key=GOOGLE_API_KEY)
-    
-    EMBEDDING_MODEL = "gemini-embedding-001"
-    TRANSFORM_MODEL = genai.GenerativeModel("gemini-2.5-flash")
-    ROUTER_MODEL = genai.GenerativeModel("gemini-2.5-flash")
-    GENERATOR_MODEL = genai.GenerativeModel("gemini-2.5-flash")
-    
-    log.info("✓ Gemini models configured.")
-except Exception as e:
-    log.critical(f"✗ Failed to initialize Gemini: {e}")
-    raise
-
-# --- D. OPTIMIZED Cross-Encoder Reranker ---
-#ONNX_MODEL_CACHE_PATH = "./model_cache/bge-reranker-v2-m3-ONNX-int8"
-ONNX_MODEL_CACHE_PATH = "./model_cache/mmarco-mMiniLMv2-L12-H384-v1"
-_RERANKER_INSTANCE = None # Singleton holder for the reranker, initialized lazily inside the worker process to avoid deadlocks.
 
 # ==============================================================================
 # 4. HELPER FUNCTIONS
 # ==============================================================================
 
 def get_db_connection():
-    """Get a connection from the pool."""
+    """Get a connection from the pool and ensure it is alive."""
     if not db_pool:
         log.error("DB pool not initialized!")
         return None
     try:
-        return db_pool.get_connection()
+        conn = db_pool.get_connection()
+        # FIX: Pragmatic check to re-establish dropped connections
+        conn.ping(reconnect=True, attempts=2, delay=1) 
+        return conn
     except Exception as e:
         log.error(f"Error getting connection from pool: {e}")
         return None
@@ -349,7 +291,7 @@ def generate_answer(query, rich_context, topic_id, topics_list):
     log.info(f"Generating answer (prompt: {len(prompt)} chars, "
              f"chunks: {len(rich_context)})")
     
-    log.debug(f"Context... {context_str}... ")
+    log.debug(f"Context... {context_str[:500]}... ")
     
     response = GENERATOR_MODEL.generate_content(prompt)
     return response.text.strip()
@@ -786,6 +728,10 @@ def process_rag_query(self, query, history):
 # 9. WORKER LIFECYCLE
 # ==============================================================================
 
+@worker_shutdown.connect
 def cleanup_worker(**kwargs):
-    if qdrant_client: qdrant_client.close()
+    """Gracefully close connections when the worker shuts down."""
+    if qdrant_client:
+        qdrant_client.close()
+        log.info("Qdrant client closed.")
 

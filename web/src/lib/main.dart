@@ -17,6 +17,18 @@ enum AppTheme { light, dark, highContrast }
 // 2. Create the Notifier (defaults to light)
 final ValueNotifier<AppTheme> themeNotifier = ValueNotifier(AppTheme.light);
 
+/// Single source of truth for theme cycling.
+/// Referenced by both the keyboard shortcut and the AppBar icon button.
+void _cycleTheme() {
+  if (themeNotifier.value == AppTheme.light) {
+    themeNotifier.value = AppTheme.dark;
+  } else if (themeNotifier.value == AppTheme.dark) {
+    themeNotifier.value = AppTheme.highContrast;
+  } else {
+    themeNotifier.value = AppTheme.light;
+  }
+}
+
 // Status enum for feedback
 enum FeedbackStatus { none, like, dislike }
 
@@ -93,14 +105,7 @@ class AiChatApp extends StatelessWidget {
                 actions: <Type, Action<Intent>>{
                   ToggleThemeIntent: CallbackAction<ToggleThemeIntent>(
                     onInvoke: (ToggleThemeIntent intent) {
-                      // Cycle through the themes
-                      if (currentTheme == AppTheme.light) {
-                        themeNotifier.value = AppTheme.dark;
-                      } else if (currentTheme == AppTheme.dark) {
-                        themeNotifier.value = AppTheme.highContrast;
-                      } else {
-                        themeNotifier.value = AppTheme.light;
-                      }
+                      _cycleTheme();
                       return null;
                     },
                   ),
@@ -176,6 +181,50 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
+  Future<void> _promptFeedbackComment(ChatMessage message, bool isLike) async {
+    if (message.isUser || message.isError || message.isSystemMessage) return;
+
+    // 1. Instantly update UI for snappy responsiveness
+    setState(() {
+      message.feedback = isLike ? FeedbackStatus.like : FeedbackStatus.dislike;
+    });
+
+    final TextEditingController commentController = TextEditingController();
+
+    // 2. Prompt for an optional comment
+    await showDialog(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: Text(isLike ? AppTranslations.get('like_msg', langNotifier.value) : AppTranslations.get('dislike_msg', langNotifier.value)),
+          content: TextField(
+            controller: commentController,
+            maxLines: 3,
+            decoration: InputDecoration(
+              hintText: AppTranslations.get('comment_hint', langNotifier.value),
+              border: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(8.0),
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text("Skip"),
+            ),
+            ElevatedButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text("Submit"),
+            ),
+          ],
+        );
+      },
+    );
+
+    // 3. Fire the backend call with the comment
+    await _sendFeedback(message, isLike, commentController.text.trim());
+  }
+
   /// Builds the static project information header at the top of the chat
   Widget _buildProjectInfoHeader() {
     final theme = Theme.of(context);
@@ -202,7 +251,7 @@ class _ChatScreenState extends State<ChatScreen> {
             return Padding(
               padding: const EdgeInsets.all(24.0),
               child: Text(
-                "Errore nel caricamento del messaggio di benvenuto.",
+                AppTranslations.get('welcome_load_error', langNotifier.value),
                 style: theme.textTheme.bodyMedium!.copyWith(
                   color: theme.colorScheme.error,
                 ),
@@ -366,12 +415,13 @@ class _ChatScreenState extends State<ChatScreen> {
         throw Exception(AppTranslations.get('timeout', langNotifier.value));
       }
 
-      // 1. Wait before checking (Dynamic Backoff is cleaner, but 2s is fine)
-      await Future.delayed(const Duration(seconds: 2));
-
-      // 2. Check Status
+      // 1. Check Status — delay is at the END of the loop so the first
+      //    request fires immediately (catches fast cache-hit responses ~200ms).
       try {
-        final response = await http.get(Uri.parse(statusUrl));
+        final response = await http.get(
+          Uri.parse(statusUrl),
+          headers: {"Authorization": "Bearer ${AppSettings.apiSecretKeyValue}"},
+        );
 
         // Reset error counter on successful connection
         consecutiveErrors = 0;
@@ -404,6 +454,9 @@ class _ChatScreenState extends State<ChatScreen> {
           );
         }
       }
+
+      // Wait between polls (not before the first one).
+      await Future.delayed(const Duration(seconds: 2));
     }
   }
 
@@ -431,8 +484,10 @@ class _ChatScreenState extends State<ChatScreen> {
         .map((msg) => {'role': msg.role, 'text': msg.text})
         .toList();
 
-    // Flask expects history without the current query
-    final chatHistoryForApi = chatHistory.length > 1
+    // Flask expects history without the current query.
+    // Explicit type annotation prevents the ternary from being inferred
+    // as List<dynamic> when the else branch returns an empty literal.
+    final List<Map<String, dynamic>> chatHistoryForApi = chatHistory.length > 1
         ? chatHistory.sublist(0, chatHistory.length - 1)
         : [];
 
@@ -447,7 +502,10 @@ class _ChatScreenState extends State<ChatScreen> {
       final response = await http
           .post(
             Uri.parse(chatUrl),
-            headers: {"Content-Type": "application/json"},
+            headers: {
+              "Content-Type": "application/json",
+              "Authorization": "Bearer ${AppSettings.apiSecretKeyValue}",
+            },
             body: jsonEncode({
               "history": chatHistoryForApi,
               "query": lastQuery,
@@ -522,7 +580,7 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   // --- Feedback Logic ---
-  Future<void> _sendFeedback(ChatMessage message, bool isLike) async {
+  Future<void> _sendFeedback(ChatMessage message, bool isLike, String comment) async {
     // Prevent sending feedback for system/error messages or user messages
     if (message.isUser || message.isError || message.isSystemMessage) return;
 
@@ -555,17 +613,26 @@ class _ChatScreenState extends State<ChatScreen> {
     // 4. Send to Backend
     try {
       final String apiUrl = "${AppSettings.apiUrl}/feedback";
-      await http.post(
+      final feedbackResponse = await http.post(
         Uri.parse(apiUrl),
-        headers: {"Content-Type": "application/json"},
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": "Bearer ${AppSettings.apiSecretKeyValue}",
+        },
         body: jsonEncode({
           "query": userQuery,
           "answer": message.text,
           "topic_id": message.topic,
           "rating": isLike ? 1 : -1,
           "history": contextHistory,
+          "comment": comment,
         }),
       );
+
+      // Treat any non-2xx response as a failure
+      if (feedbackResponse.statusCode < 200 || feedbackResponse.statusCode >= 300) {
+        throw Exception("Server returned ${feedbackResponse.statusCode}");
+      }
 
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -596,12 +663,15 @@ class _ChatScreenState extends State<ChatScreen> {
     setState(() {
       _messages.insert(0, message);
     });
-    // Animate to the (new) top of the reversed list
-    _scrollController.animateTo(
-      0.0,
-      duration: const Duration(milliseconds: 300),
-      curve: Curves.easeOut,
-    );
+    // Guard against animateTo being called before the ScrollView is laid out
+    // (e.g. the welcome message is inserted during initState).
+    if (_scrollController.hasClients) {
+      _scrollController.animateTo(
+        0.0,
+        duration: const Duration(milliseconds: 300),
+        curve: Curves.easeOut,
+      );
+    }
   }
 
   /// --- Opens Nginx Document URLs ---
@@ -690,16 +760,7 @@ class _ChatScreenState extends State<ChatScreen> {
                   'toggle_theme',
                   langNotifier.value,
                 ), // Translated tooltip
-                onPressed: () {
-                  // Cycle through the themes
-                  if (currentTheme == AppTheme.light) {
-                    themeNotifier.value = AppTheme.dark;
-                  } else if (currentTheme == AppTheme.dark) {
-                    themeNotifier.value = AppTheme.highContrast;
-                  } else {
-                    themeNotifier.value = AppTheme.light;
-                  }
-                },
+                onPressed: _cycleTheme,
               );
             },
           ),
@@ -808,11 +869,8 @@ class _ChatScreenState extends State<ChatScreen> {
                             ? Colors.green
                             : theme.colorScheme.onSurfaceVariant,
                       ),
-                      onPressed: () => _sendFeedback(message, true),
-                      tooltip: AppTranslations.get(
-                        'good_response',
-                        langNotifier.value,
-                      ),
+                      onPressed: () => _promptFeedbackComment(message, true), 
+                      tooltip: AppTranslations.get('good_response', langNotifier.value),
                     ),
                     IconButton(
                       icon: Icon(
@@ -824,7 +882,7 @@ class _ChatScreenState extends State<ChatScreen> {
                             ? Colors.red
                             : theme.colorScheme.onSurfaceVariant,
                       ),
-                      onPressed: () => _sendFeedback(message, false),
+                      onPressed: () => _promptFeedbackComment(message, false),
                       tooltip: AppTranslations.get(
                         'bad_response',
                         langNotifier.value,
@@ -1019,7 +1077,7 @@ class _ChatScreenState extends State<ChatScreen> {
         color: theme.colorScheme.surface,
         boxShadow: [
           BoxShadow(
-            color: Colors.black.withOpacity(0.1),
+            color: Colors.black.withValues(alpha: 0.1),
             blurRadius: 10,
             offset: const Offset(0, -5),
           ),

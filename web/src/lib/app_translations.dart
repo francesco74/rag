@@ -10,17 +10,15 @@ final ValueNotifier<AppLang> langNotifier = ValueNotifier(AppLang.it);
 class AppTranslations {
   static const Map<String, Map<AppLang, String>> _strings = {
     'welcome_msg': {
-      AppLang.it: "<p>Ciao! Chiedimi qualunque cosa sui documenti che conosco.</p>",
+      AppLang.it:
+          "<p>Ciao! Chiedimi qualunque cosa sui documenti che conosco.</p>",
       AppLang.en: "<p>Hi! Ask me anything about the documents I know.</p>",
     },
     'ask_hint': {
       AppLang.it: "Sottoponi la domanda...",
       AppLang.en: "Ask a question...",
     },
-    'clear_chat': {
-      AppLang.it: "Svuota Chat",
-      AppLang.en: "Clear Chat",
-    },
+    'clear_chat': {AppLang.it: "Svuota Chat", AppLang.en: "Clear Chat"},
     'chat_cleared': {
       AppLang.it: "Cronologia chat cancellata.",
       AppLang.en: "Chat history cleared.",
@@ -35,8 +33,8 @@ class AppTranslations {
     },
     // Bonus: You can also translate the path to your welcome HTML file!
     'welcome_html_path': {
-      AppLang.it: "assets/html/welcome_it.html", 
-      AppLang.en: "assets/html/welcome_en.html", 
+      AppLang.it: "assets/html/welcome_it.html",
+      AppLang.en: "assets/html/welcome_en.html",
     },
     'timeout': {
       AppLang.it: "La richiesta ha impiegato troppo tempo. Riprova.",
@@ -57,19 +55,13 @@ class AppTranslations {
     'good_response': {
       AppLang.it: "Buona risposta",
       AppLang.en: "Good response",
-    },    
-    'bad_response': {
-      AppLang.it: "Risposta errata",
-      AppLang.en: "Bad response",
     },
+    'bad_response': {AppLang.it: "Risposta errata", AppLang.en: "Bad response"},
     'unknown_topic': {
       AppLang.it: "argomento sconosciuto",
       AppLang.en: "unknown topic",
     },
-    'error': {
-      AppLang.it: "Errore",
-      AppLang.en: "Error",
-    },
+    'error': {AppLang.it: "Errore", AppLang.en: "Error"},
     'unknown_error': {
       AppLang.it: "Errore sconosciuto",
       AppLang.en: "Unknown error",
@@ -78,9 +70,22 @@ class AppTranslations {
       AppLang.it: "Grazie per il tuo feedback!",
       AppLang.en: "Thanks for your feedback!",
     },
-    'toggle_theme': {
-      AppLang.it: "Cambia tema",
-      AppLang.en: "Toggle Theme",
+    'toggle_theme': {AppLang.it: "Cambia tema", AppLang.en: "Toggle Theme"},
+    'welcome_load_error': {
+      AppLang.it: "Errore nel caricamento del messaggio di benvenuto.",
+      AppLang.en: "Error loading welcome message.",
+    },
+    'like_msg': {
+      AppLang.it: "Felice di esserti stato d'aiuto! Vuoi aggiungere un commento?",
+      AppLang.en: "Glad it helped! Would you like to add a comment?",
+    },
+    'dislike_msg': {
+      AppLang.it: "Mi dispiace che la risposta non sia stata utile. Vuoi aggiungere un commento per aiutarci a migliorare?",
+      AppLang.en: "Sorry to hear the response wasn't helpful. Would you like to add a comment to help us improve?", 
+    },
+    'comment_hint': {
+      AppLang.it: "Aggiungi un commento opzionale...",
+      AppLang.en: "Add an optional comment...",
     },
   };
 

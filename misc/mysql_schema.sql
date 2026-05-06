@@ -10,6 +10,7 @@ CREATE TABLE `chat_feedback` (
   `ai_response` text,
   `rating` int DEFAULT NULL,
   `chat_history` json DEFAULT NULL,
+  `comment` text DEFAULT NULL,
   `reviewed` tinyint(1) DEFAULT '0'
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 

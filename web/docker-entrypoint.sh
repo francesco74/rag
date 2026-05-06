@@ -5,6 +5,8 @@ cat <<EOF > /usr/share/nginx/html/env-config.js
 window.ENV_CONFIG = {
   DOCUMENT_URL: "${DOCUMENT_URL:-http://localhost:8080}",
   REST_URL: "${REST_URL:-http://localhost:8080}",
+  API_SECRET_KEY: "${API_SECRET_KEY:-no_secret_key_submitted}",
+  PROJECT_NAME: "${PROJECT_NAME:-BiblioLucca - Progetti innovativi}"
 };
 EOF
 

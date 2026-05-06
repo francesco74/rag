@@ -11,6 +11,8 @@ import json
 
 from dotenv import load_dotenv
 
+load_dotenv()
+
 # ==============================================================================
 # CONFIGURATION & LOGGING
 # ==============================================================================
@@ -28,14 +30,20 @@ app = Flask(__name__)
 ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "http://localhost:3000").split(",")
 CORS(app, origins=ALLOWED_ORIGINS)  # Enable CORS for frontend access
 
+API_SECRET_KEY = os.environ.get("API_SECRET_KEY")
+if not API_SECRET_KEY:
+    log.warning("API_SECRET_KEY is not set — setting default value. This is not secure for production!")
+    API_SECRET_KEY = "default_secret_key"
+ 
+MAX_HISTORY_ITEMS = int(os.environ.get("MAX_HISTORY_ITEMS", 20))
+ 
+
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
 celery_client = Celery(
     'rag_queue', 
     broker=REDIS_URL, 
     backend=REDIS_URL
 )
-
-load_dotenv()
 
 try:
     db_pool = pooling.MySQLConnectionPool(
@@ -51,6 +59,9 @@ except Exception as e:
     log.critical(f"Failed to initialize API DB Pool: {e}")
     # Consider whether the app should crash here if the DB is critical
 
+
+UNPROTECTED_ROUTES = {"/health"}
+
 # ==============================================================================
 # MIDDLEWARE
 # ==============================================================================
@@ -59,6 +70,14 @@ def start_timer_and_add_id():
     request.request_id = str(uuid.uuid4())
     request.start_time = time.time()
     log.debug(f"[{request.request_id}] START {request.method} {request.path}")
+
+    # --- Authentication ---
+    # Skip auth for health checks and when no key is configured (dev mode).
+    if API_SECRET_KEY and request.path not in UNPROTECTED_ROUTES:
+        auth_header = request.headers.get("Authorization", "")
+        if not auth_header.startswith("Bearer ") or auth_header[7:] != API_SECRET_KEY:
+            log.warning(f"[{request.request_id}] Unauthorized request to {request.path}")
+            return jsonify({"error": "Unauthorized"}), 401
 
 @app.after_request
 def log_response(response):
@@ -75,9 +94,15 @@ def log_response(response):
 
 @app.route("/health", methods=["GET"])
 def health_check():
-    """Simple health check for Docker/Load Balancer."""
-    return jsonify({"status": "ok"}), 200
-
+    try:
+        # Quick check if DB pool is alive
+        conn = db_pool.get_connection()
+        conn.ping(reconnect=True)
+        conn.close()
+        return jsonify({"status": "ok", "database": "connected"}), 200
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 503
+    
 @app.route("/chat", methods=["POST"])
 def chat_handler():
     try:
@@ -92,6 +117,13 @@ def chat_handler():
         
         if len(query) > 2000:
             return jsonify({"error": "Payload Too Large", "message": "Query exceeds maximum length"}), 413
+        
+        if not isinstance(history, list):
+            return jsonify({"error": "Bad Request", "message": "'history' must be a list"}), 400
+        history = [
+            h for h in history[:MAX_HISTORY_ITEMS]
+            if isinstance(h, dict) and "role" in h and "text" in h
+        ]
 
         log.info(f"Received query: '{query[:50]}...'. Offloading to Worker.")
 
@@ -164,6 +196,14 @@ def get_task_status(task_id):
 def feedback_handler():
     # ... (Your existing feedback logic remains the same) ...
     # Since it's a simple INSERT, it doesn't strictly need Celery yet.
+
+    if not db_pool:
+        log.error("Feedback rejected: DB pool not initialized.")
+        return jsonify({"error": "Service Unavailable", "message": "Database not available."}), 503
+    
+    conn = None
+    cursor = None
+
     try:
         data = request.json
         query = data.get("query")
@@ -172,6 +212,7 @@ def feedback_handler():
         rating = data.get("rating")
 
         history = data.get("history", [])
+        comment = data.get("comment", "")
         
         if not all([query, answer, rating is not None]):
             return jsonify({"error": "Missing fields"}), 400
@@ -181,8 +222,8 @@ def feedback_handler():
         conn = db_pool.get_connection()
         cursor = conn.cursor()
 
-        sql = "INSERT INTO chat_feedback (user_query, ai_response, topic_id, rating, chat_history) VALUES (%s, %s, %s, %s, %s)"
-        cursor.execute(sql, (query, answer, topic_id, rating, history_json))
+        sql = "INSERT INTO chat_feedback (user_query, ai_response, topic_id, rating, chat_history, comment) VALUES (%s, %s, %s, %s, %s, %s)"
+        cursor.execute(sql, (query, answer, topic_id, rating, history_json, comment))
         conn.commit()
         return jsonify({"status": "success"}), 200
 
