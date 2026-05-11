@@ -9,6 +9,8 @@ from mysql.connector import pooling
 from qdrant_client import QdrantClient, models
 import google.generativeai as genai
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 from dotenv import load_dotenv
 
 # Use the optimized reranker
@@ -51,12 +53,10 @@ ONNX_MODEL_CACHE_PATH = os.environ.get(
     "./model_cache/mmarco-mMiniLMv2-L12-H384-v1"
 )
 
-
 QDRANT_SYNTATIC_SIZE = 20
 QDRANT_SEMANTIC_SIZE = 30
 MAX_CONTEXT_CHARS = 30000 
 
-FORCE_TOPIC = os.environ.get("TOPIC", None)
 MAX_AGE_SECONDS = 86400  # 24 hours
 
 # Gemini Retry Configuration
@@ -74,6 +74,7 @@ os.environ["ONNXRUNTIME_EXECUTION_MODE"] = "PARALLEL"
 
 QDRANT_COLLECTION = "document_chunks"
 CACHE_COLLECTION = "semantic_cache"
+PARENT_COLLECTION = "parent_documents"
 
 # ==============================================================================
 # 2. CELERY INITIALIZATION
@@ -99,7 +100,6 @@ _RERANKER_INSTANCE = None
 
 EMBEDDING_MODEL = "gemini-embedding-001"
 TRANSFORM_MODEL = None
-ROUTER_MODEL = None
 GENERATOR_MODEL = None
 
 @worker_process_init.connect
@@ -108,7 +108,7 @@ def init_worker_process(**kwargs):
     Initializes network connections and models ONLY after Celery forks the process.
     Prevents Socket Corruption and BrokenPipeErrors.
     """
-    global db_pool, qdrant_client, TRANSFORM_MODEL, ROUTER_MODEL, GENERATOR_MODEL
+    global db_pool, qdrant_client, TRANSFORM_MODEL, GENERATOR_MODEL
     log.info("Initializing Worker Resources (Post-Fork)...")
 
     try:
@@ -130,7 +130,6 @@ def init_worker_process(**kwargs):
         # Instantiate models here
         OCR_MODEL_NAME = os.environ.get("OCR_MODEL_NAME", "gemini-3-flash-preview")
         TRANSFORM_MODEL = genai.GenerativeModel(OCR_MODEL_NAME)
-        ROUTER_MODEL = genai.GenerativeModel(OCR_MODEL_NAME)
         GENERATOR_MODEL = genai.GenerativeModel(OCR_MODEL_NAME)
         log.info("✓ Resources successfully initialized for this process.")
     except Exception as e:
@@ -216,33 +215,6 @@ def transform_query(history, query):
 
 
 @GEMINI_RETRY
-def route_query_to_topic(standalone_query, topics):
-    """Route query to most relevant topic using AI."""
-    topic_list_str = "\n".join([
-        f"- {t['topic_id']}: {t['description']}" 
-        for t in topics
-    ])
-    
-    prompt = load_prompt_template("topic_finder").format(
-        topic_string=topic_list_str, 
-        standalone_query=standalone_query
-    )
-    
-    log.debug("Routing query to topic...")
-    
-    response = ROUTER_MODEL.generate_content(prompt)
-    topic_id = response.text.strip().replace("`", "").replace("'", "").replace('"', "")
-    
-    valid_topics = [t['topic_id'] for t in topics]
-    if topic_id in valid_topics:
-        log.info(f"Query routed to topic: '{topic_id}'")
-        return topic_id
-    
-    log.warning(f"AI returned invalid topic '{topic_id}'. Available: {valid_topics}")
-    return None
-
-
-@GEMINI_RETRY
 def extract_keywords_with_ai(query):
     """Extract significant keywords using AI."""
     prompt = load_prompt_template("extract_keywords").format(query=query)
@@ -260,7 +232,7 @@ def extract_keywords_with_ai(query):
 
 
 @GEMINI_RETRY
-def generate_answer(query, rich_context, topic_id, topics_list):
+def generate_answer(query, rich_context, topic_id):
     """Generate final answer using retrieved context."""
     formatted_chunks = []
     curr_len = 0
@@ -275,23 +247,16 @@ def generate_answer(query, rich_context, topic_id, topics_list):
     
     context_str = "".join(formatted_chunks)
     
-    topic_details = next(
-        (t for t in topics_list if t['topic_id'] == topic_id), 
-        None
-    )
-    
-    if topic_details:
-        prompt_file = topic_details.get('prompt') or 'general'
-    else:
-        prompt_file = 'general'
+    # 2. Recupero del Prompt 
+    prompt_file = get_topic_prompt(topic_id)
     
     prompt_tmpl = load_prompt_template(prompt_file)
     prompt = prompt_tmpl.format(context_str=context_str, query=query)
     
-    log.info(f"Generating answer (prompt: {len(prompt)} chars, "
-             f"chunks: {len(rich_context)})")
+    log.info(f"Generating answer for topic '{topic_id}' (prompt file: {prompt_file})")
+    log.debug(f"Context size: {len(context_str)} chars, Chunks: {len(rich_context)}")
     
-    log.debug(f"Context... {context_str[:500]}... ")
+    log.debug(f"Context... {context_str[:200]}... ")
     
     response = GENERATOR_MODEL.generate_content(prompt)
     return response.text.strip()
@@ -301,7 +266,7 @@ def generate_answer(query, rich_context, topic_id, topics_list):
 # 6. SEMANTIC CACHE FUNCTIONS
 # ==============================================================================
 
-def check_semantic_cache(query_vector):
+def check_semantic_cache(query_vector, topic_id, sub_topics_key):
     """Check if similar query exists in cache."""
     if not qdrant_client:
         return None
@@ -311,11 +276,17 @@ def check_semantic_cache(query_vector):
             collection_name=CACHE_COLLECTION,
             query=query_vector,
             limit=1,
-            score_threshold=0.97
+            score_threshold=0.97,
+            query_filter=models.Filter(
+                must=[
+                    models.FieldCondition(key="topic_id", match=models.MatchValue(value=topic_id)),
+                    models.FieldCondition(key="sub_topics_key", match=models.MatchValue(value=sub_topics_key))
+                ]
+            )
         ).points
         
         if hits:
-            log.info(f"✓ Cache HIT (similarity: {hits[0].score:.3f})")
+            log.info(f"✓ Cache HIT (similarity: {hits[0].score:.3f}) for topic '{topic_id}' & sub_topics '{sub_topics_key}'")
             return hits[0].payload
         
         log.debug("Cache MISS")
@@ -325,9 +296,8 @@ def check_semantic_cache(query_vector):
         log.error(f"Cache check failed: {e}")
         return None
 
-
-def save_to_semantic_cache(query_vector, original_query, answer, sources, topic_id):
-    """Save successful response to semantic cache."""
+def save_to_semantic_cache(query_vector, original_query, answer, sources, topic_id, sub_topics_key):
+    """Salva la risposta in cache includendo la chiave di combinazione dei sub-topic."""
     if not qdrant_client:
         return
     
@@ -339,16 +309,37 @@ def save_to_semantic_cache(query_vector, original_query, answer, sources, topic_
                 "original_query": original_query,
                 "answer": answer,
                 "sources": sources,
-                "topic": topic_id,
+                "topic_id": topic_id,
+                "sub_topics_key": sub_topics_key, 
                 "timestamp": time.time()
             }
         )
-
         qdrant_client.upsert(collection_name=CACHE_COLLECTION, points=[point])
         log.debug("Cache entry saved.")
         
     except Exception as e:
         log.error(f"Cache save failed: {e}")
+
+def get_topic_prompt(topic_id):
+    """Recupera il template del prompt associato al topic. Ritorna 'general' come fallback."""
+    conn = get_db_connection()
+    if not conn:
+        return 'general'
+    
+    try:
+        with conn.cursor(dictionary=True) as cursor:
+            cursor.execute("SELECT prompt FROM topics WHERE topic_id = %s", (topic_id,))
+            row = cursor.fetchone()
+            # Se il campo prompt è NULL o vuoto, restituisce 'general'
+            return row['prompt'] if row and row.get('prompt') else 'general'
+    except Exception as e:
+        log.error(f"Errore durante il recupero del prompt per il topic '{topic_id}': {e}")
+        return 'general'
+    finally:
+        conn.close()
+
+def generate_sub_topics_key(selected_sub_topics):
+   return ",".join(sorted(selected_sub_topics))
 
 
 @celery_app.task(name="prune_semantic_cache")
@@ -395,96 +386,55 @@ def setup_periodic_tasks(sender, **kwargs):
 # ==============================================================================
 # 7. DOCUMENT RETRIEVAL (With OPTIMIZED Reranking)
 # ==============================================================================
-
-def retrieve_chunks(query, vector, topic_id):
-    """
-    Hybrid retrieval with OPTIMIZED reranking.
-    
-    Expected: 94s → ~5-10s for 59 documents
-    """
+def retrieve_chunks(query, vector, topic_id, selected_sub_topics):
     if not qdrant_client:
         log.error("Qdrant client not available!")
         return [], []
     
     try:
-        log.info(f"Retrieving chunks for topic '{topic_id}'...")
+        log.info(f"=== Inizio Retrieval (Parent-Child) per topic '{topic_id}' ===")
         fused_hits = {}
         
         # ==================================================================
-        # PARALLEL SEARCH
+        # 1. PARALLEL SEARCH (Vector + Keyword)
         # ==================================================================
+        must_conditions = [models.FieldCondition(key="topic_id", match=models.MatchValue(value=topic_id))]
+        if selected_sub_topics:
+            must_conditions.append(models.FieldCondition(key="sub_topic_id", match=models.MatchAny(any=selected_sub_topics)))
+
         def vector_search():
-            """Semantic vector search."""
             res = qdrant_client.query_points(
                 collection_name=QDRANT_COLLECTION,
-                query=vector,
+                query=vector, 
                 limit=QDRANT_SEMANTIC_SIZE,
-                query_filter=models.Filter(
-                    must=[models.FieldCondition(
-                        key="topic_id", 
-                        match=models.MatchValue(value=topic_id)
-                    )]
-                )
+                query_filter=models.Filter(must=must_conditions)
             )
-            log.info(f"Vector search: {len(res.points)} hits")
+            log.info(f"Child Vector search: {len(res.points)} hits")
             return res.points
         
         def keyword_search():
-            """Keyword search with AI extraction."""
             try:
                 keywords = extract_keywords_with_ai(query)
-                log.info(f"Keywords extracted: {keywords}")
+                log.info(f"Keywords estratte per Child Search: {keywords}")
             except Exception as e:
-                log.warning(f"AI keyword extraction failed: {e}. Using fallback.")
+                log.warning(f"AI keyword extraction fallita: {e}. Uso fallback.")
                 keywords = [w.lower() for w in query.split() if len(w) > 3]
-                keywords = list(dict.fromkeys(keywords))
             
-            if not keywords:
-                log.info("No valid keywords - skipping keyword search.")
+            if not keywords: 
                 return []
             
-            min_match = 1
-            
-            log.debug(f"Min-match threshold: {min_match}/{len(keywords)}")
-            
-            should_cond = [
-                models.FieldCondition(key="content", match=models.MatchText(text=w))
-                for w in keywords
-            ]
-            
+            should_cond = [models.FieldCondition(key="content", match=models.MatchText(text=w)) for w in keywords]
             k_res = qdrant_client.scroll(
                 collection_name=QDRANT_COLLECTION,
-                scroll_filter=models.Filter(
-                    must=[
-                        # Condition 1: Must match the topic exactly
-                        models.FieldCondition(
-                            key="topic_id", 
-                            match=models.MatchValue(value=topic_id)
-                        ),
-                        # Condition 2: Must match AT LEAST ONE of the keywords
-                        models.Filter(
-                            should=should_cond
-                        )
-                    ]
-                ),
+                scroll_filter=models.Filter(must=must_conditions + [models.Filter(should=should_cond)]),
                 limit=QDRANT_SYNTATIC_SIZE * 2,
                 with_payload=True
             )
-            
-            k_hits_raw = k_res[0]
-            valid_hits = []
-            
-            for hit in k_hits_raw:
-                content = hit.payload.get("content", "").lower()
-                matches = sum(1 for w in keywords if w in content)
-                
-                if matches >= min_match:
-                    valid_hits.append(hit)
-            
-            log.info(f"Keyword search: {len(k_hits_raw)} raw → {len(valid_hits)} valid")
-            return valid_hits
+            hits = k_res[0]
+            log.info(f"Child Keyword search: {len(hits)} hits validi")
+            return hits
         
-        # Execute searches in parallel
+        # Esecuzione parallela delle ricerche sui Child
         with ThreadPoolExecutor(max_workers=2) as executor:
             futures = {executor.submit(vector_search): "vector", executor.submit(keyword_search): "keyword"}
             for future in as_completed(futures):
@@ -492,64 +442,80 @@ def retrieve_chunks(query, vector, topic_id):
                     for hit in future.result():
                         if hit.id not in fused_hits: fused_hits[hit.id] = hit
                 except Exception as e:
-                    log.error(f"{futures[future]} search failed: {e}")
-        
+                    log.error(f"Ricerca {futures[future]} fallita: {e}")
+                    
         candidates = list(fused_hits.values())
-        
-        if not candidates:
-            log.warning("No documents found in vector or keyword search.")
+        if not candidates: 
+            log.warning("Nessun Child Chunk trovato.")
             return [], []
-        
-        log.info(f"Total unique candidates: {len(candidates)}")
-        
-        top_docs = []
+
+        # ==================================================================
+        # 2. RERANKING SUI CHILD CHUNKS
+        # ==================================================================
+        top_child_docs = []
         reranker = get_reranker()
         
         if reranker and candidates:
-            log.info(f"Reranking {len(candidates)} candidates...")
+            log.info(f"Reranking di {len(candidates)} candidati (Child)...")
             docs_content = [c.payload.get("content", "")[:RERANK_TRUNCATE] for c in candidates]
-            
             try:
-                start_rr = time.time()
-                
-                # Run reranking (Lazy loaded instance)
                 reranked_results = reranker.rerank(query, docs_content)
-                
-                for res in reranked_results[:RERANK_SIZE]:
-                    top_docs.append(candidates[res.index])
-                
-                elapsed = time.time() - start_rr
-                log.info(f"⚡ Reranking completed in {elapsed:.2f}s")
-                
+                top_child_docs = [candidates[res.index] for res in reranked_results[:RERANK_SIZE]]
+                log.info(f"Reranking completato. Selezionati {len(top_child_docs)} Child migliori.")
             except Exception as e:
-                log.error(f"Reranking failed: {e}", exc_info=True)
-                top_docs = candidates[:RERANK_SIZE]
+                log.error(f"Reranking fallito: {e}")
+                top_child_docs = candidates[:RERANK_SIZE]
         else:
-            log.warning("Reranker not initialized or unavailable.")
-            top_docs = candidates[:RERANK_SIZE]
+            top_child_docs = candidates[:RERANK_SIZE]
 
         # ==================================================================
-        # FORMAT OUTPUT
+        # 3. RECUPERO DEI PARENT DOCUMENTS (Il "Contesto Vero")
         # ==================================================================
-        rich_context = [
-            {
-                "content": d.payload.get("content", ""),
-                "source": d.payload.get("source", "")
-            }
-            for d in top_docs
-        ]
+        # Estraiamo i parent_id unici dai Child migliori
+        parent_ids = list(set([
+            doc.payload.get("parent_id") for doc in top_child_docs 
+            if doc.payload and doc.payload.get("parent_id")
+        ]))
+
+        if not parent_ids:
+            log.error("Errore critico: i Child non hanno parent_id nel payload!")
+            return [], []
+
+        log.info(f"Recupero di {len(parent_ids)} Parent Documents dalla collezione '{PARENT_COLLECTION}'...")
         
-        unique_sources = list({
-            d['source']: {"file": d['source']} 
-            for d in rich_context
-        }.values())
-        
-        return rich_context, unique_sources
+        # Recupero batch dei Parent tramite ID
+        parent_records = qdrant_client.retrieve(
+            collection_name=PARENT_COLLECTION,
+            ids=parent_ids,
+            with_payload=True
+        )
+
+        # ==================================================================
+        # 4. ORGANIZZAZIONE RISULTATI PER IL GENERATOR
+        # ==================================================================
+        rich_context = []
+        unique_sources_map = {}
+
+        for p_doc in parent_records:
+            source = p_doc.payload.get("source", "Fonte sconosciuta")
+            sub_topic_id = p_doc.payload.get("sub_topic_id", "")
+            content = p_doc.payload.get("content", "").strip()
+            
+            if content:
+                rich_context.append({
+                    "content": content,
+                    "source": source
+                })
+                
+                if source not in unique_sources_map:
+                    unique_sources_map[source] = {"file": source, "sub_topic": sub_topic_id}
+
+        log.info(f"=== Retrieval terminata. Inviati {len(rich_context)} Parent Documents a Gemini. ===")
+        return rich_context, list(unique_sources_map.values())
         
     except Exception as e:
-        log.error(f"Retrieval process failed: {e}", exc_info=True)
+        log.error(f"Errore durante il processo di retrieval: {e}", exc_info=True)
         return [], []
-
 
 
 def get_reranker():
@@ -579,19 +545,46 @@ def get_reranker():
             
     return _RERANKER_INSTANCE if _RERANKER_INSTANCE is not False else None
 
+
+
+def get_all_sub_topics(topic_id):
+    """Recupera tutti i sub_topic_id associati a un topic dal database."""
+    conn = get_db_connection()
+    if not conn:
+        return []
+    
+    try:
+        with conn.cursor(dictionary=True) as cursor:
+            cursor.execute("SELECT sub_topic_id FROM sub_topics WHERE topic_id = %s", (topic_id,))
+            rows = cursor.fetchall()
+            return [row['sub_topic_id'] for row in rows]
+    except Exception as e:
+        log.error(f"Errore recupero tutti i sub-topics per '{topic_id}': {e}")
+        return []
+    finally:
+        conn.close()
+
 # ==============================================================================
 # 8. MAIN CELERY TASK
 # ==============================================================================
 
 @celery_app.task(bind=True, name="rag_queue")
-def process_rag_query(self, query, history):
+def process_rag_query(self, query, history, topic_id, selected_sub_topics=None):
     """Main RAG processing pipeline with optimized reranking."""
     start_time = time.time()
     task_id = self.request.id
-    log.info(f"[{task_id}] Task started: '{query[:50]}...'")
-    
-    conn = None
-    
+    log.info(f"[{task_id}] Task started: '{query[:50]}...' su topic: {topic_id}")
+
+    if not selected_sub_topics:
+        selected_sub_topics = get_all_sub_topics(topic_id)
+        if not selected_sub_topics:
+            log.error(f"[{task_id}] Nessun sub-topic trovato o configurato per il topic '{topic_id}'.")
+            return {
+                "error": "Configuration Error",
+                "message": "Il topic selezionato non contiene documenti o non è configurato correttamente.",
+                "status": "failed"
+            }
+        
     try:
         # 1. Query Transformation
         try:
@@ -619,58 +612,26 @@ def process_rag_query(self, query, history):
             }
         
         # 3. Cache Check
-        cached = check_semantic_cache(query_vector)
+        st_key = generate_sub_topics_key(selected_sub_topics)
+        cached = check_semantic_cache(query_vector, topic_id, st_key)
         if cached:
             log.info(f"[{task_id}] Returning cached response.")
             return {
                 "answer": cached['answer'],
                 "sources": cached['sources'],
-                "topic": cached['topic'],
+                "topic": cached['topic_id'],
                 "cached": True,
                 "status": "success"
             }
         
-        # 4. Load Topics
-        conn = get_db_connection()
-        if not conn:
-            raise ValueError("Database connection failed")
-        
-        topics = []
-        with conn.cursor(dictionary=True) as cursor:
-            cursor.execute("SELECT topic_id, description, aliases, prompt FROM topics")
-            topics = cursor.fetchall()
-        
-        if not topics:
-            log.error("No topics configured!")
-            return {
-                "error": "System Configuration Error",
-                "message": "The system is not properly configured.",
-                "status": "failed"
-            }
-        
-        # 5. Topic Routing\
-        topic_id = FORCE_TOPIC
-        
-        if not topic_id:
-            try:
-                topic_id = route_query_to_topic(standalone_query, topics)
-            except Exception as e:
-                log.error(f"Routing failed: {e}")
-        else:
-            log.debug(f"Forced topic: {topic_id}")
-        
-        if not topic_id:
-            return {
-                "error": "No Matching Topic",
-                "message": "I couldn't identify a relevant topic for your question.",
-                "status": "failed"
-            }
-        
-        log.info(f"[{task_id}] Routed to topic: '{topic_id}'")
-        
-        # 6. Document Retrieval (WITH OPTIMIZED RERANKING!)
-        context, sources = retrieve_chunks(standalone_query, query_vector, topic_id)
-        
+        # 4. Document Retrieval (Saltiamo totalmente la logica LLM di routing)
+        context, sources = retrieve_chunks(
+            standalone_query, 
+            query_vector, 
+            topic_id, 
+            selected_sub_topics
+        )
+
         if not context:
             return {
                 "error": "No Relevant Documents",
@@ -679,9 +640,9 @@ def process_rag_query(self, query, history):
                 "status": "failed"
             }
         
-        # 7. Answer Generation
+        # 5. Answer Generation
         try:
-            answer = generate_answer(standalone_query, context, topic_id, topics)
+            answer = generate_answer(standalone_query, context, topic_id)
         except Exception as e:
             log.error(f"Answer generation failed: {e}")
             return {
@@ -690,14 +651,15 @@ def process_rag_query(self, query, history):
                 "status": "failed"
             }
         
-        # 8. Cache Valid Responses
+        # 6. Cache Valid Responses
         if answer and len(answer) > 20 and "could not find" not in answer.lower():
             save_to_semantic_cache(
                 query_vector, 
                 standalone_query, 
                 answer, 
                 sources, 
-                topic_id
+                topic_id,
+                st_key
             )
         
         duration = time.time() - start_time
@@ -719,11 +681,6 @@ def process_rag_query(self, query, history):
             "status": "failed"
         }
     
-    finally:
-        if conn and conn.is_connected():
-            conn.close()
-
-
 # ==============================================================================
 # 9. WORKER LIFECYCLE
 # ==============================================================================

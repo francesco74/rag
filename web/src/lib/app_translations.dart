@@ -87,6 +87,14 @@ class AppTranslations {
       AppLang.it: "Aggiungi un commento opzionale...",
       AppLang.en: "Add an optional comment...",
     },
+    'filter_subtopics': {
+      AppLang.it: "Filtra Sottocategorie",
+      AppLang.en: "Filter Subtopics",
+    },
+    'subtopics_title': {
+      AppLang.it: "Sottocategorie",
+      AppLang.en: "Subtopics",
+    },
   };
 
   /// Helper function to grab the correct string based on the current language

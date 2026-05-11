@@ -30,6 +30,8 @@ app = Flask(__name__)
 ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "http://localhost:3000").split(",")
 CORS(app, origins=ALLOWED_ORIGINS)  # Enable CORS for frontend access
 
+ALLOW_SUBTOPIC_SELECTION = os.environ.get("ALLOW_SUBTOPIC_SELECTION", "true").lower() == "true"    
+
 API_SECRET_KEY = os.environ.get("API_SECRET_KEY")
 if not API_SECRET_KEY:
     log.warning("API_SECRET_KEY is not set — setting default value. This is not secure for production!")
@@ -103,6 +105,41 @@ def health_check():
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 503
     
+@app.route("/config", methods=["POST"])
+def get_config():
+    """Invia al frontend i subtopic relativi al topic richiesto."""
+    data = request.json # <--- Leggi il body JSON
+    if not data:
+        return jsonify({"error": "Bad Request", "message": "Invalid JSON"}), 400
+        
+    topic_id = data.get("topic_id") # <--- Recupera topic_id dal JSON
+    if not topic_id:
+        return jsonify({"error": "Bad Request", "message": "topic_id is required"}), 400
+
+    conn = None
+    cursor = None
+
+    try:
+        conn = db_pool.get_connection()
+        cursor = conn.cursor(dictionary=True)
+        
+        cursor.execute("SELECT sub_topic_id, description FROM sub_topics WHERE topic_id = %s", (topic_id,))
+        rows = cursor.fetchall()
+        
+        sub_topics_data = [
+            {"id": row['sub_topic_id'], "desc": row['description'] or row['sub_topic_id']} 
+            for row in rows
+        ]
+
+        return jsonify({
+            "allow_subtopic_selection": ALLOW_SUBTOPIC_SELECTION,
+            "sub_topics": sub_topics_data 
+        }), 200
+    finally:
+        if conn and conn.is_connected():
+            conn.close()
+
+
 @app.route("/chat", methods=["POST"])
 def chat_handler():
     try:
@@ -111,6 +148,12 @@ def chat_handler():
 
         query = data.get("query")
         history = data.get("history", [])
+
+        topic_id = data.get("topic_id")
+        if not topic_id:
+             return jsonify({"error": "Bad Request", "message": "topic_id is required"}), 400
+
+        selected_sub_topics = data.get("sub_topics", []) 
 
         if not query or not isinstance(query, str) or len(query.strip()) == 0:
             return jsonify({"error": "Bad Request", "message": "Valid 'query' string is required"}), 400
@@ -127,12 +170,9 @@ def chat_handler():
 
         log.info(f"Received query: '{query[:50]}...'. Offloading to Worker.")
 
-        # --- FIX 1: Send Task by Name ---
-        # We use send_task() instead of importing the function.
-        # This prevents loading the AI models in the API container.
         task = celery_client.send_task(
             'rag_queue', 
-            args=[query, history]
+            args=[query, history, topic_id, selected_sub_topics] 
         )
 
         return jsonify({
@@ -183,20 +223,9 @@ def get_task_status(task_id):
         log.error(f"Error checking status for {task_id}: {e}")
         return jsonify({"error": "Internal Server Error"}), 500
 
-# ==============================================================================
-# FEEDBACK ENDPOINT (Direct DB Access)
-# ==============================================================================
-# Note: Feedback is light (SQL Insert), so we can keep it synchronous here 
-# or move it to a worker if you expect massive scale.
-
-
-
 
 @app.route("/feedback", methods=["POST"])
 def feedback_handler():
-    # ... (Your existing feedback logic remains the same) ...
-    # Since it's a simple INSERT, it doesn't strictly need Celery yet.
-
     if not db_pool:
         log.error("Feedback rejected: DB pool not initialized.")
         return jsonify({"error": "Service Unavailable", "message": "Database not available."}), 503

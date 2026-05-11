@@ -5,7 +5,7 @@ import 'package:flutter_html/flutter_html.dart'; // For rendering HTML
 import 'package:url_launcher/url_launcher.dart'; // For opening links
 import 'settings.dart'; // Import the settings file
 import 'app_translations.dart'; // Import the translations file
-import 'package:flutter/services.dart'; 
+import 'package:flutter/services.dart';
 
 void main() {
   runApp(const AiChatApp());
@@ -99,7 +99,8 @@ class AiChatApp extends StatelessWidget {
             return Shortcuts(
               shortcuts: <ShortcutActivator, Intent>{
                 // Binds Alt + T (or Option + T on Mac) to our Intent
-                const SingleActivator(LogicalKeyboardKey.keyT, alt: true): const ToggleThemeIntent(),
+                const SingleActivator(LogicalKeyboardKey.keyT, alt: true):
+                    const ToggleThemeIntent(),
               },
               child: Actions(
                 actions: <Type, Action<Intent>>{
@@ -163,11 +164,61 @@ class _ChatScreenState extends State<ChatScreen> {
   final ScrollController _scrollController = ScrollController();
   final List<ChatMessage> _messages = [];
   bool _isLoading = false;
+  bool _isMaintenanceMode = false;
+
+  Map<String, String> _subTopicDescriptions = {};
+  List<String> _availableSubTopicIds = [];
+  Set<String> _selectedSubTopics = {};
+  bool _allowSubtopicSelection = false;
 
   @override
   void initState() {
     super.initState();
     _addWelcomeMessage();
+    _fetchConfig(); // Recupera la configurazione al boot
+  }
+
+  Future<void> _fetchConfig() async {
+    try {
+      final response = await http.post(
+        Uri.parse("${AppSettings.apiUrl}/config"),
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": "Bearer ${AppSettings.apiSecretKeyValue}",
+        },
+        body: jsonEncode({"topic_id": AppSettings.getTopicId}),
+      );
+
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body);
+        final List rawSubTopics = data['sub_topics'];
+
+        setState(() {
+          _allowSubtopicSelection = data['allow_subtopic_selection'] ?? false;
+          _availableSubTopicIds = rawSubTopics
+              .map((item) => item['id'].toString())
+              .toList();
+          _subTopicDescriptions = {
+            for (var item in rawSubTopics)
+              item['id'].toString(): item['desc'].toString(),
+          };
+
+          _selectedSubTopics = _availableSubTopicIds.toSet();
+          _isMaintenanceMode = false; // Tutto ok
+        });
+      } else {
+        // Se il server risponde con un errore (es. 500 o 400)
+        setState(() {
+          _isMaintenanceMode = true;
+        });
+      }
+    } catch (e) {
+      // Se c'è un errore di connessione o il server è offline
+      debugPrint("Errore critico configurazione: $e");
+      setState(() {
+        _isMaintenanceMode = true;
+      });
+    }
   }
 
   /// Adds the initial system welcome message
@@ -196,7 +247,11 @@ class _ChatScreenState extends State<ChatScreen> {
       context: context,
       builder: (context) {
         return AlertDialog(
-          title: Text(isLike ? AppTranslations.get('like_msg', langNotifier.value) : AppTranslations.get('dislike_msg', langNotifier.value)),
+          title: Text(
+            isLike
+                ? AppTranslations.get('like_msg', langNotifier.value)
+                : AppTranslations.get('dislike_msg', langNotifier.value),
+          ),
           content: TextField(
             controller: commentController,
             maxLines: 3,
@@ -223,6 +278,50 @@ class _ChatScreenState extends State<ChatScreen> {
 
     // 3. Fire the backend call with the comment
     await _sendFeedback(message, isLike, commentController.text.trim());
+  }
+
+  Widget _buildMaintenancePage() {
+    final theme = Theme.of(context);
+    return Scaffold(
+      body: Center(
+        child: Padding(
+          padding: const EdgeInsets.all(32.0),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(
+                Icons.construction,
+                size: 80,
+                color: theme.colorScheme.primary,
+              ),
+              const SizedBox(height: 24),
+              Text(
+                "Sistema in manutenzione",
+                style: theme.textTheme.headlineMedium!.copyWith(
+                  fontWeight: FontWeight.bold,
+                ),
+                textAlign: TextAlign.center,
+              ),
+              const SizedBox(height: 16),
+              Text(
+                "Stiamo effettuando degli aggiornamenti tecnici. Il servizio tornerà disponibile a breve.",
+                style: theme.textTheme.bodyLarge,
+                textAlign: TextAlign.center,
+              ),
+              const SizedBox(height: 32),
+              ElevatedButton.icon(
+                onPressed: () {
+                  setState(() => _isMaintenanceMode = false);
+                  _fetchConfig(); // Riprova la configurazione
+                },
+                icon: const Icon(Icons.refresh),
+                label: const Text("Riprova a collegarti"),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
   }
 
   /// Builds the static project information header at the top of the chat
@@ -497,8 +596,6 @@ class _ChatScreenState extends State<ChatScreen> {
     try {
       final String chatUrl = "${AppSettings.apiUrl}/chat";
 
-      // --- STEP A: Dispatch Task ---
-      // We use a short timeout (10s) because the server should respond instantly with a Task ID
       final response = await http
           .post(
             Uri.parse(chatUrl),
@@ -509,6 +606,8 @@ class _ChatScreenState extends State<ChatScreen> {
             body: jsonEncode({
               "history": chatHistoryForApi,
               "query": lastQuery,
+              "sub_topics": _selectedSubTopics.toList(),
+              "topic_id": AppSettings.getTopicId,
             }),
           )
           .timeout(const Duration(seconds: 10));
@@ -580,7 +679,11 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   // --- Feedback Logic ---
-  Future<void> _sendFeedback(ChatMessage message, bool isLike, String comment) async {
+  Future<void> _sendFeedback(
+    ChatMessage message,
+    bool isLike,
+    String comment,
+  ) async {
     // Prevent sending feedback for system/error messages or user messages
     if (message.isUser || message.isError || message.isSystemMessage) return;
 
@@ -630,7 +733,8 @@ class _ChatScreenState extends State<ChatScreen> {
       );
 
       // Treat any non-2xx response as a failure
-      if (feedbackResponse.statusCode < 200 || feedbackResponse.statusCode >= 300) {
+      if (feedbackResponse.statusCode < 200 ||
+          feedbackResponse.statusCode >= 300) {
         throw Exception("Server returned ${feedbackResponse.statusCode}");
       }
 
@@ -640,7 +744,7 @@ class _ChatScreenState extends State<ChatScreen> {
             content: Text(
               AppTranslations.get('feedback_received', langNotifier.value),
             ),
-            duration: Duration(seconds: 1),
+            duration: Duration(seconds: 4),
           ),
         );
       }
@@ -651,7 +755,7 @@ class _ChatScreenState extends State<ChatScreen> {
             content: Text(
               AppTranslations.get('feedback_error', langNotifier.value),
             ),
-            duration: Duration(seconds: 1),
+            duration: Duration(seconds: 4),
           ),
         );
       }
@@ -700,8 +804,59 @@ class _ChatScreenState extends State<ChatScreen> {
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
         content: Text(AppTranslations.get('chat_cleared', langNotifier.value)),
-        duration: Duration(seconds: 2),
+        duration: Duration(seconds: 3),
       ),
+    );
+  }
+
+  void _showSubTopicSelector() {
+    showModalBottomSheet(
+      context: context,
+      builder: (context) {
+        return StatefulBuilder(
+          builder: (context, setModalState) {
+            return Container(
+              padding: const EdgeInsets.all(16.0),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    AppTranslations.get('subtopics_title', langNotifier.value),
+                    style: Theme.of(context).textTheme.titleLarge,
+                  ),
+                  const Divider(),
+                  Expanded(
+                    child: ListView(
+                      children: _availableSubTopicIds.map((id) {
+                        return CheckboxListTile(
+                          title: Text(
+                            _subTopicDescriptions[id] ?? id,
+                          ), // Mostra la descrizione
+                          subtitle: Text(
+                            id,
+                            style: TextStyle(fontSize: 10),
+                          ), // Opzionale: mostra l'ID in piccolo
+                          value: _selectedSubTopics.contains(id),
+                          onChanged: (bool? value) {
+                            setState(() {
+                              if (value == true) {
+                                _selectedSubTopics.add(id);
+                              } else {
+                                _selectedSubTopics.remove(id);
+                              }
+                            });
+                            setModalState(() {});
+                          },
+                        );
+                      }).toList(),
+                    ),
+                  ),
+                ],
+              ),
+            );
+          },
+        );
+      },
     );
   }
 
@@ -711,11 +866,23 @@ class _ChatScreenState extends State<ChatScreen> {
 
   @override
   Widget build(BuildContext context) {
+    if (_isMaintenanceMode) {
+      return _buildMaintenancePage();
+    }
+
     return Scaffold(
       appBar: AppBar(
         title: Text(AppSettings.projectName),
         actions: [
-          // --- LANGUAGE TOGGLE ---
+          if (_allowSubtopicSelection && _availableSubTopicIds.isNotEmpty)
+            IconButton(
+              icon: const Icon(Icons.filter_list),
+              onPressed: _showSubTopicSelector,
+              tooltip: AppTranslations.get(
+                'filter_subtopics',
+                langNotifier.value,
+              ),
+            ),
           ValueListenableBuilder<AppLang>(
             valueListenable: langNotifier,
             builder: (_, AppLang currentLang, __) {
@@ -869,8 +1036,11 @@ class _ChatScreenState extends State<ChatScreen> {
                             ? Colors.green
                             : theme.colorScheme.onSurfaceVariant,
                       ),
-                      onPressed: () => _promptFeedbackComment(message, true), 
-                      tooltip: AppTranslations.get('good_response', langNotifier.value),
+                      onPressed: () => _promptFeedbackComment(message, true),
+                      tooltip: AppTranslations.get(
+                        'good_response',
+                        langNotifier.value,
+                      ),
                     ),
                     IconButton(
                       icon: Icon(
@@ -1026,8 +1196,12 @@ class _ChatScreenState extends State<ChatScreen> {
                                   'unknown_file',
                                   langNotifier.value,
                                 );
-                            final String url =
-                                "${AppSettings.downloadDocumentUrl}/$topic/$fileName";
+                            final String subTopic = source['sub_topic'] ?? '';
+
+                            // Costruzione URL dinamica: se c'è il sub_topic lo inserisce nel path, altrimenti usa il path vecchio.
+                            final String url = subTopic.isNotEmpty
+                                ? "${AppSettings.downloadDocumentUrl}/$topic/$subTopic/$fileName"
+                                : "${AppSettings.downloadDocumentUrl}/$topic/$fileName";
 
                             return ActionChip(
                               onPressed: () => _launchUrl(url),

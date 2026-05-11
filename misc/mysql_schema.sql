@@ -3,7 +3,7 @@
 --
 
 CREATE TABLE `chat_feedback` (
-  `id` int NOT NULL,
+  `id` int NOT NULL PRIMARY KEY,
   `timestamp` timestamp NULL DEFAULT CURRENT_TIMESTAMP,
   `topic_id` varchar(255) DEFAULT NULL,
   `user_query` text,
@@ -21,7 +21,7 @@ CREATE TABLE `chat_feedback` (
 --
 
 CREATE TABLE `failed_queries` (
-  `id` int NOT NULL,
+  `id` int NOT NULL AUTO_INCREMENT PRIMARY KEY,
   `timestamp` timestamp NULL DEFAULT CURRENT_TIMESTAMP,
   `standalone_query` text NOT NULL,
   `failure_type` varchar(50) NOT NULL,
@@ -35,11 +35,27 @@ CREATE TABLE `failed_queries` (
 --
 
 CREATE TABLE `topics` (
-  `topic_id` varchar(255) NOT NULL,
+  `topic_id` varchar(100) NOT NULL PRIMARY KEY,
   `description` text NOT NULL,
   `created_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP,
   `aliases` text,
   `prompt` varchar(100) DEFAULT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+CREATE TABLE IF NOT EXISTS `sub_topics` (
+  `id` int NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  `topic_id` varchar(100) NOT NULL,
+  `sub_topic_id` varchar(100) NOT NULL,
+  `description` varchar(255) NOT NULL,
+  `chunk_size` int DEFAULT NULL,     
+  `chunk_overlap` int DEFAULT 50,
+  `parent_chunk_size` int DEFAULT 1500,
+  UNIQUE KEY `unique_sub_topic` (`topic_id`, `sub_topic_id`),
+  CONSTRAINT `fk_sub_topics_topic_id` 
+    FOREIGN KEY (`topic_id`) 
+    REFERENCES `topics` (`topic_id`) 
+    ON DELETE CASCADE 
+    ON UPDATE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
 CREATE TABLE IF NOT EXISTS system_logs (
@@ -56,33 +72,3 @@ CREATE TABLE IF NOT EXISTS system_logs (
     INDEX idx_created_at (created_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
---
--- Indici per le tabelle scaricate
---
-
---
--- Indici per le tabelle `failed_queries`
---
-ALTER TABLE `failed_queries`
-  ADD PRIMARY KEY (`id`);
-
---
--- Indici per le tabelle `topics`
---
-ALTER TABLE `topics`
-  ADD PRIMARY KEY (`topic_id`);
-
---
--- AUTO_INCREMENT per le tabelle scaricate
---
-
---
--- AUTO_INCREMENT per la tabella `failed_queries`
---
-ALTER TABLE `failed_queries`
-  MODIFY `id` int NOT NULL AUTO_INCREMENT;
-
-ALTER TABLE `chat_feedback`
-  MODIFY `id` int NOT NULL AUTO_INCREMENT;
-
-COMMIT;

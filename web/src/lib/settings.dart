@@ -12,6 +12,7 @@ extension type EnvConfigJS._(JSObject _) implements JSObject {
   external String? get REST_URL;
   external String? get PROJECT_NAME;
   external String? get API_SECRET_KEY;
+  external String? get TOPIC_ID;
 }
 
 class AppSettings {
@@ -23,6 +24,7 @@ class AppSettings {
   static const String _downloadDocumentUrl = "http://127.0.0.1:5000";
   static const String _projectName = "BiblioLucca - Progetti innovativi";
   static const String _secretKeyValue = "default_secret_key";
+  static const String _topicId = "greenlees";
 
   static String get apiUrl {
     // Read from JavaScript first (Runtime value)
@@ -55,4 +57,12 @@ class AppSettings {
     return secretKey  ?? _secretKeyValue;
 
   }
+
+  static String get getTopicId {
+    // Read from JavaScript first (Runtime value)
+    final topicId = envConfigJS?.TOPIC_ID;
+
+    return topicId  ?? _topicId;
+
+   }
 }
