@@ -326,14 +326,20 @@ async def async_ocr_generate(image_input, as_markdown=False):
                     HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
                 }
             )
-            
-            # DEFENSIVE CHECK: Catch the Gemini block
+
             if not response.candidates or not response.candidates[0].content.parts:
-                reason = getattr(response.candidates[0], "finish_reason", "Unknown") if response.candidates else "Unknown"
+                if response.candidates:
+                    reason = getattr(response.candidates[0], "finish_reason", "Unknown")
+                elif hasattr(response, "prompt_feedback"):
+                    reason = getattr(response.prompt_feedback, "block_reason", "Prompt Blocked")
+                else:
+                    reason = "Unknown"
+
+                log.warning(f"Gemini API blocked page (Reason: {reason}). Engaging Cloud Vision API fallback...")
                 
                 # Check if it is a Recitation (4) block. If so, trigger the fallback.
-                if reason == 4 or str(reason) == "FinishReason.RECITATION":
-                    log.warning("Gemini API blocked page (RECITATION). Engaging Cloud Vision API fallback...")
+                if reason in [3, 4, 'SAFETY', 'RECITATION']:
+                    log.warning(f"Gemini HARD block (Reason: {reason}). Engaging Cloud Vision API fallback...")
                     fallback_text = await asyncio.to_thread(_cloud_vision_fallback, image_input)
                     return clean_text(fallback_text.strip(), as_markdown)
                 else:
@@ -448,7 +454,9 @@ async def process_single_file_async(topic_id, sub_topic_id, file_path, root_fold
                 is_markdown = True
             elif filename.lower().endswith((".png", ".jpg", ".jpeg")):
                 log.info(f"Routing '{filename}' to Raw Image OCR.")
-                full_text = await async_ocr_generate(Image.open(file_path), as_markdown=True)
+                with Image.open(file_path) as img:
+                    img.load() # Forces file reading into memory, safe to close file descriptor
+                    full_text = await async_ocr_generate(img, as_markdown=True)
                 is_markdown = True
             elif filename.lower().endswith((".txt", ".md")):
                 log.info(f"Routing '{filename}' to standard text read.")

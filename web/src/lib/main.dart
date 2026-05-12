@@ -6,6 +6,7 @@ import 'package:url_launcher/url_launcher.dart'; // For opening links
 import 'settings.dart'; // Import the settings file
 import 'app_translations.dart'; // Import the translations file
 import 'package:flutter/services.dart';
+import 'dart:html' as html;
 
 void main() {
   runApp(const AiChatApp());
@@ -47,6 +48,10 @@ class AiChatApp extends StatelessWidget {
         return ValueListenableBuilder<AppLang>(
           valueListenable: langNotifier,
           builder: (_, AppLang currentLang, __) {
+            final langCode = currentLang == AppLang.it ? 'it' : 'en';
+            // Aggiorna l'attributo <html lang="..."> del browser
+            html.document.documentElement?.lang = langCode;
+
             // Define the 3 themes dynamically
             ThemeData activeTheme;
             switch (currentTheme) {
@@ -316,7 +321,9 @@ class _ChatScreenState extends State<ChatScreen> {
                   _fetchConfig(); // Riprova la configurazione
                 },
                 icon: const Icon(Icons.refresh),
-                label: Text(AppTranslations.get('retry_connection', langNotifier.value)),
+                label: Text(
+                  AppTranslations.get('retry_connection', langNotifier.value),
+                ),
               ),
             ],
           ),

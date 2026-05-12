@@ -3,7 +3,7 @@
 --
 
 CREATE TABLE `chat_feedback` (
-  `id` int NOT NULL PRIMARY KEY,
+  `id` int NOT NULL AUTO_INCREMENT PRIMARY KEY,
   `timestamp` timestamp NULL DEFAULT CURRENT_TIMESTAMP,
   `topic_id` varchar(255) DEFAULT NULL,
   `user_query` text,
