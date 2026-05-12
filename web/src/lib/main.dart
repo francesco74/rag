@@ -165,6 +165,7 @@ class _ChatScreenState extends State<ChatScreen> {
   final List<ChatMessage> _messages = [];
   bool _isLoading = false;
   bool _isMaintenanceMode = false;
+  final FocusNode _textFocusNode = FocusNode();
 
   Map<String, String> _subTopicDescriptions = {};
   List<String> _availableSubTopicIds = [];
@@ -265,11 +266,11 @@ class _ChatScreenState extends State<ChatScreen> {
           actions: [
             TextButton(
               onPressed: () => Navigator.of(context).pop(),
-              child: const Text("Skip"),
+              child: Text(AppTranslations.get('skip', langNotifier.value)),
             ),
             ElevatedButton(
               onPressed: () => Navigator.of(context).pop(),
-              child: const Text("Submit"),
+              child: Text(AppTranslations.get('submit', langNotifier.value)),
             ),
           ],
         );
@@ -296,7 +297,7 @@ class _ChatScreenState extends State<ChatScreen> {
               ),
               const SizedBox(height: 24),
               Text(
-                "Sistema in manutenzione",
+                AppTranslations.get('maintenance_mode', langNotifier.value),
                 style: theme.textTheme.headlineMedium!.copyWith(
                   fontWeight: FontWeight.bold,
                 ),
@@ -304,7 +305,7 @@ class _ChatScreenState extends State<ChatScreen> {
               ),
               const SizedBox(height: 16),
               Text(
-                "Stiamo effettuando degli aggiornamenti tecnici. Il servizio tornerà disponibile a breve.",
+                AppTranslations.get('maintenance_msg', langNotifier.value),
                 style: theme.textTheme.bodyLarge,
                 textAlign: TextAlign.center,
               ),
@@ -315,7 +316,7 @@ class _ChatScreenState extends State<ChatScreen> {
                   _fetchConfig(); // Riprova la configurazione
                 },
                 icon: const Icon(Icons.refresh),
-                label: const Text("Riprova a collegarti"),
+                label: Text(AppTranslations.get('retry_connection', langNotifier.value)),
               ),
             ],
           ),
@@ -400,15 +401,19 @@ class _ChatScreenState extends State<ChatScreen> {
                   }
 
                   // Fallback: If it's just a normal <a> tag without the class
-                  return GestureDetector(
-                    onTap: () {
-                      if (url != null) _launchUrl(url);
-                    },
-                    child: Text(
-                      text,
-                      style: TextStyle(
-                        color: theme.colorScheme.primary,
-                        decoration: TextDecoration.underline,
+                  return Semantics(
+                    link: true, // Dice allo screen reader "questo è un link"
+                    child: InkWell(
+                      // InkWell rende l'elemento focusabile col tasto Tab
+                      onTap: () {
+                        if (url != null) _launchUrl(url);
+                      },
+                      child: Text(
+                        text,
+                        style: TextStyle(
+                          color: theme.colorScheme.primary,
+                          decoration: TextDecoration.underline,
+                        ),
                       ),
                     ),
                   );
@@ -489,6 +494,7 @@ class _ChatScreenState extends State<ChatScreen> {
   void dispose() {
     _textController.dispose();
     _scrollController.dispose();
+    _textFocusNode.dispose();
     super.dispose();
   }
 
@@ -674,6 +680,8 @@ class _ChatScreenState extends State<ChatScreen> {
         setState(() {
           _isLoading = false;
         });
+        // Rimette automaticamente il cursore per l'utente da tastiera
+        _textFocusNode.requestFocus();
       }
     }
   }
@@ -1066,59 +1074,71 @@ class _ChatScreenState extends State<ChatScreen> {
       );
     }
 
-    return Container(
-      margin: const EdgeInsets.symmetric(vertical: 8.0),
-      child: Row(
-        mainAxisAlignment: isUser
-            ? MainAxisAlignment.end
-            : MainAxisAlignment.start,
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          // Avatar
-          if (!isUser)
-            CircleAvatar(
-              backgroundColor: theme.colorScheme.secondary,
-              child: Icon(
-                message.isError
-                    ? Icons.error_outline
-                    : (message.isSystemMessage
-                          ? Icons
-                                .info_outline // Different icon for system
-                          : Icons.computer),
-                color: theme.colorScheme.onSecondary,
-              ),
-            ),
-          if (isUser) const SizedBox(width: 40), // Spacer
-          // Bubble Container
-          Expanded(
-            child: Container(
-              margin: const EdgeInsets.symmetric(horizontal: 12.0),
-              padding: const EdgeInsets.all(16.0),
-              decoration: BoxDecoration(
-                color: isUser
-                    ? theme.colorScheme.primary
-                    : (message.isError
-                          ? theme.colorScheme.errorContainer
-                          : theme.colorScheme.surfaceContainerHighest),
-                borderRadius: BorderRadius.only(
-                  topLeft: const Radius.circular(20),
-                  topRight: const Radius.circular(20),
-                  bottomLeft: isUser ? const Radius.circular(20) : Radius.zero,
-                  bottomRight: isUser ? Radius.zero : const Radius.circular(20),
+    return Semantics(
+      // ATTIVA L'ANNUNCIO VOCALE AUTOMATICO:
+      // Appena questo widget viene inserito nella lista (cioè quando invii
+      // la domanda o quando arriva la risposta), lo screen reader lo leggerà
+      // istantaneamente, interrompendo il silenzio.
+      liveRegion: true,
+
+      child: Container(
+        margin: const EdgeInsets.symmetric(vertical: 8.0),
+        child: Row(
+          mainAxisAlignment: isUser
+              ? MainAxisAlignment.end
+              : MainAxisAlignment.start,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            // Avatar
+            if (!isUser)
+              CircleAvatar(
+                backgroundColor: theme.colorScheme.secondary,
+                child: Icon(
+                  message.isError
+                      ? Icons.error_outline
+                      : (message.isSystemMessage
+                            ? Icons
+                                  .info_outline // Different icon for system
+                            : Icons.computer),
+                  color: theme.colorScheme.onSecondary,
                 ),
               ),
-              // The content (SelectableText or SelectionArea)
-              child: messageContent,
+            if (isUser) const SizedBox(width: 40), // Spacer
+            // Bubble Container
+            Expanded(
+              child: Container(
+                margin: const EdgeInsets.symmetric(horizontal: 12.0),
+                padding: const EdgeInsets.all(16.0),
+                decoration: BoxDecoration(
+                  color: isUser
+                      ? theme.colorScheme.primary
+                      : (message.isError
+                            ? theme.colorScheme.errorContainer
+                            : theme.colorScheme.surfaceContainerHighest),
+                  borderRadius: BorderRadius.only(
+                    topLeft: const Radius.circular(20),
+                    topRight: const Radius.circular(20),
+                    bottomLeft: isUser
+                        ? const Radius.circular(20)
+                        : Radius.zero,
+                    bottomRight: isUser
+                        ? Radius.zero
+                        : const Radius.circular(20),
+                  ),
+                ),
+                // The content (SelectableText or SelectionArea)
+                child: messageContent,
+              ),
             ),
-          ),
 
-          if (isUser)
-            CircleAvatar(
-              backgroundColor: theme.colorScheme.primary,
-              child: Icon(Icons.person, color: theme.colorScheme.onPrimary),
-            ),
-          if (!isUser) const SizedBox(width: 40), // Spacer
-        ],
+            if (isUser)
+              CircleAvatar(
+                backgroundColor: theme.colorScheme.primary,
+                child: Icon(Icons.person, color: theme.colorScheme.onPrimary),
+              ),
+            if (!isUser) const SizedBox(width: 40), // Spacer
+          ],
+        ),
       ),
     );
   }
@@ -1263,6 +1283,7 @@ class _ChatScreenState extends State<ChatScreen> {
             Expanded(
               child: TextField(
                 controller: _textController,
+                focusNode: _textFocusNode,
                 enabled: !_isLoading,
                 autocorrect: true,
                 enableSuggestions: true,
@@ -1286,6 +1307,7 @@ class _ChatScreenState extends State<ChatScreen> {
             FloatingActionButton(
               onPressed: _isLoading ? null : _handleSendPressed,
               backgroundColor: theme.colorScheme.primary,
+              tooltip: AppTranslations.get('send_question', langNotifier.value),
               child: Icon(Icons.send, color: theme.colorScheme.onPrimary),
             ),
           ],

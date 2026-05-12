@@ -95,6 +95,29 @@ class AppTranslations {
       AppLang.it: "Sottocategorie",
       AppLang.en: "Subtopics",
     },
+    'send_question': {
+      AppLang.it: "Invia domanda",
+      AppLang.en: "Send question",
+    },
+    'maintenance_mode': {
+      AppLang.it: "Sistema in manutenzione",
+      AppLang.en: "Maintenance Mode",
+    },
+    'maintenance_msg': {
+      AppLang.it: "Stiamo effettuando degli aggiornamenti tecnici. Il servizio tornerà disponibile a breve.",
+      AppLang.en: "We are performing technical updates. The service will be back shortly.",
+    },
+    'retry_connection': {
+      AppLang.it: "Riprova a collegarti",
+      AppLang.en: "Retry Connection",
+    },
+    'skip': {
+      AppLang.it: "Salta",
+      AppLang.en: "Skip",
+    },    'submit': {
+      AppLang.it: "Invia",
+      AppLang.en: "Submit",
+    },
   };
 
   /// Helper function to grab the correct string based on the current language

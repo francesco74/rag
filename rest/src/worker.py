@@ -47,6 +47,7 @@ RERANK_SIZE = int(os.environ.get("RERANK_SIZE", 25))
 RERANK_TRUNCATE = int(os.environ.get("RERANK_TRUNCATE", 1200))
 RERANK_BATCH_SIZE = int(os.environ.get("RERANK_BATCH_SIZE", 32))  
 RERANK_MAX_LENGTH = int(os.environ.get("RERANK_MAX_LENGTH", 512))
+RERANK_THRESHOLD = 0.40
 
 ONNX_MODEL_CACHE_PATH = os.environ.get(
     "RERANKER_MODEL_PATH", 
@@ -55,6 +56,7 @@ ONNX_MODEL_CACHE_PATH = os.environ.get(
 
 QDRANT_SYNTATIC_SIZE = 20
 QDRANT_SEMANTIC_SIZE = 30
+QDRANT_THRESHOLD = 0.60
 MAX_CONTEXT_CHARS = 30000 
 
 MAX_AGE_SECONDS = 86400  # 24 hours
@@ -407,6 +409,7 @@ def retrieve_chunks(query, vector, topic_id, selected_sub_topics):
                 collection_name=QDRANT_COLLECTION,
                 query=vector, 
                 limit=QDRANT_SEMANTIC_SIZE,
+                score_threshold=QDRANT_THRESHOLD,
                 query_filter=models.Filter(must=must_conditions)
             )
             log.info(f"Child Vector search: {len(res.points)} hits")
@@ -460,7 +463,13 @@ def retrieve_chunks(query, vector, topic_id, selected_sub_topics):
             docs_content = [c.payload.get("content", "")[:RERANK_TRUNCATE] for c in candidates]
             try:
                 reranked_results = reranker.rerank(query, docs_content)
-                top_child_docs = [candidates[res.index] for res in reranked_results[:RERANK_SIZE]]
+                #top_child_docs = [candidates[res.index] for res in reranked_results[:RERANK_SIZE]]
+                top_child_docs = [
+                    candidates[res.index] 
+                    for res in reranked_results 
+                        if res.score >= RERANK_THRESHOLD  
+                ][:RERANK_SIZE] 
+                
                 log.info(f"Reranking completato. Selezionati {len(top_child_docs)} Child migliori.")
             except Exception as e:
                 log.error(f"Reranking fallito: {e}")
