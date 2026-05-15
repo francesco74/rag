@@ -8,6 +8,7 @@ from celery.schedules import crontab
 from mysql.connector import pooling
 from qdrant_client import QdrantClient, models
 import google.generativeai as genai
+import math
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -47,17 +48,18 @@ RERANK_SIZE = int(os.environ.get("RERANK_SIZE", 25))
 RERANK_TRUNCATE = int(os.environ.get("RERANK_TRUNCATE", 1200))
 RERANK_BATCH_SIZE = int(os.environ.get("RERANK_BATCH_SIZE", 32))  
 RERANK_MAX_LENGTH = int(os.environ.get("RERANK_MAX_LENGTH", 512))
-RERANK_THRESHOLD = 0.40
 
 ONNX_MODEL_CACHE_PATH = os.environ.get(
     "RERANKER_MODEL_PATH", 
     "./model_cache/mmarco-mMiniLMv2-L12-H384-v1"
 )
 
-QDRANT_SYNTATIC_SIZE = 20
-QDRANT_SEMANTIC_SIZE = 30
-QDRANT_THRESHOLD = 0.60
-MAX_CONTEXT_CHARS = 30000 
+QDRANT_SYNTATIC_SIZE = int(os.environ.get("QDRANT_SYNTATIC_SIZE", 20))
+QDRANT_SEMANTIC_SIZE = int(os.environ.get("QDRANT_SEMANTIC_SIZE", 30))
+QDRANT_THRESHOLD = float(os.environ.get("QDRANT_THRESHOLD", 0.60))
+MAX_CONTEXT_CHARS = int(os.environ.get("MAX_CONTEXT_CHARS", 30000)) 
+
+MIN_PROB_THRESHOLD = float(os.environ.get("MIN_PROB_THRESHOLD", 0.02))
 
 MAX_AGE_SECONDS = 86400  # 24 hours
 
@@ -142,6 +144,14 @@ def init_worker_process(**kwargs):
 # ==============================================================================
 # 4. HELPER FUNCTIONS
 # ==============================================================================
+
+def safe_sigmoid(x):
+    """
+    Converte i logit in probabilità (0-1) prevenendo OverflowError in Python.
+    """
+    if x < -100:  # Qualsiasi logit sotto -100 è di fatto 0 probabilità
+        return 0.0
+    return 1 / (1 + math.exp(-x))
 
 def get_db_connection():
     """Get a connection from the pool and ensure it is alive."""
@@ -463,17 +473,28 @@ def retrieve_chunks(query, vector, topic_id, selected_sub_topics):
             docs_content = [c.payload.get("content", "")[:RERANK_TRUNCATE] for c in candidates]
             try:
                 reranked_results = reranker.rerank(query, docs_content)
-                #top_child_docs = [candidates[res.index] for res in reranked_results[:RERANK_SIZE]]
-                top_child_docs = [
-                    candidates[res.index] 
-                    for res in reranked_results 
-                        if res.score >= RERANK_THRESHOLD  
-                ][:RERANK_SIZE] 
+                reranked_results.sort(key=lambda x: x.score, reverse=True)
+
+                for res in reranked_results[:RERANK_SIZE]:
+                    prob = safe_sigmoid(res.score)
+                    log.info(f"Candidate {res.index} | Logit: {res.score:.4f} | Prob: {prob:.2%}")
+
+                    # 2. Filtro anti-spazzatura
+                    if prob >= MIN_PROB_THRESHOLD or len(top_child_docs) < 2:
+                        top_child_docs.append(candidates[res.index])
+                    else:
+                        # Appena troviamo il primo sotto soglia, possiamo anche interrompere 
+                        # il ciclo (break) dato che sono ordinati in modo decrescente.
+                        log.debug(f"Documento scartato: probabilità {prob:.2%} < {MIN_PROB_THRESHOLD:.2%}")
+                        break 
                 
-                log.info(f"Reranking completato. Selezionati {len(top_child_docs)} Child migliori.")
+                log.info(f"Reranking completato. Selezionati {len(top_child_docs)} Child validi.")
+
             except Exception as e:
                 log.error(f"Reranking fallito: {e}")
+                # Fallback: se il reranker fallisce, passiamo i candidati originali
                 top_child_docs = candidates[:RERANK_SIZE]
+
         else:
             top_child_docs = candidates[:RERANK_SIZE]
 

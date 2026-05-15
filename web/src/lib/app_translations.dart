@@ -76,12 +76,15 @@ class AppTranslations {
       AppLang.en: "Error loading welcome message.",
     },
     'like_msg': {
-      AppLang.it: "Felice di esserti stato d'aiuto! Vuoi aggiungere un commento?",
+      AppLang.it:
+          "Felice di esserti stato d'aiuto! Vuoi aggiungere un commento?",
       AppLang.en: "Glad it helped! Would you like to add a comment?",
     },
     'dislike_msg': {
-      AppLang.it: "Mi dispiace che la risposta non sia stata utile. Vuoi aggiungere un commento per aiutarci a migliorare?",
-      AppLang.en: "Sorry to hear the response wasn't helpful. Would you like to add a comment to help us improve?", 
+      AppLang.it:
+          "Mi dispiace che la risposta non sia stata utile. Vuoi aggiungere un commento per aiutarci a migliorare?",
+      AppLang.en:
+          "Sorry to hear the response wasn't helpful. Would you like to add a comment to help us improve?",
     },
     'comment_hint': {
       AppLang.it: "Aggiungi un commento opzionale...",
@@ -91,32 +94,48 @@ class AppTranslations {
       AppLang.it: "Filtra Sottocategorie",
       AppLang.en: "Filter Subtopics",
     },
-    'subtopics_title': {
-      AppLang.it: "Sottocategorie",
-      AppLang.en: "Subtopics",
-    },
-    'send_question': {
-      AppLang.it: "Invia domanda",
-      AppLang.en: "Send question",
-    },
+    'subtopics_title': {AppLang.it: "Sottocategorie", AppLang.en: "Subtopics"},
+    'send_question': {AppLang.it: "Invia domanda", AppLang.en: "Send question"},
     'maintenance_mode': {
       AppLang.it: "Sistema in manutenzione",
       AppLang.en: "Maintenance Mode",
     },
     'maintenance_msg': {
-      AppLang.it: "Stiamo effettuando degli aggiornamenti tecnici. Il servizio tornerà disponibile a breve.",
-      AppLang.en: "We are performing technical updates. The service will be back shortly.",
+      AppLang.it:
+          "Stiamo effettuando degli aggiornamenti tecnici. Il servizio tornerà disponibile a breve.",
+      AppLang.en:
+          "We are performing technical updates. The service will be back shortly.",
     },
     'retry_connection': {
       AppLang.it: "Riprova a collegarti",
       AppLang.en: "Retry Connection",
     },
-    'skip': {
-      AppLang.it: "Salta",
-      AppLang.en: "Skip",
-    },    'submit': {
-      AppLang.it: "Invia",
-      AppLang.en: "Submit",
+    'skip': {AppLang.it: "Salta", AppLang.en: "Skip"},
+    'submit': {AppLang.it: "Invia", AppLang.en: "Submit"},
+    'change_language': {
+      AppLang.it: "Cambio Lingua",
+      AppLang.en: "Change Language",
+    },
+    'change_language_desc': {
+      AppLang.it:
+          "Passa dall'italiano all'inglese. L'IA tradurrà automaticamente i documenti per te.",
+      AppLang.en:
+          "Switch between Italian and English. The AI will automatically translate documents for you.",
+    },
+    'change_theme': {
+      AppLang.it: "Modalità Lettura",
+      AppLang.en: "Reading Mode",
+    },
+    'change_theme_desc': {
+      AppLang.it:
+          "Cambia i colori dello schermo (Chiaro, Scuro o Alto Contrasto) per migliorare la visibilità.",
+      AppLang.en:
+          "Change the screen colors (Light, Dark, or High Contrast) to improve visibility.",
+    },
+    'filter_subtopics_desc': {
+      AppLang.it:
+          "Filtro per effettuare le ricerche solamente sulle serie che ti interessano.",
+      AppLang.en: "Filter to search only within the series that interest you.",
     },
   };
 

@@ -6,6 +6,8 @@ import 'package:url_launcher/url_launcher.dart'; // For opening links
 import 'settings.dart'; // Import the settings file
 import 'app_translations.dart'; // Import the translations file
 import 'package:flutter/services.dart';
+import 'package:tutorial_coach_mark/tutorial_coach_mark.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'dart:html' as html;
 
 void main() {
@@ -17,6 +19,9 @@ enum AppTheme { light, dark, highContrast }
 
 // 2. Create the Notifier (defaults to light)
 final ValueNotifier<AppTheme> themeNotifier = ValueNotifier(AppTheme.light);
+final ValueNotifier<AppLang> langNotifier = ValueNotifier(
+  _detectBrowserLanguage(),
+);
 
 /// Single source of truth for theme cycling.
 /// Referenced by both the keyboard shortcut and the AppBar icon button.
@@ -35,6 +40,17 @@ enum FeedbackStatus { none, like, dislike }
 
 class ToggleThemeIntent extends Intent {
   const ToggleThemeIntent();
+}
+
+AppLang _detectBrowserLanguage() {
+  // Prende la stringa della lingua (es. "it-IT" o "en-US")
+  final String browserLang = html.window.navigator.language.toLowerCase();
+
+  if (browserLang.startsWith('it')) {
+    return AppLang.it;
+  }
+  // Default in inglese per tutti gli altri casi
+  return AppLang.en;
 }
 
 class AiChatApp extends StatelessWidget {
@@ -164,6 +180,27 @@ class ChatScreen extends StatefulWidget {
   State<ChatScreen> createState() => _ChatScreenState();
 }
 
+Widget _buildTutorialText(String title, String desc) {
+  return Column(
+    mainAxisSize: MainAxisSize.min,
+    crossAxisAlignment: CrossAxisAlignment.start,
+    children: [
+      Text(
+        title,
+        style: const TextStyle(
+          fontWeight: FontWeight.bold,
+          color: Colors.white,
+          fontSize: 20,
+        ),
+      ),
+      Padding(
+        padding: const EdgeInsets.only(top: 10.0),
+        child: Text(desc, style: const TextStyle(color: Colors.white)),
+      ),
+    ],
+  );
+}
+
 class _ChatScreenState extends State<ChatScreen> {
   final TextEditingController _textController = TextEditingController();
   final ScrollController _scrollController = ScrollController();
@@ -171,6 +208,13 @@ class _ChatScreenState extends State<ChatScreen> {
   bool _isLoading = false;
   bool _isMaintenanceMode = false;
   final FocusNode _textFocusNode = FocusNode();
+
+  final GlobalKey _filterKey = GlobalKey();
+  final GlobalKey _langKey = GlobalKey();
+  final GlobalKey _themeKey = GlobalKey();
+
+  TutorialCoachMark? _tutorialCoachMark;
+  List<TargetFocus> _targets = [];
 
   Map<String, String> _subTopicDescriptions = {};
   List<String> _availableSubTopicIds = [];
@@ -181,7 +225,127 @@ class _ChatScreenState extends State<ChatScreen> {
   void initState() {
     super.initState();
     _addWelcomeMessage();
-    _fetchConfig(); // Recupera la configurazione al boot
+    _fetchConfig();
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _checkFirstRun();
+      AppLang _detectBrowserLanguage() {
+        // Prende la stringa della lingua (es. "it-IT" o "en-US")
+        final String browserLang = html.window.navigator.language.toLowerCase();
+
+        if (browserLang.startsWith('it')) {
+          return AppLang.it;
+        }
+        // Default in inglese per tutti gli altri casi
+        return AppLang.en;
+      }
+    });
+  }
+
+  Future<void> _checkFirstRun() async {
+    final prefs = await SharedPreferences.getInstance();
+    bool isFirstRun = prefs.getBool('tutorial_seen') ?? false;
+    
+    if (!isFirstRun) {
+      await Future.delayed(const Duration(milliseconds: 500));
+      _showTutorial();
+      await prefs.setBool('tutorial_seen', true);
+    } else {
+      print("Tutorial già visto, non mostro di nuovo.");
+    }
+
+    
+    //_showTutorial(); // Per ora lo forziamo per test
+  }
+
+  void _initTutorialTargets() {
+    _targets.clear();
+
+    // 1. Filtro Serie
+    _targets.add(
+      TargetFocus(
+        identify: "FilterTarget",
+        keyTarget: _filterKey,
+        alignSkip: Alignment.topRight,
+        contents: [
+          TargetContent(
+            align: ContentAlign.bottom,
+            builder: (context, controller) => _buildTutorialText(
+              AppTranslations.get('filter_subtopics', langNotifier.value),
+              AppTranslations.get('filter_subtopics_desc', langNotifier.value),
+            ),
+          ),
+        ],
+      ),
+    );
+
+    // 2. Cambio Lingua
+    _targets.add(
+      TargetFocus(
+        identify: "LangTarget",
+        keyTarget: _langKey,
+        contents: [
+          TargetContent(
+            align: ContentAlign.bottom,
+            builder: (context, controller) => _buildTutorialText(
+              AppTranslations.get('change_language', langNotifier.value),
+              AppTranslations.get('change_language_desc', langNotifier.value),
+            ),
+          ),
+        ],
+      ),
+    );
+
+    // 3. Tema
+    _targets.add(
+      TargetFocus(
+        identify: "ThemeTarget",
+        keyTarget: _themeKey,
+        contents: [
+          TargetContent(
+            align: ContentAlign.bottom,
+            builder: (context, controller) => _buildTutorialText(
+              AppTranslations.get('change_theme', langNotifier.value),
+              AppTranslations.get('change_theme_desc', langNotifier.value),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildTutorialText(String title, String desc) {
+    return Container(
+      padding: const EdgeInsets.all(16),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            title,
+            style: const TextStyle(
+              fontWeight: FontWeight.bold,
+              color: Colors.white,
+              fontSize: 22,
+            ),
+          ),
+          const SizedBox(height: 10),
+          Text(desc, style: const TextStyle(color: Colors.white, fontSize: 16)),
+        ],
+      ),
+    );
+  }
+
+  void _showTutorial() {
+    _initTutorialTargets();
+    _tutorialCoachMark = TutorialCoachMark(
+      targets: _targets,
+      colorShadow: Colors.black,
+      opacityShadow: 0.85,
+      paddingFocus: 10,
+      textSkip: AppTranslations.get('skip', langNotifier.value).toUpperCase(),
+      onClickTarget: (target) => print("Target cliccato: ${target.identify}"),
+    )..show(context: context);
   }
 
   Future<void> _fetchConfig() async {
@@ -891,6 +1055,7 @@ class _ChatScreenState extends State<ChatScreen> {
         actions: [
           if (_allowSubtopicSelection && _availableSubTopicIds.isNotEmpty)
             IconButton(
+              key: _filterKey,
               icon: const Icon(Icons.filter_list),
               onPressed: _showSubTopicSelector,
               tooltip: AppTranslations.get(
@@ -902,6 +1067,7 @@ class _ChatScreenState extends State<ChatScreen> {
             valueListenable: langNotifier,
             builder: (_, AppLang currentLang, __) {
               return TextButton(
+                key: _langKey,
                 onPressed: () {
                   // Flip the language
                   langNotifier.value = currentLang == AppLang.it
@@ -937,6 +1103,7 @@ class _ChatScreenState extends State<ChatScreen> {
               }
 
               return IconButton(
+                key: _themeKey,
                 icon: Icon(themeIcon),
                 tooltip: AppTranslations.get(
                   'toggle_theme',

@@ -28,6 +28,7 @@ log = logging.getLogger("api_gateway")
 app = Flask(__name__)
 
 ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "http://localhost:3000").split(",")
+#CORS(app, origins="*")
 CORS(app, origins=ALLOWED_ORIGINS)  # Enable CORS for frontend access
 
 ALLOW_SUBTOPIC_SELECTION = os.environ.get("ALLOW_SUBTOPIC_SELECTION", "true").lower() == "true"    
@@ -72,6 +73,9 @@ def start_timer_and_add_id():
     request.request_id = str(uuid.uuid4())
     request.start_time = time.time()
     log.debug(f"[{request.request_id}] START {request.method} {request.path}")
+
+    if request.method == "OPTIONS":
+        return
 
     # --- Authentication ---
     # Skip auth for health checks and when no key is configured (dev mode).
