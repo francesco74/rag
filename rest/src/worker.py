@@ -62,6 +62,7 @@ MAX_CONTEXT_CHARS = int(os.environ.get("MAX_CONTEXT_CHARS", 30000))
 MIN_PROB_THRESHOLD = float(os.environ.get("MIN_PROB_THRESHOLD", 0.02))
 
 MAX_AGE_SECONDS = 86400  # 24 hours
+MAX_MODEL_RETRIES = 2
 
 # Gemini Retry Configuration
 GEMINI_RETRY = retry(
@@ -104,7 +105,9 @@ _RERANKER_INSTANCE = None
 
 EMBEDDING_MODEL = "gemini-embedding-001"
 TRANSFORM_MODEL = None
+OCR_MODEL_NAME = None
 GENERATOR_MODEL = None
+TRANSFORM_MODEL_NAME = None
 
 @worker_process_init.connect
 def init_worker_process(**kwargs):
@@ -112,7 +115,7 @@ def init_worker_process(**kwargs):
     Initializes network connections and models ONLY after Celery forks the process.
     Prevents Socket Corruption and BrokenPipeErrors.
     """
-    global db_pool, qdrant_client, TRANSFORM_MODEL, GENERATOR_MODEL
+    global db_pool, qdrant_client, TRANSFORM_MODEL, GENERATOR_MODEL,  OCR_MODEL_NAME, TRANSFORM_MODEL_NAME
     log.info("Initializing Worker Resources (Post-Fork)...")
 
     try:
@@ -132,8 +135,9 @@ def init_worker_process(**kwargs):
         genai.configure(api_key=os.environ.get("GOOGLE_API_KEY"))
         
         # Instantiate models here
-        OCR_MODEL_NAME = os.environ.get("OCR_MODEL_NAME", "gemini-3-flash-preview")
-        TRANSFORM_MODEL = genai.GenerativeModel(OCR_MODEL_NAME)
+        OCR_MODEL_NAME = os.environ.get("OCR_MODEL_NAME", "gemini-3.5-flash")
+        TRANSFORM_MODEL_NAME = os.environ.get("TRANSFORM_MODEL_NAME", "gemini-3.1-flash-lite")
+        TRANSFORM_MODEL = genai.GenerativeModel(TRANSFORM_MODEL_NAME)
         GENERATOR_MODEL = genai.GenerativeModel(OCR_MODEL_NAME)
         log.info("✓ Resources successfully initialized for this process.")
     except Exception as e:
@@ -243,9 +247,11 @@ def extract_keywords_with_ai(query):
     return list(dict.fromkeys(keywords))
 
 
+import json
+
 @GEMINI_RETRY
 def generate_answer(query, rich_context, topic_id):
-    """Generate final answer using retrieved context."""
+    """Generate final answer using retrieved context, returning a structured dict."""
     formatted_chunks = []
     curr_len = 0
     
@@ -258,20 +264,39 @@ def generate_answer(query, rich_context, topic_id):
             break
     
     context_str = "".join(formatted_chunks)
-    
-    # 2. Recupero del Prompt 
     prompt_file = get_topic_prompt(topic_id)
     
     prompt_tmpl = load_prompt_template(prompt_file)
     prompt = prompt_tmpl.format(context_str=context_str, query=query)
     
-    log.info(f"Generating answer for topic '{topic_id}' (prompt file: {prompt_file})")
-    log.debug(f"Context size: {len(context_str)} chars, Chunks: {len(rich_context)}")
+    log.info(f"Generating structured answer for topic '{topic_id}'")
+    log.debug(f"Context size: {len(context_str)} chars")
     
-    log.debug(f"Context... {context_str[:200]}... ")
+    # 1. Chiediamo ESPLICITAMENTE il JSON tramite la configurazione
+    response = GENERATOR_MODEL.generate_content(
+        prompt,
+        generation_config=genai.types.GenerationConfig(
+            response_mime_type="application/json"
+        )
+    )
     
-    response = GENERATOR_MODEL.generate_content(prompt)
-    return response.text.strip()
+    # 2. Parsing sicuro del JSON
+    try:
+        raw_text = response.text.strip()
+        result_data = json.loads(raw_text)
+        
+        # Garantiamo che restituisca sempre le chiavi attese
+        return {
+            "is_found": bool(result_data.get("is_found", True)),
+            "answer": str(result_data.get("answer", ""))
+        }
+    except json.JSONDecodeError as e:
+        log.error(f"Generazione JSON fallita: {e}. Output grezzo: {response.text}")
+        # Fallback difensivo in caso di errore del modello
+        return {
+            "is_found": True,
+            "answer": response.text.strip()
+        }
 
 
 # ==============================================================================
@@ -662,27 +687,92 @@ def process_rag_query(self, query, history, topic_id, selected_sub_topics=None):
             selected_sub_topics
         )
 
-        if not context:
-            return {
-                "error": "No Relevant Documents",
-                "message": f"I couldn't find specific information to answer your question.",
-                "topic": topic_id,
-                "status": "failed"
-            }
-        
-        # 5. Answer Generation
-        try:
-            answer = generate_answer(standalone_query, context, topic_id)
-        except Exception as e:
-            log.error(f"Answer generation failed: {e}")
-            return {
-                "error": "Generation Failed",
-                "message": "I found documents but couldn't generate an answer.",
-                "status": "failed"
-            }
-        
+        # Self-Correction Loop
+        attempt = 0
+        answer = None
+        is_satisfactory = False
+
+        while attempt < MAX_MODEL_RETRIES and not is_satisfactory:
+            if not context:
+                # Se non c'è contesto fin dall'inizio, inutile interrogare i modelli
+                answer = "<p>Non sono riuscito a trovare la risposta nei documenti che ho analizzato.</p>"
+                log.debug(f"[{task_id}] No context retrieved. Breaking loop.")
+                break
+
+            # 1. Generazione Strutturata (JSON Mode)
+            try:
+                gen_result = generate_answer(standalone_query, context, topic_id)
+                is_found = gen_result.get("is_found", False)
+                answer = gen_result.get("answer", "")
+            except Exception as e:
+                log.error(f"[{task_id}] Answer generation failed: {e}")
+                return {"error": "Generation Failed", "message": "Failed to generate answer.", "status": "failed"}
+
+            # 2. Valutazione Logica (Fail-Fast)
+            if not is_found:
+                log.info(f"[{task_id}] Il generatore dichiara (via JSON) che l'informazione è assente. Salto il Grader.")
+                is_satisfactory = False
+            else:
+                # 3. Grader LLM (Controllo Allucinazioni)
+                # Il Grader entra in gioco SOLO se il generatore crede di aver risposto bene
+                context_snippet = context if isinstance(context, str) else str(context)
+                
+                grader_tmpl = load_prompt_template("grader")
+                grader_prompt = grader_tmpl.format(
+                    query=standalone_query, 
+                    context_snippet=context_snippet, 
+                    answer=answer
+                )
+
+                log.debug(f"[{task_id}] Validating answer {answer} with Grader...")
+
+                try:
+                    grade_response = TRANSFORM_MODEL.generate_content(
+                        grader_prompt,
+                        generation_config=genai.types.GenerationConfig(
+                            temperature=0.0, 
+                            max_output_tokens=5 
+                        )
+                    ).text.strip().upper()
+                    
+                    log.info(f"[{task_id}] Grader response: '{grade_response}'")
+                    
+                    # Parsing rigoroso
+                    is_satisfactory = grade_response.startswith("YES")
+                    
+                except Exception as e:
+                    log.error(f"[{task_id}] Grader LLM failed: {e}. Defaulting to YES to not penalize user.")
+                    is_satisfactory = True 
+
+            # 4. Gestione Retry (Generazione nuova query e nuovo retrieval)
+            if not is_satisfactory:
+                attempt += 1
+                if attempt < MAX_MODEL_RETRIES:
+                    log.warning(f"[{task_id}] Answer inadequate. Retrying ({attempt}/{MAX_MODEL_RETRIES})...")
+                    
+                    retry_prompt_tmpl = load_prompt_template("query_retry")
+                    retry_prompt = retry_prompt_tmpl.format(query=standalone_query)
+                    
+                    try:
+                        new_query = TRANSFORM_MODEL.generate_content(retry_prompt).text.strip()
+                        log.info(f"[{task_id}] Fallback query generated: '{new_query}'")
+                        
+                        new_vector = embed_query(new_query)
+                        
+                        # Sovrascrittura totale: scartiamo il rumore precedente
+                        context, sources = retrieve_chunks(new_query, new_vector, topic_id, selected_sub_topics)
+                    except Exception as e:
+                        log.error(f"[{task_id}] Retry infrastructure failed: {e}")
+                        break # Inutile insistere se embedding o retrieval vanno in crash
+                else:
+                    log.warning(f"[{task_id}] Max retries reached. Returning best available answer.")
+
+        # ==============================================================================
+        # 5. USCITA DAL LOOP (La variabile 'answer' contiene già l'elaborazione corretta)
+        # ==============================================================================
+
         # 6. Cache Valid Responses
-        if answer and len(answer) > 20 and "could not find" not in answer.lower():
+        if answer and is_satisfactory and len(answer) > 20:
             save_to_semantic_cache(
                 query_vector, 
                 standalone_query, 
