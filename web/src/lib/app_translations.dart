@@ -31,7 +31,6 @@ class AppTranslations {
       AppLang.it: "File sconosciuto",
       AppLang.en: "Unknown file",
     },
-    // Bonus: You can also translate the path to your welcome HTML file!
     'welcome_html_path': {
       AppLang.it: "assets/html/welcome_it.html",
       AppLang.en: "assets/html/welcome_en.html",
@@ -71,6 +70,7 @@ class AppTranslations {
       AppLang.en: "Thanks for your feedback!",
     },
     'toggle_theme': {AppLang.it: "Cambia tema", AppLang.en: "Toggle Theme"},
+    'delete_chat': {AppLang.it: "Elimina Chat", AppLang.en: "Delete Chat"},
     'welcome_load_error': {
       AppLang.it: "Errore nel caricamento del messaggio di benvenuto.",
       AppLang.en: "Error loading welcome message.",
@@ -95,7 +95,6 @@ class AppTranslations {
       AppLang.en: "Filter Subtopics",
     },
     'subtopics_title': {AppLang.it: "Sottocategorie", AppLang.en: "Subtopics"},
-    'send_question': {AppLang.it: "Invia domanda", AppLang.en: "Send question"},
     'maintenance_mode': {
       AppLang.it: "Sistema in manutenzione",
       AppLang.en: "Maintenance Mode",
@@ -132,11 +131,36 @@ class AppTranslations {
       AppLang.en:
           "Change the screen colors (Light, Dark, or High Contrast) to improve visibility.",
     },
+    'delete_chat_desc': {
+      AppLang.it:
+          "Elimina la chat corrente e inizia una nuova conversazione.",
+      AppLang.en:
+          "Delete the current chat and start a new conversation.",
+    },
     'filter_subtopics_desc': {
       AppLang.it:
           "Filtro per effettuare le ricerche solamente sulle serie che ti interessano.",
       AppLang.en: "Filter to search only within the series that interest you.",
     },
+    'ai_processing': {
+      AppLang.it: "Sto elaborando la tua domanda...",
+      AppLang.en: "Processing your question...",
+    },
+    'taking_longer': {
+      AppLang.it:
+          "La ricerca a ricerca è complessa, ci sta volendo più del previsto...attendi ancora un attimo...",
+      AppLang.en:
+          "The search is complex, it's taking longer than expected...please wait a bit more...",
+    },
+    'send_question': {
+      AppLang.it: "Invia domanda",
+      AppLang.en: "Send question",
+    },
+    'send_question_desc': {
+      AppLang.it: "Invia la tua domanda al chatbot",
+      AppLang.en: "Send your question to the chatbot",
+    },
+
   };
 
   /// Helper function to grab the correct string based on the current language

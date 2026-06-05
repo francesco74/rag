@@ -9,6 +9,7 @@ from mysql.connector import pooling
 from qdrant_client import QdrantClient, models
 import google.generativeai as genai
 import math
+import json, re
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -67,7 +68,7 @@ MAX_MODEL_RETRIES = 2
 # Gemini Retry Configuration
 GEMINI_RETRY = retry(
     retry=retry_if_exception_type((ResourceExhausted, ServiceUnavailable)),
-    wait=wait_random_exponential(multiplier=2, max=60),
+    wait=wait_random_exponential(multiplier=2, min=4, max=60),
     stop=stop_after_attempt(6),
     before_sleep=lambda retry_state: log.warning(
         f"Rate limit hit. Retrying in {retry_state.next_action.sleep}s..."
@@ -96,7 +97,7 @@ celery_app.conf.update(
 )
 
 # ==============================================================================
-# PROCESS-SAFE INITIALIZATION (THE CRITICAL FIX)
+# PROCESS-SAFE INITIALIZATION 
 # ==============================================================================
 # Globals assigned strictly AFTER the fork
 db_pool = None
@@ -148,6 +149,46 @@ def init_worker_process(**kwargs):
 # ==============================================================================
 # 4. HELPER FUNCTIONS
 # ==============================================================================
+
+def safe_json_parse(raw_text: str, task_id: str = "UNKNOWN") -> dict:
+    """
+    Estrae robustamente il JSON con log intermedi per capire ESATTAMENTE
+    dove e perché il parser fallisce.
+    """
+    raw_text = raw_text.strip()
+    # Logghiamo l'inizio del parsing (limitato ai primi 300 caratteri per non intasare i log)
+    log.debug(f"[{task_id}] [JSON_PARSE] Inizio estrazione. Testo grezzo ricevuto: \n{raw_text[:300]}...")
+    
+    # 1. Tentativo standard
+    try:
+        parsed_data = json.loads(raw_text)
+        log.debug(f"[{task_id}] [JSON_PARSE] ✓ Successo al Livello 1 (Standard Parse).")
+        return parsed_data
+    except json.JSONDecodeError as e:
+        log.debug(f"[{task_id}] [JSON_PARSE] Livello 1 fallito: {e}. Passo al Livello 2 (Markdown Strip).")
+        
+    # 2. Tentativo con pulizia Markdown esplicita
+    clean_text = re.sub(r'^```json\s*|\s*```$', '', raw_text, flags=re.MULTILINE).strip()
+    try:
+        parsed_data = json.loads(clean_text)
+        log.debug(f"[{task_id}] [JSON_PARSE] ✓ Successo al Livello 2 (Markdown rimosso).")
+        return parsed_data
+    except json.JSONDecodeError as e:
+        log.debug(f"[{task_id}] [JSON_PARSE] Livello 2 fallito: {e}. Passo al Livello 3 (Brute Force Regex).")
+
+    # 3. Tentativo "Forza Bruta": Cerca tutto ciò che è tra parentesi graffe
+    match = re.search(r'\{.*\}', raw_text, re.DOTALL)
+    if match:
+        try:
+            parsed_data = json.loads(match.group(0))
+            log.debug(f"[{task_id}] [JSON_PARSE] ✓ Successo al Livello 3 (Regex Regex Brute Force).")
+            return parsed_data
+        except json.JSONDecodeError as e:
+            log.debug(f"[{task_id}] [JSON_PARSE] Livello 3 fallito: {e}.")
+            
+    # Fallimento totale
+    log.error(f"[{task_id}] [JSON_PARSE] ✗ Fallimento totale. Impossibile estrarre JSON. Testo originale:\n{raw_text}")
+    raise ValueError("Impossibile estrarre un JSON valido dal testo fornito.")
 
 def safe_sigmoid(x):
     """
@@ -205,49 +246,75 @@ def embed_query(query):
 
 
 @GEMINI_RETRY
-def transform_query(history, query):
-    """Transform conversational query into standalone query."""
-    if not history:
-        log.debug("No history provided, using original query.")
-        return query
+def transform_query(history, query, task_id="UNKNOWN"):
+    """Transform conversational query into standalone query via JSON Mode with full tracing."""
+    log.info(f"[{task_id}] [REWRITER] Avvio analisi query: '{query}'")
     
-    history_str = "\n".join([
-        f"{msg.get('role', 'user')}: {msg.get('text', '')}" 
-        for msg in history
-    ])
+    if not history:
+        log.debug(f"[{task_id}] [REWRITER] Nessuna history fornita.")
+        history_str = ""
+    else:
+        history_str = "\n".join([
+            f"{msg.get('role', 'user')}: {msg.get('text', '')}" 
+            for msg in history
+        ])
+        log.debug(f"[{task_id}] [REWRITER] History iniettata (elementi: {len(history)})")
     
     prompt = load_prompt_template("query_rewriter").format(
         history_str=history_str, 
         query=query
     )
     
-    log.debug(f"Transforming query with history context...")
-    
-    response = TRANSFORM_MODEL.generate_content(prompt)
-    transformed = response.text.strip()
-    
-    log.debug(f"Query transformed: '{query}' → '{transformed}'")
-    return transformed
-
+    try:
+        log.debug(f"[{task_id}] [REWRITER] Chiamata a Gemini API in corso...")
+        
+        response = TRANSFORM_MODEL.generate_content(
+            prompt,
+            generation_config=genai.types.GenerationConfig(
+                response_mime_type="application/json",
+                temperature=0.1
+            )
+        )
+        
+        # Logghiamo l'intero testo restituito da Gemini PRIMA di parsarlo
+        log.debug(f"[{task_id}] [REWRITER] Risposta grezza Gemini:\n{response.text}")
+        
+        # Uso del parser robusto passandogli il task_id
+        data = safe_json_parse(response.text, task_id)
+        
+        standalone = data.get("standalone_query", query)
+        searches = data.get("search_queries", [query])
+        keywords = data.get("keywords", [])
+        
+        log.info(f"[{task_id}] [REWRITER] ✓ Query processata. Standalone: '{standalone}' | Facets: {len(searches)} | Keywords: {len(keywords)}")
+        
+        return {
+            "standalone_query": standalone,
+            "search_queries": searches,
+            "keywords": keywords
+        }
+        
+    except Exception as e:
+        # Se cade qui, o l'API è down o safe_json_parse ha sollevato il ValueError estremo
+        log.warning(f"[{task_id}] [REWRITER] ✗ Fallimento critico: {e}. Attivazione fallback (query raw).", exc_info=True)
+        return {
+            "standalone_query": query,
+            "search_queries": [query],
+            "keywords": []
+        }
 
 @GEMINI_RETRY
-def extract_keywords_with_ai(query):
-    """Extract significant keywords using AI."""
-    prompt = load_prompt_template("extract_keywords").format(query=query)
-    log.info(f"input prompt'{prompt}'")
-    
-    response = TRANSFORM_MODEL.generate_content(prompt)
-    cleaned_text = response.text.strip()
-    
-    log.info(f"AI extracted keywords: '{cleaned_text}'")
-    
-    keywords = cleaned_text.replace(",", " ").replace(".", "").split()
-    keywords = [w.lower() for w in keywords if len(w) > 2]
-    
-    return list(dict.fromkeys(keywords))
+def embed_queries_batch(queries_list):
+    """Generate embeddings for MULTIPLE queries in a single API call."""
+    result = genai.embed_content(
+        model=EMBEDDING_MODEL,
+        content=queries_list,
+        task_type="RETRIEVAL_QUERY",
+        output_dimensionality=768
+    )
+    # result['embedding'] will be a list of vectors if input is a list
+    return result['embedding'] if isinstance(queries_list, list) else [result['embedding']]
 
-
-import json
 
 @GEMINI_RETRY
 def generate_answer(query, rich_context, topic_id):
@@ -423,153 +490,174 @@ def setup_periodic_tasks(sender, **kwargs):
 # ==============================================================================
 # 7. DOCUMENT RETRIEVAL (With OPTIMIZED Reranking)
 # ==============================================================================
-def retrieve_chunks(query, vector, topic_id, selected_sub_topics):
+def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_sub_topics):
+    """
+    Recupera, fonde e riordina i chunk dal Vector DB in modo sicuro.
+    """
     if not qdrant_client:
-        log.error("Qdrant client not available!")
+        log.error("Qdrant client not available! Retrieval aborted.")
         return [], []
     
+    log.info(f"=== Inizio Retrieval per topic '{topic_id}' ===")
+    log.debug(f"Search Queries: {search_queries} | Keywords: {keywords}")
+    
     try:
-        log.info(f"=== Inizio Retrieval (Parent-Child) per topic '{topic_id}' ===")
         fused_hits = {}
-        
-        # ==================================================================
-        # 1. PARALLEL SEARCH (Vector + Keyword)
-        # ==================================================================
         must_conditions = [models.FieldCondition(key="topic_id", match=models.MatchValue(value=topic_id))]
         if selected_sub_topics:
             must_conditions.append(models.FieldCondition(key="sub_topic_id", match=models.MatchAny(any=selected_sub_topics)))
 
-        def vector_search():
-            res = qdrant_client.query_points(
-                collection_name=QDRANT_COLLECTION,
-                query=vector, 
-                limit=QDRANT_SEMANTIC_SIZE,
-                score_threshold=QDRANT_THRESHOLD,
-                query_filter=models.Filter(must=must_conditions)
-            )
-            log.info(f"Child Vector search: {len(res.points)} hits")
-            return res.points
-        
-        def keyword_search():
+        # ==========================================================
+        # 1. FUNZIONI DI RICERCA (Con Exception Handling Interno)
+        # ==========================================================
+        def safe_vector_search(vector, idx):
             try:
-                keywords = extract_keywords_with_ai(query)
-                log.info(f"Keywords estratte per Child Search: {keywords}")
+                res = qdrant_client.query_points(
+                    collection_name=QDRANT_COLLECTION,
+                    query=vector, 
+                    limit=QDRANT_SEMANTIC_SIZE,
+                    score_threshold=QDRANT_THRESHOLD,
+                    query_filter=models.Filter(must=must_conditions)
+                )
+                log.debug(f"Vector search #{idx} returned {len(res.points)} hits.")
+                return res.points
             except Exception as e:
-                log.warning(f"AI keyword extraction fallita: {e}. Uso fallback.")
-                keywords = [w.lower() for w in query.split() if len(w) > 3]
-            
-            if not keywords: 
+                log.error(f"Vector search #{idx} failed: {e}")
                 return []
             
-            should_cond = [models.FieldCondition(key="content", match=models.MatchText(text=w)) for w in keywords]
-            k_res = qdrant_client.scroll(
-                collection_name=QDRANT_COLLECTION,
-                scroll_filter=models.Filter(must=must_conditions + [models.Filter(should=should_cond)]),
-                limit=QDRANT_SYNTATIC_SIZE * 2,
-                with_payload=True
-            )
-            hits = k_res[0]
-            log.info(f"Child Keyword search: {len(hits)} hits validi")
-            return hits
-        
-        # Esecuzione parallela delle ricerche sui Child
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            futures = {executor.submit(vector_search): "vector", executor.submit(keyword_search): "keyword"}
+        def safe_keyword_search():
+            if not keywords: return []
+            try:
+                # Normalizzazione rigorosa delle keyword
+                clean_kw = [w.lower().strip() for w in keywords if len(w.strip()) > 2]
+                if not clean_kw: return []
+                
+                should_cond = [models.FieldCondition(key="content", match=models.MatchText(text=w)) for w in clean_kw]
+                res = qdrant_client.scroll(
+                    collection_name=QDRANT_COLLECTION,
+                    scroll_filter=models.Filter(must=must_conditions + [models.Filter(should=should_cond)]),
+                    limit=QDRANT_SYNTATIC_SIZE * 2,
+                    with_payload=True
+                )
+                log.debug(f"Keyword search returned {len(res[0])} hits.")
+                return res[0]
+            except Exception as e:
+                log.error(f"Keyword search failed: {e}")
+                return []
+
+        # ==========================================================
+        # 2. ESECUZIONE PARALLELA 
+        # ==========================================================
+        with ThreadPoolExecutor(max_workers=min(10, len(vectors_list) + 1)) as executor:
+            futures = []
+            
+            # Lancio ricerca testuale
+            futures.append(executor.submit(safe_keyword_search))
+            
+            # Lancio ricerche vettoriali
+            for idx, vec in enumerate(vectors_list):
+                futures.append(executor.submit(safe_vector_search, vec, idx))
+                
+            # Aggregazione e De-duplicazione
             for future in as_completed(futures):
                 try:
-                    for hit in future.result():
-                        if hit.id not in fused_hits: fused_hits[hit.id] = hit
+                    hits = future.result()
+                    for hit in hits:
+                        if hit.id not in fused_hits: 
+                            fused_hits[hit.id] = hit
                 except Exception as e:
-                    log.error(f"Ricerca {futures[future]} fallita: {e}")
-                    
+                    log.error(f"Error resolving search future: {e}", exc_info=True)
+
         candidates = list(fused_hits.values())
         if not candidates: 
-            log.warning("Nessun Child Chunk trovato.")
+            log.warning("Nessun Child Chunk trovato da nessuna delle query.")
             return [], []
+            
+        log.info(f"Ricerca parallela completata. Trovati {len(candidates)} candidati unici (Child).")
 
-        # ==================================================================
-        # 2. RERANKING SUI CHILD CHUNKS
-        # ==================================================================
+        # ==========================================================
+        # 3. RERANKING LOCALE (Con Graceful Degradation)
+        # ==========================================================
         top_child_docs = []
-        reranker = get_reranker()
         
-        if reranker and candidates:
-            log.info(f"Reranking di {len(candidates)} candidati (Child)...")
-            docs_content = [c.payload.get("content", "")[:RERANK_TRUNCATE] for c in candidates]
-            try:
-                reranked_results = reranker.rerank(query, docs_content)
+        try:
+            reranker = get_reranker()
+            if reranker and candidates:
+                log.debug("Inizio Reranking locale...")
+                # Usa la query originale per valutare la coerenza
+                eval_query = search_queries[0] 
+                docs_content = [c.payload.get("content", "")[:RERANK_TRUNCATE] for c in candidates]
+                
+                reranked_results = reranker.rerank(eval_query, docs_content)
                 reranked_results.sort(key=lambda x: x.score, reverse=True)
 
                 for res in reranked_results[:RERANK_SIZE]:
                     prob = safe_sigmoid(res.score)
-                    log.info(f"Candidate {res.index} | Logit: {res.score:.4f} | Prob: {prob:.2%}")
-
-                    # 2. Filtro anti-spazzatura
                     if prob >= MIN_PROB_THRESHOLD or len(top_child_docs) < 2:
                         top_child_docs.append(candidates[res.index])
                     else:
-                        # Appena troviamo il primo sotto soglia, possiamo anche interrompere 
-                        # il ciclo (break) dato che sono ordinati in modo decrescente.
-                        log.debug(f"Documento scartato: probabilità {prob:.2%} < {MIN_PROB_THRESHOLD:.2%}")
-                        break 
+                        break # Soglia minima non raggiunta, interrompiamo (sono già ordinati)
                 
-                log.info(f"Reranking completato. Selezionati {len(top_child_docs)} Child validi.")
-
-            except Exception as e:
-                log.error(f"Reranking fallito: {e}")
-                # Fallback: se il reranker fallisce, passiamo i candidati originali
+                log.info(f"Reranking completato. Sopravvissuti {len(top_child_docs)} Child validi.")
+            else:
+                log.warning("Reranker non disponibile. Fallback sui risultati grezzi di Qdrant.")
+                # Ordinamento per score Qdrant (approssimativo) e taglio a RERANK_SIZE
+                candidates.sort(key=lambda x: getattr(x, 'score', 0), reverse=True)
                 top_child_docs = candidates[:RERANK_SIZE]
-
-        else:
+                
+        except Exception as e:
+            log.error(f"Errore fatale durante il Reranking: {e}. Fallback sui risultati grezzi.", exc_info=True)
             top_child_docs = candidates[:RERANK_SIZE]
 
-        # ==================================================================
-        # 3. RECUPERO DEI PARENT DOCUMENTS (Il "Contesto Vero")
-        # ==================================================================
-        # Estraiamo i parent_id unici dai Child migliori
-        parent_ids = list(set([
-            doc.payload.get("parent_id") for doc in top_child_docs 
-            if doc.payload and doc.payload.get("parent_id")
-        ]))
+        # ==========================================================
+        # 4. RECUPERO PARENT DOCUMENTS
+        # ==========================================================
+        try:
+            # Estrazione sicura dei parent_id
+            parent_ids = list({
+                doc.payload.get("parent_id") 
+                for doc in top_child_docs 
+                if doc.payload and doc.payload.get("parent_id")
+            })
 
-        if not parent_ids:
-            log.error("Errore critico: i Child non hanno parent_id nel payload!")
+            if not parent_ids:
+                log.error("I Child document non contengono alcun 'parent_id' nel payload.")
+                return [], []
+
+            log.debug(f"Recupero batch di {len(parent_ids)} Parent Documents...")
+            parent_records = qdrant_client.retrieve(
+                collection_name=PARENT_COLLECTION,
+                ids=parent_ids,
+                with_payload=True
+            )
+        except Exception as e:
+            log.error(f"Errore recupero Parent Documents: {e}", exc_info=True)
             return [], []
 
-        log.info(f"Recupero di {len(parent_ids)} Parent Documents dalla collezione '{PARENT_COLLECTION}'...")
-        
-        # Recupero batch dei Parent tramite ID
-        parent_records = qdrant_client.retrieve(
-            collection_name=PARENT_COLLECTION,
-            ids=parent_ids,
-            with_payload=True
-        )
-
-        # ==================================================================
-        # 4. ORGANIZZAZIONE RISULTATI PER IL GENERATOR
-        # ==================================================================
+        # ==========================================================
+        # 5. FORMATTAZIONE OUTPUT
+        # ==========================================================
         rich_context = []
         unique_sources_map = {}
 
         for p_doc in parent_records:
-            source = p_doc.payload.get("source", "Fonte sconosciuta")
+            if not p_doc.payload: continue
+            
+            source = p_doc.payload.get("source", "Fonte_Sconosciuta")
             sub_topic_id = p_doc.payload.get("sub_topic_id", "")
             content = p_doc.payload.get("content", "").strip()
             
             if content:
-                rich_context.append({
-                    "content": content,
-                    "source": source
-                })
+                rich_context.append({"content": content, "source": source})
                 
                 if source not in unique_sources_map:
                     unique_sources_map[source] = {"file": source, "sub_topic": sub_topic_id}
 
-        log.info(f"=== Retrieval terminata. Inviati {len(rich_context)} Parent Documents a Gemini. ===")
+        log.info(f"=== Retrieval terminata con successo. Parent passati al generatore: {len(rich_context)} ===")
         return rich_context, list(unique_sources_map.values())
         
     except Exception as e:
-        log.error(f"Errore durante il processo di retrieval: {e}", exc_info=True)
+        log.critical(f"Errore critico imprevisto nel Retrieval: {e}", exc_info=True)
         return [], []
 
 
@@ -625,52 +713,70 @@ def get_all_sub_topics(topic_id):
 
 @celery_app.task(bind=True, name="rag_queue")
 def process_rag_query(self, query, history, topic_id, selected_sub_topics=None):
-    """Main RAG processing pipeline with optimized reranking."""
+    """Main RAG processing pipeline: JSON Mode, Multi-Query, and Defensive Error Handling."""
     start_time = time.time()
     task_id = self.request.id
     log.info(f"[{task_id}] Task started: '{query[:50]}...' su topic: {topic_id}")
 
-    if not selected_sub_topics:
-        selected_sub_topics = get_all_sub_topics(topic_id)
-        if not selected_sub_topics:
-            log.error(f"[{task_id}] Nessun sub-topic trovato o configurato per il topic '{topic_id}'.")
-            return {
-                "error": "Configuration Error",
-                "message": "Il topic selezionato non contiene documenti o non è configurato correttamente.",
-                "status": "failed"
-            }
-        
+    # ==========================================================
+    # 1. SETUP & VALIDATION
+    # ==========================================================
     try:
-        # 1. Query Transformation
-        try:
-            standalone_query = transform_query(history, query)
-        except Exception as e:
-            log.warning(f"Query transformation failed: {e}")
-            standalone_query = query
-        
-        # 2. Embedding
-        try:
-            query_vector = embed_query(standalone_query)
-        except Exception as e:
-            log.error(f"Embedding failed: {e}")
-            return {
-                "error": "AI Service Unavailable",
-                "message": "The AI service is currently overloaded. Please try again.",
-                "status": "failed"
-            }
-        
-        if not query_vector:
-            return {
-                "error": "Embedding Failed",
-                "message": "Unable to process your question. Please try rephrasing.",
-                "status": "failed"
-            }
-        
-        # 3. Cache Check
+        if not selected_sub_topics:
+            selected_sub_topics = get_all_sub_topics(topic_id)
+            if not selected_sub_topics:
+                log.error(f"[{task_id}] Config Error: Nessun sub-topic per il topic '{topic_id}'.")
+                return {
+                    "error": "Configuration Error",
+                    "message": "Il topic selezionato non è configurato correttamente.",
+                    "status": "failed"
+                }
         st_key = generate_sub_topics_key(selected_sub_topics)
-        cached = check_semantic_cache(query_vector, topic_id, st_key)
+    except Exception as e:
+        log.error(f"[{task_id}] Initialization DB failed: {e}", exc_info=True)
+        return {"error": "Internal Error", "message": "Errore di inizializzazione.", "status": "failed"}
+
+    # ==========================================================
+    # 2. QUERY TRANSFORMATION & MULTI-QUERY EXPANSION
+    # ==========================================================
+    try:
+        # Nota l'aggiunta di task_id qui
+        rewritten_data = transform_query(history, query, task_id)
+        
+        standalone_query = rewritten_data.get("standalone_query", query)
+        search_queries = rewritten_data.get("search_queries", [standalone_query])
+        extracted_keywords = rewritten_data.get("keywords", [])
+        
+        # Fallback testuale di sicurezza
+        if not extracted_keywords:
+            log.debug(f"[{task_id}] Nessuna keyword restituita, attivo fallback testuale in Python.")
+            extracted_keywords = [w.strip("?.,!'\"") for w in standalone_query.split() if len(w) > 3]
+
+        if standalone_query not in search_queries:
+            search_queries.insert(0, standalone_query)
+            
+    except Exception as e:
+        log.warning(f"[{task_id}] [MAIN_TASK] Pipeline di trasformazione caduta: {e}. Uso raw query.")
+        standalone_query, search_queries, extracted_keywords = query, [query], []
+
+    # ==========================================================
+    # 3. BATCH EMBEDDING
+    # ==========================================================
+    try:
+        vectors_list = embed_queries_batch(search_queries)
+        # Vettore primario usato per la Semantic Cache
+        primary_query_vector = vectors_list[0] 
+    except Exception as e:
+        log.error(f"[{task_id}] AI Embedding service failed: {e}", exc_info=True)
+        return {"error": "AI Service Unavailable", "message": "Servizio momentaneamente sovraccarico.", "status": "failed"}
+
+    # ==========================================================
+    # 4. SEMANTIC CACHE CHECK
+    # ==========================================================
+    try:
+        cached = check_semantic_cache(primary_query_vector, topic_id, st_key)
         if cached:
-            log.info(f"[{task_id}] Returning cached response.")
+            log.info(f"[{task_id}] Cache HIT. Returning cached response.")
             return {
                 "answer": cached['answer'],
                 "sources": cached['sources'],
@@ -678,128 +784,137 @@ def process_rag_query(self, query, history, topic_id, selected_sub_topics=None):
                 "cached": True,
                 "status": "success"
             }
-        
-        # 4. Document Retrieval (Saltiamo totalmente la logica LLM di routing)
+    except Exception as e:
+        log.warning(f"[{task_id}] Cache check failed (non-blocking): {e}")
+
+    # ==========================================================
+    # 5. RETRIEVAL (Parallel Vector + Keyword)
+    # ==========================================================
+    try:
         context, sources = retrieve_chunks(
-            standalone_query, 
-            query_vector, 
+            search_queries, 
+            vectors_list, 
+            extracted_keywords, 
             topic_id, 
             selected_sub_topics
         )
+    except Exception as e:
+        log.error(f"[{task_id}] Vector DB Retrieval failed: {e}", exc_info=True)
+        return {"error": "Database Error", "message": "Errore durante il recupero dei documenti.", "status": "failed"}
 
-        # Self-Correction Loop
-        attempt = 0
-        answer = None
-        is_satisfactory = False
+    # ==========================================================
+    # 6. SELF-CORRECTION LOOP (Generation & Grading)
+    # ==========================================================
+    attempt = 0
+    answer = None
+    is_satisfactory = False
 
-        while attempt < MAX_MODEL_RETRIES and not is_satisfactory:
-            if not context:
-                # Se non c'è contesto fin dall'inizio, inutile interrogare i modelli
-                answer = "<p>Non sono riuscito a trovare la risposta nei documenti che ho analizzato.</p>"
-                log.debug(f"[{task_id}] No context retrieved. Breaking loop.")
-                break
+    while attempt < MAX_MODEL_RETRIES and not is_satisfactory:
+        if not context:
+            answer = "<p>Non sono riuscito a trovare la risposta nei documenti che ho analizzato.</p>"
+            log.debug(f"[{task_id}] Context empty. Breaking loop.")
+            break
 
-            # 1. Generazione Strutturata (JSON Mode)
+        # A. Generazione (JSON Mode)
+        try:
+            gen_result = generate_answer(standalone_query, context, topic_id)
+            is_found = gen_result.get("is_found", False)
+            answer = gen_result.get("answer", "")
+        except Exception as e:
+            log.error(f"[{task_id}] Answer generation API failed: {e}", exc_info=True)
+            return {"error": "Generation Failed", "message": "Impossibile elaborare la risposta.", "status": "failed"}
+
+        # B. Logica Fail-Fast
+        if not is_found:
+            log.info(f"[{task_id}] Model explicitly flagged is_found=False. Skipping Grader.")
+            log.debug(f"[{task_id}] Model answer: {answer}")
+            is_satisfactory = False
+        else:
+            # C. Grader LLM
             try:
-                gen_result = generate_answer(standalone_query, context, topic_id)
-                is_found = gen_result.get("is_found", False)
-                answer = gen_result.get("answer", "")
-            except Exception as e:
-                log.error(f"[{task_id}] Answer generation failed: {e}")
-                return {"error": "Generation Failed", "message": "Failed to generate answer.", "status": "failed"}
-
-            # 2. Valutazione Logica (Fail-Fast)
-            if not is_found:
-                log.info(f"[{task_id}] Il generatore dichiara (via JSON) che l'informazione è assente. Salto il Grader.")
-                is_satisfactory = False
-            else:
-                # 3. Grader LLM (Controllo Allucinazioni)
-                # Il Grader entra in gioco SOLO se il generatore crede di aver risposto bene
                 context_snippet = context if isinstance(context, str) else str(context)
-                
                 grader_tmpl = load_prompt_template("grader")
-                grader_prompt = grader_tmpl.format(
-                    query=standalone_query, 
-                    context_snippet=context_snippet, 
-                    answer=answer
-                )
+                grader_prompt = grader_tmpl.format(query=standalone_query, context_snippet=context_snippet, answer=answer)
+                
+                grade_response = TRANSFORM_MODEL.generate_content(
+                    grader_prompt,
+                    generation_config=genai.types.GenerationConfig(temperature=0.0, max_output_tokens=5)
+                ).text.strip().upper()
+                
+                log.info(f"[{task_id}] Grader response: '{grade_response}'")
+                is_satisfactory = grade_response.startswith("YES")
+                
+            except Exception as e:
+                log.error(f"[{task_id}] Grader LLM failed (non-blocking): {e}. Defaulting to YES.")
+                is_satisfactory = True 
 
-                log.debug(f"[{task_id}] Validating answer {answer} with Grader...")
-
+        # D. Gestione Retry Fallimento
+        if not is_satisfactory:
+            attempt += 1
+            if attempt < MAX_MODEL_RETRIES:
+                log.warning(f"[{task_id}] Answer unsatisfactory. Retrying ({attempt}/{MAX_MODEL_RETRIES}) with full pipeline...")
                 try:
-                    grade_response = TRANSFORM_MODEL.generate_content(
-                        grader_prompt,
-                        generation_config=genai.types.GenerationConfig(
-                            temperature=0.0, 
-                            max_output_tokens=5 
-                        )
-                    ).text.strip().upper()
+                    # 1. Iniettiamo un "falso" messaggio di sistema nella history per forzare l'LLM a cambiare approccio
+                    retry_history = history.copy() if history else []
+                    retry_history.append({
+                        "role": "user", 
+                        "text": f"La ricerca precedente per '{standalone_query}' non ha prodotto documenti validi. Riformula completamente la query usando sinonimi o concetti più ampi per esplorare un'angolazione semantica diversa."
+                    })
                     
-                    log.info(f"[{task_id}] Grader response: '{grade_response}'")
+                    # 2. Riusiamo la funzione strutturata (JSON Mode + Facets + Keywords)
+                    retry_data = transform_query(retry_history, query, f"{task_id}-RETRY")
                     
-                    # Parsing rigoroso
-                    is_satisfactory = grade_response.startswith("YES")
+                    standalone_query = retry_data.get("standalone_query", query)
+                    search_queries = retry_data.get("search_queries", [standalone_query])
+                    extracted_keywords = retry_data.get("keywords", [])
                     
+                    if not extracted_keywords:
+                        extracted_keywords = [w.strip("?.,!'\"") for w in standalone_query.split() if len(w) > 3]
+                    if standalone_query not in search_queries:
+                        search_queries.insert(0, standalone_query)
+                    
+                    # 3. Rieseguiamo il Batch Embedding e il Retrieval Multi-Query
+                    vectors_list = embed_queries_batch(search_queries)
+                    context, sources = retrieve_chunks(
+                        search_queries, 
+                        vectors_list, 
+                        extracted_keywords, 
+                        topic_id, 
+                        selected_sub_topics
+                    )
                 except Exception as e:
-                    log.error(f"[{task_id}] Grader LLM failed: {e}. Defaulting to YES to not penalize user.")
-                    is_satisfactory = True 
+                    log.error(f"[{task_id}] Retry infrastructure failed: {e}", exc_info=True)
+                    break  # Usciamo usando l'ultima answer generata
+            else:
+                log.warning(f"[{task_id}] Max retries exhausted. Returning best effort answer.")
 
-            # 4. Gestione Retry (Generazione nuova query e nuovo retrieval)
-            if not is_satisfactory:
-                attempt += 1
-                if attempt < MAX_MODEL_RETRIES:
-                    log.warning(f"[{task_id}] Answer inadequate. Retrying ({attempt}/{MAX_MODEL_RETRIES})...")
-                    
-                    retry_prompt_tmpl = load_prompt_template("query_retry")
-                    retry_prompt = retry_prompt_tmpl.format(query=standalone_query)
-                    
-                    try:
-                        new_query = TRANSFORM_MODEL.generate_content(retry_prompt).text.strip()
-                        log.info(f"[{task_id}] Fallback query generated: '{new_query}'")
-                        
-                        new_vector = embed_query(new_query)
-                        
-                        # Sovrascrittura totale: scartiamo il rumore precedente
-                        context, sources = retrieve_chunks(new_query, new_vector, topic_id, selected_sub_topics)
-                    except Exception as e:
-                        log.error(f"[{task_id}] Retry infrastructure failed: {e}")
-                        break # Inutile insistere se embedding o retrieval vanno in crash
-                else:
-                    log.warning(f"[{task_id}] Max retries reached. Returning best available answer.")
-
-        # ==============================================================================
-        # 5. USCITA DAL LOOP (La variabile 'answer' contiene già l'elaborazione corretta)
-        # ==============================================================================
-
-        # 6. Cache Valid Responses
+    # ==========================================================
+    # 7. CACHE SAVING & RETURN
+    # ==========================================================
+    try:
+        # Evitiamo di cacchare risposte troppo brevi o palesemente vuote
         if answer and is_satisfactory and len(answer) > 20:
             save_to_semantic_cache(
-                query_vector, 
+                primary_query_vector, 
                 standalone_query, 
                 answer, 
                 sources, 
                 topic_id,
                 st_key
             )
-        
-        duration = time.time() - start_time
-        log.info(f"[{task_id}] ✓ Completed in {duration:.2f}s")
-        
-        return {
-            "answer": answer,
-            "sources": sources,
-            "topic": topic_id,
-            "cached": False,
-            "status": "success"
-        }
-    
     except Exception as e:
-        log.critical(f"[{task_id}] ✗ Unhandled exception: {e}", exc_info=True)
-        return {
-            "error": "Internal Processing Error",
-            "message": "An unexpected error occurred.",
-            "status": "failed"
-        }
+        log.warning(f"[{task_id}] Failed to save successful response to cache (non-blocking): {e}")
+
+    duration = time.time() - start_time
+    log.info(f"[{task_id}] ✓ Completed gracefully in {duration:.2f}s")
+    
+    return {
+        "answer": answer,
+        "sources": sources,
+        "topic": topic_id,
+        "cached": False,
+        "status": "success"
+    }
     
 # ==============================================================================
 # 9. WORKER LIFECYCLE

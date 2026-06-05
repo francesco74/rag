@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:async'; // Aggiunto per il Timer del Progressive Delay
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:flutter_html/flutter_html.dart'; // For rendering HTML
@@ -212,6 +213,8 @@ class _ChatScreenState extends State<ChatScreen> {
   final GlobalKey _filterKey = GlobalKey();
   final GlobalKey _langKey = GlobalKey();
   final GlobalKey _themeKey = GlobalKey();
+  final GlobalKey _deleteKey = GlobalKey();
+  final GlobalKey _sendKey = GlobalKey();
 
   TutorialCoachMark? _tutorialCoachMark;
   List<TargetFocus> _targets = [];
@@ -221,6 +224,10 @@ class _ChatScreenState extends State<ChatScreen> {
   Set<String> _selectedSubTopics = {};
   bool _allowSubtopicSelection = false;
 
+  // --- STATO PER PROGRESSIVE DELAY ---
+  Timer? _longWaitTimer;
+  String? _dynamicLoadingMessage;
+
   @override
   void initState() {
     super.initState();
@@ -229,33 +236,20 @@ class _ChatScreenState extends State<ChatScreen> {
 
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _checkFirstRun();
-      AppLang _detectBrowserLanguage() {
-        // Prende la stringa della lingua (es. "it-IT" o "en-US")
-        final String browserLang = html.window.navigator.language.toLowerCase();
-
-        if (browserLang.startsWith('it')) {
-          return AppLang.it;
-        }
-        // Default in inglese per tutti gli altri casi
-        return AppLang.en;
-      }
     });
   }
 
   Future<void> _checkFirstRun() async {
     final prefs = await SharedPreferences.getInstance();
     bool isFirstRun = prefs.getBool('tutorial_seen') ?? false;
-    
+
     if (!isFirstRun) {
       await Future.delayed(const Duration(milliseconds: 500));
       _showTutorial();
       await prefs.setBool('tutorial_seen', true);
     } else {
-      print("Tutorial già visto, non mostro di nuovo.");
+      debugPrint("Tutorial già visto, non mostro di nuovo.");
     }
-
-    
-    //_showTutorial(); // Per ora lo forziamo per test
   }
 
   void _initTutorialTargets() {
@@ -312,25 +306,35 @@ class _ChatScreenState extends State<ChatScreen> {
         ],
       ),
     );
-  }
 
-  Widget _buildTutorialText(String title, String desc) {
-    return Container(
-      padding: const EdgeInsets.all(16),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(
-            title,
-            style: const TextStyle(
-              fontWeight: FontWeight.bold,
-              color: Colors.white,
-              fontSize: 22,
+    _targets.add(
+      TargetFocus(
+        identify: "DeleteTarget",
+        keyTarget: _deleteKey,
+        contents: [
+          TargetContent(
+            align: ContentAlign.bottom,
+            builder: (context, controller) => _buildTutorialText(
+              AppTranslations.get('delete_chat', langNotifier.value),
+              AppTranslations.get('delete_chat_desc', langNotifier.value),
             ),
           ),
-          const SizedBox(height: 10),
-          Text(desc, style: const TextStyle(color: Colors.white, fontSize: 16)),
+        ],
+      ),
+    );
+
+    _targets.add(
+      TargetFocus(
+        identify: "SendTarget",
+        keyTarget: _sendKey,
+        contents: [
+          TargetContent(
+            align: ContentAlign.bottom,
+            builder: (context, controller) => _buildTutorialText(
+              AppTranslations.get('send_question', langNotifier.value),
+              AppTranslations.get('send_question_desc', langNotifier.value),
+            ),
+          ),
         ],
       ),
     );
@@ -344,7 +348,8 @@ class _ChatScreenState extends State<ChatScreen> {
       opacityShadow: 0.85,
       paddingFocus: 10,
       textSkip: AppTranslations.get('skip', langNotifier.value).toUpperCase(),
-      onClickTarget: (target) => print("Target cliccato: ${target.identify}"),
+      onClickTarget: (target) =>
+          debugPrint("Target cliccato: ${target.identify}"),
     )..show(context: context);
   }
 
@@ -374,16 +379,14 @@ class _ChatScreenState extends State<ChatScreen> {
           };
 
           _selectedSubTopics = _availableSubTopicIds.toSet();
-          _isMaintenanceMode = false; // Tutto ok
+          _isMaintenanceMode = false;
         });
       } else {
-        // Se il server risponde con un errore (es. 500 o 400)
         setState(() {
           _isMaintenanceMode = true;
         });
       }
     } catch (e) {
-      // Se c'è un errore di connessione o il server è offline
       debugPrint("Errore critico configurazione: $e");
       setState(() {
         _isMaintenanceMode = true;
@@ -405,14 +408,12 @@ class _ChatScreenState extends State<ChatScreen> {
   Future<void> _promptFeedbackComment(ChatMessage message, bool isLike) async {
     if (message.isUser || message.isError || message.isSystemMessage) return;
 
-    // 1. Instantly update UI for snappy responsiveness
     setState(() {
       message.feedback = isLike ? FeedbackStatus.like : FeedbackStatus.dislike;
     });
 
     final TextEditingController commentController = TextEditingController();
 
-    // 2. Prompt for an optional comment
     await showDialog(
       context: context,
       builder: (context) {
@@ -446,7 +447,6 @@ class _ChatScreenState extends State<ChatScreen> {
       },
     );
 
-    // 3. Fire the backend call with the comment
     await _sendFeedback(message, isLike, commentController.text.trim());
   }
 
@@ -533,15 +533,13 @@ class _ChatScreenState extends State<ChatScreen> {
 
           return Html(
             data: snapshot.data,
-            // Replace HTML elements with native Flutter widgets
             extensions: [
               TagExtension(
-                tagsToExtend: {"a"}, // <--- Change this line
+                tagsToExtend: {"a"},
                 builder: (extensionContext) {
                   final url = extensionContext.attributes['href'];
                   final text = extensionContext.element?.text ?? 'Link';
 
-                  // If it's one of our buttons (<a class="btn">)
                   if (extensionContext.classes.contains("btn")) {
                     return Padding(
                       padding: const EdgeInsets.symmetric(
@@ -571,11 +569,9 @@ class _ChatScreenState extends State<ChatScreen> {
                     );
                   }
 
-                  // Fallback: If it's just a normal <a> tag without the class
                   return Semantics(
-                    link: true, // Dice allo screen reader "questo è un link"
+                    link: true,
                     child: InkWell(
-                      // InkWell rende l'elemento focusabile col tasto Tab
                       onTap: () {
                         if (url != null) _launchUrl(url);
                       },
@@ -615,7 +611,6 @@ class _ChatScreenState extends State<ChatScreen> {
                 color: theme.colorScheme.onSurfaceVariant,
                 margin: Margins.only(bottom: 20.0),
               ),
-              // Optional: Help center the newly injected Flutter buttons
               ".links": Style(
                 textAlign: TextAlign.center,
                 margin: Margins.only(bottom: 16.0),
@@ -633,7 +628,6 @@ class _ChatScreenState extends State<ChatScreen> {
                     color: theme.colorScheme.secondary,
                     width: 4.0,
                   ),
-                  // Removing the other borders keeps it modern and clean
                 ),
                 margin: Margins.only(top: 16.0),
               ),
@@ -666,6 +660,7 @@ class _ChatScreenState extends State<ChatScreen> {
     _textController.dispose();
     _scrollController.dispose();
     _textFocusNode.dispose();
+    _longWaitTimer?.cancel(); // Prevenzione Memory Leak
     super.dispose();
   }
 
@@ -677,61 +672,53 @@ class _ChatScreenState extends State<ChatScreen> {
   Future<Map<String, dynamic>> _pollForResponse(String taskId) async {
     final String statusUrl = "${AppSettings.apiUrl}/status/$taskId";
 
-    // Safety 1: Set a maximum timeout (e.g., 60 seconds)
     final DateTime startTime = DateTime.now();
     const int timeoutSeconds = 180;
 
-    // Safety 2: Track consecutive network errors to avoid crashing on a single blip
     int consecutiveErrors = 0;
     const int maxErrors = 3;
 
     while (true) {
-      // Check Timeout
       if (DateTime.now().difference(startTime).inSeconds > timeoutSeconds) {
         throw Exception(AppTranslations.get('timeout', langNotifier.value));
       }
 
-      // 1. Check Status — delay is at the END of the loop so the first
-      //    request fires immediately (catches fast cache-hit responses ~200ms).
       try {
         final response = await http.get(
           Uri.parse(statusUrl),
           headers: {"Authorization": "Bearer ${AppSettings.apiSecretKeyValue}"},
         );
 
-        // Reset error counter on successful connection
-        consecutiveErrors = 0;
+        // FIX: Accettiamo 200 e 202. La UI non va in crash durante l'elaborazione.
+        if (response.statusCode == 200 || response.statusCode == 202) {
+          consecutiveErrors =
+              0; // Azzera gli errori solo su reale successo di rete
 
-        if (response.statusCode == 200) {
           final data = jsonDecode(utf8.decode(response.bodyBytes));
           final String status = data['status'];
 
           if (status == 'completed' || status == 'success') {
-            // SUCCESS
             return data['data'] ?? data;
           } else if (status == 'failed') {
-            // WORKER FAILURE
             return {
               'status': 'failed',
               'error': data['error'] ?? "Worker error",
             };
           }
-          // If 'processing' or 'PENDING', continue loop
         } else {
-          // HTTP Server Error (500, 404, etc) - Count as an error
+          // Errori severi 500, 502, etc.
           consecutiveErrors++;
         }
       } catch (e) {
         consecutiveErrors++;
-        // If we hit max errors, THEN crash. Otherwise, retry.
-        if (consecutiveErrors >= maxErrors) {
-          throw Exception(
-            AppTranslations.get('connection_lost', langNotifier.value),
-          );
-        }
       }
 
-      // Wait between polls (not before the first one).
+      if (consecutiveErrors >= maxErrors) {
+        throw Exception(
+          AppTranslations.get('connection_lost', langNotifier.value),
+        );
+      }
+
       await Future.delayed(const Duration(seconds: 2));
     }
   }
@@ -741,33 +728,40 @@ class _ChatScreenState extends State<ChatScreen> {
     final text = _textController.text;
     if (text.isEmpty) return;
 
-    // 1. Add user message to UI immediately
     final userMessage = ChatMessage(text: text, isUser: true);
     _addMessage(userMessage);
     _textController.clear();
 
-    // 2. Set Loading State
     setState(() {
       _isLoading = true;
+      _dynamicLoadingMessage = null; // Reset per la nuova chiamata
     });
 
-    // 3. Prepare Chat History
-    // Filter out errors/system messages and format for backend
+    // --- PROGRESSIVE DELAY MESSAGING ---
+    _longWaitTimer?.cancel();
+    _longWaitTimer = Timer(const Duration(seconds: 20), () {
+      if (mounted && _isLoading) {
+        setState(() {
+          // Assicurati che 'taking_longer' sia tradotto nel tuo file app_translations
+          _dynamicLoadingMessage = AppTranslations.get(
+            'taking_longer',
+            langNotifier.value,
+          );
+        });
+      }
+    });
+
     final chatHistory = _messages
         .where((msg) => !msg.isError && !msg.isSystemMessage)
         .toList()
-        .reversed // Oldest to newest
+        .reversed
         .map((msg) => {'role': msg.role, 'text': msg.text})
         .toList();
 
-    // Flask expects history without the current query.
-    // Explicit type annotation prevents the ternary from being inferred
-    // as List<dynamic> when the else branch returns an empty literal.
     final List<Map<String, dynamic>> chatHistoryForApi = chatHistory.length > 1
         ? chatHistory.sublist(0, chatHistory.length - 1)
         : [];
 
-    // The current query is in 'text' variable
     final lastQuery = text;
 
     try {
@@ -790,17 +784,11 @@ class _ChatScreenState extends State<ChatScreen> {
           .timeout(const Duration(seconds: 10));
 
       if (response.statusCode == 202) {
-        // 202 Accepted = Task Started successfully
         final data = jsonDecode(utf8.decode(response.bodyBytes));
         final String taskId = data['task_id'];
 
-        // --- STEP B: Poll for Result ---
-        // This awaits until the loop in _pollForResponse finishes
         final resultData = await _pollForResponse(taskId);
 
-        // --- STEP C: Handle Result ---
-        // Check if the worker returned a logical error (like "Topic not found")
-        // Your worker returns {"status": "not_found", ...} in these cases
         if (resultData['status'] == 'failed' ||
             resultData['status'] == 'not_found') {
           _addMessage(
@@ -812,7 +800,6 @@ class _ChatScreenState extends State<ChatScreen> {
             ),
           );
         } else {
-          // Success!
           _addMessage(
             ChatMessage(
               text: resultData['answer'],
@@ -824,7 +811,6 @@ class _ChatScreenState extends State<ChatScreen> {
           );
         }
       } else {
-        // The Dispatch failed immediately (e.g., 400 Bad Request, 500 Server Error)
         final data = jsonDecode(utf8.decode(response.bodyBytes));
         _addMessage(
           ChatMessage(
@@ -836,22 +822,22 @@ class _ChatScreenState extends State<ChatScreen> {
         );
       }
     } catch (e) {
-      // Network Error or Polling Error
       _addMessage(
         ChatMessage(
           text:
-              "<p>${AppTranslations.get('connection_lost', langNotifier.value)} (${e.toString()})</p>",
+              "<p>${AppTranslations.get('connection_lost', langNotifier.value)}</p>",
           isError: true,
           isSystemMessage: true,
         ),
       );
     } finally {
-      // 4. Reset Loading State
+      // Spegne SEMPRE il timer, a prescindere dal successo o dal fallimento
+      _longWaitTimer?.cancel();
+
       if (mounted) {
         setState(() {
           _isLoading = false;
         });
-        // Rimette automaticamente il cursore per l'utente da tastiera
         _textFocusNode.requestFocus();
       }
     }
@@ -863,19 +849,15 @@ class _ChatScreenState extends State<ChatScreen> {
     bool isLike,
     String comment,
   ) async {
-    // Prevent sending feedback for system/error messages or user messages
     if (message.isUser || message.isError || message.isSystemMessage) return;
 
-    // 1. Identify the user query that prompted this answer
     int msgIndex = _messages.indexOf(message);
     String userQuery = "";
 
-    // The user query should be immediately after the AI response in the reversed list
     if (msgIndex != -1 && msgIndex + 1 < _messages.length) {
       userQuery = _messages[msgIndex + 1].text;
     }
 
-    // 2. Construct History *up to* this exchange
     List<Map<String, dynamic>> contextHistory = [];
     if (msgIndex + 2 < _messages.length) {
       contextHistory = _messages
@@ -887,12 +869,10 @@ class _ChatScreenState extends State<ChatScreen> {
           .toList();
     }
 
-    // 3. Update UI State immediately
     setState(() {
       message.feedback = isLike ? FeedbackStatus.like : FeedbackStatus.dislike;
     });
 
-    // 4. Send to Backend
     try {
       final String apiUrl = "${AppSettings.apiUrl}/feedback";
       final feedbackResponse = await http.post(
@@ -911,7 +891,6 @@ class _ChatScreenState extends State<ChatScreen> {
         }),
       );
 
-      // Treat any non-2xx response as a failure
       if (feedbackResponse.statusCode < 200 ||
           feedbackResponse.statusCode >= 300) {
         throw Exception("Server returned ${feedbackResponse.statusCode}");
@@ -923,7 +902,7 @@ class _ChatScreenState extends State<ChatScreen> {
             content: Text(
               AppTranslations.get('feedback_received', langNotifier.value),
             ),
-            duration: Duration(seconds: 4),
+            duration: const Duration(seconds: 4),
           ),
         );
       }
@@ -934,7 +913,7 @@ class _ChatScreenState extends State<ChatScreen> {
             content: Text(
               AppTranslations.get('feedback_error', langNotifier.value),
             ),
-            duration: Duration(seconds: 4),
+            duration: const Duration(seconds: 4),
           ),
         );
       }
@@ -946,8 +925,6 @@ class _ChatScreenState extends State<ChatScreen> {
     setState(() {
       _messages.insert(0, message);
     });
-    // Guard against animateTo being called before the ScrollView is laid out
-    // (e.g. the welcome message is inserted during initState).
     if (_scrollController.hasClients) {
       _scrollController.animateTo(
         0.0,
@@ -961,7 +938,6 @@ class _ChatScreenState extends State<ChatScreen> {
   Future<void> _launchUrl(String urlString) async {
     final Uri url = Uri.parse(urlString);
     if (!await launchUrl(url, mode: LaunchMode.externalApplication)) {
-      // Show an error message if it fails to launch
       _addMessage(
         ChatMessage(
           text:
@@ -983,7 +959,7 @@ class _ChatScreenState extends State<ChatScreen> {
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
         content: Text(AppTranslations.get('chat_cleared', langNotifier.value)),
-        duration: Duration(seconds: 3),
+        duration: const Duration(seconds: 3),
       ),
     );
   }
@@ -1008,13 +984,11 @@ class _ChatScreenState extends State<ChatScreen> {
                     child: ListView(
                       children: _availableSubTopicIds.map((id) {
                         return CheckboxListTile(
-                          title: Text(
-                            _subTopicDescriptions[id] ?? id,
-                          ), // Mostra la descrizione
+                          title: Text(_subTopicDescriptions[id] ?? id),
                           subtitle: Text(
                             id,
-                            style: TextStyle(fontSize: 10),
-                          ), // Opzionale: mostra l'ID in piccolo
+                            style: const TextStyle(fontSize: 10),
+                          ),
                           value: _selectedSubTopics.contains(id),
                           onChanged: (bool? value) {
                             setState(() {
@@ -1069,12 +1043,9 @@ class _ChatScreenState extends State<ChatScreen> {
               return TextButton(
                 key: _langKey,
                 onPressed: () {
-                  // Flip the language
                   langNotifier.value = currentLang == AppLang.it
                       ? AppLang.en
                       : AppLang.it;
-
-                  // Optional: Clear chat so the welcome message resets to the new language
                   _clearChat();
                 },
                 child: Text(
@@ -1088,16 +1059,14 @@ class _ChatScreenState extends State<ChatScreen> {
             },
           ),
 
-          // --- THEME TOGGLE (Your existing code) ---
           ValueListenableBuilder<AppTheme>(
             valueListenable: themeNotifier,
             builder: (_, AppTheme currentTheme, __) {
-              // Decide which icon to show based on the current theme
               IconData themeIcon;
               if (currentTheme == AppTheme.light) {
                 themeIcon = Icons.dark_mode;
               } else if (currentTheme == AppTheme.dark) {
-                themeIcon = Icons.contrast; // The high-contrast icon
+                themeIcon = Icons.contrast;
               } else {
                 themeIcon = Icons.light_mode;
               }
@@ -1108,19 +1077,16 @@ class _ChatScreenState extends State<ChatScreen> {
                 tooltip: AppTranslations.get(
                   'toggle_theme',
                   langNotifier.value,
-                ), // Translated tooltip
+                ),
                 onPressed: _cycleTheme,
               );
             },
           ),
 
-          // --- CLEAR CHAT BUTTON ---
           IconButton(
+            key: _deleteKey,
             icon: const Icon(Icons.delete_sweep_outlined),
-            tooltip: AppTranslations.get(
-              'clear_chat',
-              langNotifier.value,
-            ), // Translated!
+            tooltip: AppTranslations.get('clear_chat', langNotifier.value),
             onPressed: _isLoading ? null : _clearChat,
           ),
           const SizedBox(width: 8),
@@ -1131,7 +1097,7 @@ class _ChatScreenState extends State<ChatScreen> {
           Expanded(
             child: ListView.builder(
               controller: _scrollController,
-              reverse: true, // Makes the list start from the bottom
+              reverse: true,
               padding: const EdgeInsets.all(16.0),
               itemCount: _messages.length + 1,
               itemBuilder: (context, index) {
@@ -1142,12 +1108,50 @@ class _ChatScreenState extends State<ChatScreen> {
               },
             ),
           ),
-          if (_isLoading)
-            const Padding(
-              padding: EdgeInsets.symmetric(horizontal: 16.0, vertical: 8.0),
-              child: LinearProgressIndicator(),
-            ),
+          // Sostituisce il vecchio LinearProgressIndicator con l'indicatore testuale
+          if (_isLoading) _buildTypingIndicator(),
+
           _buildTextInputArea(),
+        ],
+      ),
+    );
+  }
+
+  /// Mostra un feedback visivo chiaro e testuale durante il polling.
+  /// Mantiene pulita la lista dei messaggi _messages.
+  Widget _buildTypingIndicator() {
+    final theme = Theme.of(context);
+
+    // Usa il messaggio dinamico dal Timer, oppure il fallback standard 'ai_processing'
+    final displayText =
+        _dynamicLoadingMessage ??
+        AppTranslations.get('ai_processing', langNotifier.value);
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 24.0, vertical: 16.0),
+      child: Row(
+        mainAxisSize: MainAxisSize.min, // Evita che occupi tutta la larghezza
+        children: [
+          SizedBox(
+            width: 16,
+            height: 16,
+            child: CircularProgressIndicator(
+              strokeWidth: 2.5,
+              color: theme.colorScheme.primary,
+            ),
+          ),
+          const SizedBox(width: 16),
+          // Semantics permette allo screen reader di annunciare l'attesa
+          Semantics(
+            liveRegion: true,
+            child: Text(
+              displayText,
+              style: theme.textTheme.bodyMedium!.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+                fontStyle: FontStyle.italic,
+              ),
+            ),
+          ),
         ],
       ),
     );
@@ -1161,7 +1165,6 @@ class _ChatScreenState extends State<ChatScreen> {
     Widget messageContent;
 
     if (isUser) {
-      // USER MESSAGE: Plain Text, Selectable
       messageContent = SelectableText(
         message.text,
         style: theme.textTheme.bodyLarge!.copyWith(
@@ -1169,7 +1172,6 @@ class _ChatScreenState extends State<ChatScreen> {
         ),
       );
     } else {
-      // AI MESSAGE: HTML, Selectable Area
       messageContent = SelectionArea(
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
@@ -1201,7 +1203,6 @@ class _ChatScreenState extends State<ChatScreen> {
             ),
             _buildSources(message),
 
-            // Feedback Buttons (Only for valid AI answers)
             if (!message.isError && !message.isSystemMessage)
               Padding(
                 padding: const EdgeInsets.only(top: 8.0),
@@ -1249,12 +1250,7 @@ class _ChatScreenState extends State<ChatScreen> {
     }
 
     return Semantics(
-      // ATTIVA L'ANNUNCIO VOCALE AUTOMATICO:
-      // Appena questo widget viene inserito nella lista (cioè quando invii
-      // la domanda o quando arriva la risposta), lo screen reader lo leggerà
-      // istantaneamente, interrompendo il silenzio.
       liveRegion: true,
-
       child: Container(
         margin: const EdgeInsets.symmetric(vertical: 8.0),
         child: Row(
@@ -1263,7 +1259,6 @@ class _ChatScreenState extends State<ChatScreen> {
               : MainAxisAlignment.start,
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            // Avatar
             if (!isUser)
               CircleAvatar(
                 backgroundColor: theme.colorScheme.secondary,
@@ -1271,14 +1266,12 @@ class _ChatScreenState extends State<ChatScreen> {
                   message.isError
                       ? Icons.error_outline
                       : (message.isSystemMessage
-                            ? Icons
-                                  .info_outline // Different icon for system
+                            ? Icons.info_outline
                             : Icons.computer),
                   color: theme.colorScheme.onSecondary,
                 ),
               ),
-            if (isUser) const SizedBox(width: 40), // Spacer
-            // Bubble Container
+            if (isUser) const SizedBox(width: 40),
             Expanded(
               child: Container(
                 margin: const EdgeInsets.symmetric(horizontal: 12.0),
@@ -1300,24 +1293,21 @@ class _ChatScreenState extends State<ChatScreen> {
                         : const Radius.circular(20),
                   ),
                 ),
-                // The content (SelectableText or SelectionArea)
                 child: messageContent,
               ),
             ),
-
             if (isUser)
               CircleAvatar(
                 backgroundColor: theme.colorScheme.primary,
                 child: Icon(Icons.person, color: theme.colorScheme.onPrimary),
               ),
-            if (!isUser) const SizedBox(width: 40), // Spacer
+            if (!isUser) const SizedBox(width: 40),
           ],
         ),
       ),
     );
   }
 
-  /// Builds the source chips for an AI message
   /// Builds the source chips for an AI message (Expandable)
   Widget _buildSources(ChatMessage message) {
     if (message.isUser || message.sources.isEmpty) {
@@ -1331,19 +1321,15 @@ class _ChatScreenState extends State<ChatScreen> {
 
     return Padding(
       padding: const EdgeInsets.only(top: 12.0),
-      // StatefulBuilder lets us rebuild ONLY this small widget when clicked,
-      // rather than rebuilding the entire chat history list.
       child: StatefulBuilder(
         builder: (context, setLocalState) {
           return Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              // --- CLICKABLE HEADER ---
               MouseRegion(
                 cursor: SystemMouseCursors.click,
                 child: GestureDetector(
                   onTap: () {
-                    // Toggle the state and trigger a local rebuild
                     setLocalState(() {
                       message.isSourcesExpanded = !message.isSourcesExpanded;
                     });
@@ -1351,7 +1337,6 @@ class _ChatScreenState extends State<ChatScreen> {
                   child: Row(
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      // Arrow icon that changes direction based on state
                       Icon(
                         message.isSourcesExpanded
                             ? Icons.keyboard_arrow_down
@@ -1372,7 +1357,6 @@ class _ChatScreenState extends State<ChatScreen> {
                 ),
               ),
 
-              // --- EXPANDABLE CHIPS AREA ---
               AnimatedSize(
                 duration: const Duration(milliseconds: 250),
                 curve: Curves.easeInOut,
@@ -1392,7 +1376,6 @@ class _ChatScreenState extends State<ChatScreen> {
                                 );
                             final String subTopic = source['sub_topic'] ?? '';
 
-                            // Costruzione URL dinamica: se c'è il sub_topic lo inserisce nel path, altrimenti usa il path vecchio.
                             final String url = subTopic.isNotEmpty
                                 ? "${AppSettings.downloadDocumentUrl}/$topic/$subTopic/$fileName"
                                 : "${AppSettings.downloadDocumentUrl}/$topic/$fileName";
@@ -1402,15 +1385,12 @@ class _ChatScreenState extends State<ChatScreen> {
                               avatar: Icon(
                                 Icons.link,
                                 size: 16,
-                                // 1. Match the icon color to the text
                                 color: theme.colorScheme.onSecondaryContainer,
                               ),
                               label: Text(fileName),
-                              // 2. Force the text color to contrast properly with the background
                               labelStyle: theme.textTheme.labelSmall?.copyWith(
                                 color: theme.colorScheme.onSecondaryContainer,
-                                fontWeight: FontWeight
-                                    .bold, // Optional: helps with readability
+                                fontWeight: FontWeight.bold,
                               ),
                               backgroundColor:
                                   theme.colorScheme.secondaryContainer,
@@ -1419,7 +1399,6 @@ class _ChatScreenState extends State<ChatScreen> {
                               ),
                               visualDensity: VisualDensity.compact,
                               side: BorderSide(
-                                // 3. Ensure the border contrasts well too
                                 color: theme.colorScheme.onSecondaryContainer
                                     .withAlpha(50),
                               ),
@@ -1427,7 +1406,7 @@ class _ChatScreenState extends State<ChatScreen> {
                           }).toList(),
                         ),
                       )
-                    : const SizedBox.shrink(), // Takes up zero space when collapsed
+                    : const SizedBox.shrink(),
               ),
             ],
           );
@@ -1479,6 +1458,7 @@ class _ChatScreenState extends State<ChatScreen> {
             ),
             const SizedBox(width: 12.0),
             FloatingActionButton(
+              key: _sendKey,
               onPressed: _isLoading ? null : _handleSendPressed,
               backgroundColor: theme.colorScheme.primary,
               tooltip: AppTranslations.get('send_question', langNotifier.value),
