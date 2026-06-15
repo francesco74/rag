@@ -1,0 +1,6 @@
+# Gestione chiamate HTTP verso il server SOAP (JBoss/Sicr@Web)
+requests==2.31.0
+
+# Lettura sicura del file .env per la configurazione
+python-dotenv==1.0.1
+asn1crypto>=1.5.1

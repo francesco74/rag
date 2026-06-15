@@ -148,7 +148,7 @@ class AppTranslations {
     },
     'taking_longer': {
       AppLang.it:
-          "La ricerca a ricerca è complessa, ci sta volendo più del previsto...attendi ancora un attimo...",
+          "La ricerca è complessa, ci sta volendo più del previsto...attendi ancora un attimo...",
       AppLang.en:
           "The search is complex, it's taking longer than expected...please wait a bit more...",
     },

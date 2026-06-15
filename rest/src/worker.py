@@ -10,6 +10,7 @@ from qdrant_client import QdrantClient, models
 import google.generativeai as genai
 import math
 import json, re
+import hashlib
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -149,6 +150,13 @@ def init_worker_process(**kwargs):
 # ==============================================================================
 # 4. HELPER FUNCTIONS
 # ==============================================================================
+
+def generate_filters_key(metadata_filters):
+    """Genera una chiave univoca basata sui filtri applicati per non inquinare la cache."""
+    if not metadata_filters: return "no_filters"
+    # Ordina le chiavi per garantire che lo stesso set generi sempre lo stesso hash
+    filter_str = json.dumps(metadata_filters, sort_keys=True)
+    return hashlib.md5(filter_str.encode()).hexdigest()
 
 def safe_json_parse(raw_text: str, task_id: str = "UNKNOWN") -> dict:
     """
@@ -370,7 +378,7 @@ def generate_answer(query, rich_context, topic_id):
 # 6. SEMANTIC CACHE FUNCTIONS
 # ==============================================================================
 
-def check_semantic_cache(query_vector, topic_id, sub_topics_key):
+def check_semantic_cache(query_vector, topic_id, sub_topics_key, filters_key):
     """Check if similar query exists in cache."""
     if not qdrant_client:
         return None
@@ -384,7 +392,8 @@ def check_semantic_cache(query_vector, topic_id, sub_topics_key):
             query_filter=models.Filter(
                 must=[
                     models.FieldCondition(key="topic_id", match=models.MatchValue(value=topic_id)),
-                    models.FieldCondition(key="sub_topics_key", match=models.MatchValue(value=sub_topics_key))
+                    models.FieldCondition(key="sub_topics_key", match=models.MatchValue(value=sub_topics_key)),
+                    models.FieldCondition(key="filters_key", match=models.MatchValue(value=filters_key)) 
                 ]
             )
         ).points
@@ -400,7 +409,7 @@ def check_semantic_cache(query_vector, topic_id, sub_topics_key):
         log.error(f"Cache check failed: {e}")
         return None
 
-def save_to_semantic_cache(query_vector, original_query, answer, sources, topic_id, sub_topics_key):
+def save_to_semantic_cache(query_vector, original_query, answer, sources, topic_id, sub_topics_key, filters_key):
     """Salva la risposta in cache includendo la chiave di combinazione dei sub-topic."""
     if not qdrant_client:
         return
@@ -415,6 +424,7 @@ def save_to_semantic_cache(query_vector, original_query, answer, sources, topic_
                 "sources": sources,
                 "topic_id": topic_id,
                 "sub_topics_key": sub_topics_key, 
+                "filters_key": filters_key,
                 "timestamp": time.time()
             }
         )
@@ -490,7 +500,7 @@ def setup_periodic_tasks(sender, **kwargs):
 # ==============================================================================
 # 7. DOCUMENT RETRIEVAL (With OPTIMIZED Reranking)
 # ==============================================================================
-def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_sub_topics):
+def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_sub_topics, metadata_filters):
     """
     Recupera, fonde e riordina i chunk dal Vector DB in modo sicuro.
     """
@@ -506,6 +516,42 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
         must_conditions = [models.FieldCondition(key="topic_id", match=models.MatchValue(value=topic_id))]
         if selected_sub_topics:
             must_conditions.append(models.FieldCondition(key="sub_topic_id", match=models.MatchAny(any=selected_sub_topics)))
+
+        # === INIEZIONE FILTRI METADATI ===
+        if metadata_filters:
+            for key, value in metadata_filters.items():
+                
+                # Ricerca full-text tokenizzata: {"oggetto__text": "disposizioni generali"}
+                if key.endswith("__text"):
+                    real_key = key[:-6]  # rimuove "__text"
+                    must_conditions.append(models.FieldCondition(
+                        key=real_key,
+                        match=models.MatchText(text=str(value))
+                    ))
+                
+                # Filtro range: {"data": {"gte": 1700000000, "lte": 1800000000}}
+                elif isinstance(value, dict) and ("gte" in value or "lte" in value):
+                    must_conditions.append(models.FieldCondition(
+                        key=key,
+                        range=models.Range(
+                            gte=value.get("gte"),
+                            lte=value.get("lte")
+                        )
+                    ))
+                
+                # Filtro multi-valore: {"stato": ["approvato", "pubblicato"]}
+                elif isinstance(value, list):
+                    must_conditions.append(models.FieldCondition(
+                        key=key,
+                        match=models.MatchAny(any=value)
+                    ))
+                
+                # Filtro esatto: {"numero_atto": "123"}
+                else:
+                    must_conditions.append(models.FieldCondition(
+                        key=key,
+                        match=models.MatchValue(value=value)
+                    ))
 
         # ==========================================================
         # 1. FUNZIONI DI RICERCA (Con Exception Handling Interno)
@@ -712,7 +758,7 @@ def get_all_sub_topics(topic_id):
 # ==============================================================================
 
 @celery_app.task(bind=True, name="rag_queue")
-def process_rag_query(self, query, history, topic_id, selected_sub_topics=None):
+def process_rag_query(self, query, history, topic_id, selected_sub_topics=None, metadata_filters=None):
     """Main RAG processing pipeline: JSON Mode, Multi-Query, and Defensive Error Handling."""
     start_time = time.time()
     task_id = self.request.id
@@ -732,6 +778,7 @@ def process_rag_query(self, query, history, topic_id, selected_sub_topics=None):
                     "status": "failed"
                 }
         st_key = generate_sub_topics_key(selected_sub_topics)
+
     except Exception as e:
         log.error(f"[{task_id}] Initialization DB failed: {e}", exc_info=True)
         return {"error": "Internal Error", "message": "Errore di inizializzazione.", "status": "failed"}
@@ -774,7 +821,9 @@ def process_rag_query(self, query, history, topic_id, selected_sub_topics=None):
     # 4. SEMANTIC CACHE CHECK
     # ==========================================================
     try:
-        cached = check_semantic_cache(primary_query_vector, topic_id, st_key)
+        filters_key = generate_filters_key(metadata_filters)
+
+        cached = check_semantic_cache(primary_query_vector, topic_id, st_key, filters_key)
         if cached:
             log.info(f"[{task_id}] Cache HIT. Returning cached response.")
             return {
@@ -796,7 +845,8 @@ def process_rag_query(self, query, history, topic_id, selected_sub_topics=None):
             vectors_list, 
             extracted_keywords, 
             topic_id, 
-            selected_sub_topics
+            selected_sub_topics,
+            metadata_filters
         )
     except Exception as e:
         log.error(f"[{task_id}] Vector DB Retrieval failed: {e}", exc_info=True)
@@ -880,7 +930,8 @@ def process_rag_query(self, query, history, topic_id, selected_sub_topics=None):
                         vectors_list, 
                         extracted_keywords, 
                         topic_id, 
-                        selected_sub_topics
+                        selected_sub_topics,
+                        metadata_filters
                     )
                 except Exception as e:
                     log.error(f"[{task_id}] Retry infrastructure failed: {e}", exc_info=True)
@@ -900,7 +951,8 @@ def process_rag_query(self, query, history, topic_id, selected_sub_topics=None):
                 answer, 
                 sources, 
                 topic_id,
-                st_key
+                st_key,
+                filters_key
             )
     except Exception as e:
         log.warning(f"[{task_id}] Failed to save successful response to cache (non-blocking): {e}")

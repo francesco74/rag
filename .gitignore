@@ -1,6 +1,7 @@
 *
 !.gitignore
 !ingestion/
+!saga_extract/
 !rest/
 !web/
 !web/src/
@@ -11,6 +12,7 @@
 
 !ingestion/**
 !rest/**
+!saga_extract/**
 !misc/**
 !web/src/web/**
 !web/src/lib/**
@@ -31,6 +33,7 @@ rest/model_cache/
 ingestion/src/error/
 ingestion/src/watch/
 ingestion/src/processed/
+saga_extract/documentazione/
 **/.env
 **/__pycache__/*
 **/.DS_Store

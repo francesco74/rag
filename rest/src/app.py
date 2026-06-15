@@ -151,20 +151,14 @@ def chat_handler():
         if not data: return jsonify({"error": "Bad Request", "message": "Invalid JSON"}), 400
 
         query = data.get("query")
-        history = data.get("history", [])
-
-        topic_id = data.get("topic_id")
-        if not topic_id:
-             return jsonify({"error": "Bad Request", "message": "topic_id is required"}), 400
-
-        selected_sub_topics = data.get("sub_topics", []) 
-
         if not query or not isinstance(query, str) or len(query.strip()) == 0:
             return jsonify({"error": "Bad Request", "message": "Valid 'query' string is required"}), 400
         
         if len(query) > 2000:
             return jsonify({"error": "Payload Too Large", "message": "Query exceeds maximum length"}), 413
         
+
+        history = data.get("history", [])
         if not isinstance(history, list):
             return jsonify({"error": "Bad Request", "message": "'history' must be a list"}), 400
         history = [
@@ -172,11 +166,18 @@ def chat_handler():
             if isinstance(h, dict) and "role" in h and "text" in h
         ]
 
+        topic_id = data.get("topic_id")
+        if not topic_id:
+             return jsonify({"error": "Bad Request", "message": "topic_id is required"}), 400
+
+        selected_sub_topics = data.get("sub_topics", []) 
+        metadata_filters = data.get("filters", {})
+
         log.info(f"Received query: '{query[:50]}...'. Offloading to Worker.")
 
         task = celery_client.send_task(
             'rag_queue', 
-            args=[query, history, topic_id, selected_sub_topics] 
+            args=[query, history, topic_id, selected_sub_topics, metadata_filters] 
         )
 
         return jsonify({
