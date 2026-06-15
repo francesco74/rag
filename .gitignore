@@ -9,6 +9,7 @@
 !web/src/assets/
 !web/src/assets/html/
 !misc/
+!converter/
 
 !ingestion/**
 !rest/**
@@ -18,6 +19,7 @@
 !web/src/lib/**
 !web/src/assets/**
 !web/src/assets/html/**
+!converter/**
 
 !web/docker-entrypoint.sh
 !web/Dockerfile

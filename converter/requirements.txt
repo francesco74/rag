@@ -1,0 +1,11 @@
+Pillow>=10.0.0
+PyMuPDF>=1.23.0
+pymupdf4llm>=0.0.12
+# AI & Cloud Vision
+google-genai
+google-cloud-vision>=3.4.0
+
+# Concorrenza, Resilienza e Rate Limiting
+aiolimiter>=1.1.0
+tenacity>=8.2.0
+python-dotenv
