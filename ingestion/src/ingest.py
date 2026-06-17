@@ -46,7 +46,6 @@ load_dotenv()
 BASE_DIR = pathlib.Path(__file__).parent.resolve()
 
 QDRANT_COLLECTION = "document_chunks"
-PARENT_COLLECTION = "parent_documents"
 
 PROTECTED_KEYS = {"topic_id", "sub_topic_id", "source", "parent_id", "content",
                   "parent_index", "child_index", "file_name", "_ingestion_error"}

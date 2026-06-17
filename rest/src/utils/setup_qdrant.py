@@ -11,7 +11,6 @@ log = logging.getLogger("qdrant_setup")
 
 QDRANT_COLLECTION = "document_chunks"
 CACHE_COLLECTION = "semantic_cache"
-PARENT_COLLECTION = "parent_documents"
 
 async def create_collection_if_missing(client, name, size=768):
     """Crea la collection solo se non esiste."""
@@ -47,7 +46,6 @@ async def setup_infrastructure():
 
         # 1. CREAZIONE COLLECTION
         await create_collection_if_missing(client, QDRANT_COLLECTION)
-        await create_collection_if_missing(client, PARENT_COLLECTION)
         await create_collection_if_missing(client, CACHE_COLLECTION)
 
         log.info("Inizio configurazione indici (Payload Indexes)...")
@@ -68,10 +66,7 @@ async def setup_infrastructure():
         for field, schema in indexes_chunks.items():
             await safe_create_payload_index(client, QDRANT_COLLECTION, field, schema)
 
-        # 3. INDICI PER PARENT DOCUMENTS
-        await safe_create_payload_index(client, PARENT_COLLECTION, "source", models.PayloadSchemaType.KEYWORD)
-
-        # 4. INDICI PER SEMANTIC CACHE (Aggiornati con i filtri)
+        # INDICI PER SEMANTIC CACHE (Aggiornati con i filtri)
         indexes_cache = {
             "topic_id": models.PayloadSchemaType.KEYWORD,
             "sub_topics_key": models.PayloadSchemaType.KEYWORD, # stringa generata "al volo" dal backend unendo in ordine alfabetico tutti i sub-topic che l'utente ha selezionato per una specifica ricerca

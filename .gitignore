@@ -44,7 +44,6 @@
 !README-TECH.MD
 !TECH.MD
 
-
 rest/model_cache/
 ingestion/src/error/
 ingestion/src/watch/

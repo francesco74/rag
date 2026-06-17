@@ -81,7 +81,6 @@ os.environ["ONNXRUNTIME_EXECUTION_MODE"] = "PARALLEL"
 
 QDRANT_COLLECTION = "document_chunks"
 CACHE_COLLECTION = "semantic_cache"
-PARENT_COLLECTION = "parent_documents"
 
 # ==============================================================================
 # 2. CELERY INITIALIZATION
@@ -685,7 +684,7 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
                     FROM parent_documents 
                     WHERE id IN ({format_strings})
                 """
-                
+
                 with conn.cursor(dictionary=True) as cursor:
                     cursor.execute(query, tuple(parent_ids))
                     db_parents = cursor.fetchall()

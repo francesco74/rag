@@ -13,7 +13,7 @@ async def wipe_qdrant_data():
     )
     
     # The collections defined in your ingestion script
-    collections_to_delete = ["document_chunks", "parent_documents", "semantic_cache"]
+    collections_to_delete = ["document_chunks", "semantic_cache"]
     
     for collection in collections_to_delete:
         try:
