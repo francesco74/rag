@@ -5,6 +5,7 @@ import argparse
 import pathlib
 from pathlib import Path
 from typing import Optional
+import pika
 
 from asn1crypto.cms import ContentInfo
 
@@ -21,7 +22,7 @@ ESTENSIONI_CONSENTITE = {".pdf", ".p7m"}
 
 log = logging.getLogger("main_extractor")
 BASE_DIR = pathlib.Path(__file__).parent.resolve()
-STAGING_JSON_ATTI_FOLDER = pathlib.Path(os.environ.get("DATA_FOLDER", str(BASE_DIR))) / "staging" / "json" / "atti"
+STAGING_ATTI_FOLDER = pathlib.Path(os.environ.get("DATA_FOLDER", str(BASE_DIR))) / "staging" / "provincia"
 
 def clean_iso_date(date_raw: str) -> Optional[str]:
     """Uniforma le date al formato YYYY-MM-DD, rimuovendo le componenti temporali (T)."""
@@ -43,6 +44,18 @@ def extract_file_from_p7m(p7m_bytes: bytes, filename: str) -> bytes:
     except Exception as e:
         log.error("Fallimento sbustamento P7M per %s: %s", filename, str(e))
         raise ValueError(f"Decodifica P7M fallita: {str(e)}")
+    
+def get_rabbitmq_channel():
+    """Inizializza la connessione al broker per pubblicare gli eventi."""
+    rabbitmq_host = os.environ.get("RABBITMQ_HOST", "rabbitmq-service.rag.svc.cluster.local")
+    try:
+        connection = pika.BlockingConnection(pika.ConnectionParameters(host=rabbitmq_host))
+        channel = connection.channel()
+        channel.queue_declare(queue='da-convertire', durable=True)
+        return connection, channel
+    except Exception as e:
+        log.error(f"Errore critico di connessione a RabbitMQ su {rabbitmq_host}: {e}")
+        raise
 
 def main():
     parser = argparse.ArgumentParser(description="Estrattore Massivo Sicr@Web - Generatore Manifest")
@@ -69,7 +82,7 @@ def main():
         tipo_cartella = tipi_supportati[tipo_atto]
         
         # ATTENZIONE: Variabile dinamica usata per TUTTO il ciclo di vita (creazione e scrittura)
-        staging_json_dir = STAGING_JSON_ATTI_FOLDER / tipo_cartella
+        staging_json_dir = STAGING_ATTI_FOLDER / tipo_cartella
         staging_json_dir.mkdir(parents=True, exist_ok=True)
 
         # 2. CREAZIONE DINAMICA DEI FILTRI DI RICERCA
@@ -103,6 +116,7 @@ def main():
     
     try:
         repwss_client = build_client_from_env()
+        mq_conn, mq_channel = get_rabbitmq_channel()
     except Exception as e:
         log.error("Impossibile inizializzare il client WSAtti: %s", str(e))
         return
@@ -166,11 +180,14 @@ def main():
                 tmp_files_paths.append((tmp_path, final_path))
                 file_scritti_nomi.append(safe_name)
 
+            percorso_logico = f"{tipo_cartella}/atto_{str_uid}"
+
             sidecar_manifest = {
                 "source": f"sicraweb://{str_uid}",
                 "files": file_scritti_nomi,  
                 "metadati": {
                     "id_sicraweb": str_uid,
+                    "percorso_originale": percorso_logico,
                     "oggetto": meta_atto.get("oggetto"),
                     "trattamento_descrizione": meta_atto.get("trattamento_descrizione"),
                     "proponente_descrizione": meta_atto.get("proponente_descrizione"),
@@ -197,6 +214,24 @@ def main():
             success_count += 1
             log.info("✓ Atto %s elaborato (%d allegati).", str_uid, len(file_scritti_nomi))
 
+            # --- NOTIFICA EVENT-DRIVEN ---
+            rel_path_to_json = str((staging_json_dir / json_filename).relative_to(STAGING_ATTI_FOLDER.parent))
+            
+            payload = {
+                "source_type": "json",
+                "rel_path": rel_path_to_json
+            }
+            
+            mq_channel.basic_publish(
+                exchange='',
+                routing_key='da-convertire',
+                body=json.dumps(payload).encode(),
+                properties=pika.BasicProperties(
+                    delivery_mode=pika.DeliveryMode.Persistent # Il messaggio sopravvive al riavvio del broker
+                )
+            )
+            log.debug(f"📨 Inviato evento a RabbitMQ per il file: {json_filename}")
+
         except Exception as e:
             log.error("✗ Errore elaborando UID %s: %s", str_uid, str(e), exc_info=True)
             for tmp_p, _ in tmp_files_paths:
@@ -204,7 +239,11 @@ def main():
             if tmp_json_path and tmp_json_path.exists():
                 tmp_json_path.unlink(missing_ok=True)
 
+    try:
+        mq_conn.close()
+    except: pass
+
     log.info("Completato (%d/%d estratti).", success_count, len(risultato_ricerca.ids))
-    
+
 if __name__ == "__main__":
     main()

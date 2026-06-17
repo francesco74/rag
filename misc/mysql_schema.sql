@@ -72,3 +72,16 @@ CREATE TABLE IF NOT EXISTS system_logs (
     INDEX idx_created_at (created_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
+CREATE TABLE IF NOT EXISTS parent_documents (
+    id VARCHAR(36) PRIMARY KEY,
+    topic_id VARCHAR(255) NOT NULL,
+    sub_topic_id VARCHAR(255) NOT NULL,
+    source VARCHAR(255) NOT NULL,
+    file_name VARCHAR(255),
+    parent_index INT,
+    content LONGTEXT NOT NULL,
+    metadata JSON,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_search (source, topic_id, sub_topic_id)
+);
+

@@ -670,12 +670,42 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
                 log.error("I Child document non contengono alcun 'parent_id' nel payload.")
                 return [], []
 
-            log.debug(f"Recupero batch di {len(parent_ids)} Parent Documents...")
-            parent_records = qdrant_client.retrieve(
-                collection_name=PARENT_COLLECTION,
-                ids=parent_ids,
-                with_payload=True
-            )
+            log.debug(f"Recupero batch di {len(parent_ids)} Parent Documents da MySql...")
+            parent_records = []
+            conn = get_db_connection()
+            if not conn:
+                log.error("Connessione al database MySQL fallita durante il retrieval dei parent.")
+                return [], []
+            
+            try:
+                # Creazione di una query con numero variabile di segnaposto (%s) per prevenire SQL Injection
+                format_strings = ','.join(['%s'] * len(parent_ids))
+                query = f"""
+                    SELECT id, topic_id, sub_topic_id, source, content, metadata 
+                    FROM parent_documents 
+                    WHERE id IN ({format_strings})
+                """
+                
+                with conn.cursor(dictionary=True) as cursor:
+                    cursor.execute(query, tuple(parent_ids))
+                    db_parents = cursor.fetchall()
+                    
+                    # Convertiamo i record MySQL nel formato dizionario che il blocco successivo (FORMATTAZIONE OUTPUT) si aspetta.
+                    # Simuliamo la struttura "payload" di Qdrant per non rompere la logica successiva.
+                    for row in db_parents:
+                        parent_records.append({
+                            "payload": {
+                                "source": row.get("source"),
+                                "sub_topic_id": row.get("sub_topic_id"),
+                                "content": row.get("content")
+                                # Se in futuro serve usare i metadati:
+                                # "metadata": json.loads(row.get("metadata")) if row.get("metadata") else {}
+                            }
+                        })
+                        
+            finally:
+                conn.close()
+
         except Exception as e:
             log.error(f"Errore recupero Parent Documents: {e}", exc_info=True)
             return [], []

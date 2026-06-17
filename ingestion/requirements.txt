@@ -1,21 +1,6 @@
-# --- Vector DB ---
-qdrant-client>=1.8.0
-
-# --- AI & Embeddings ---
+aio-pika==9.4.1
+python-dotenv==1.0.1
+qdrant-client>=1.7.0
+langchain-text-splitters>=0.2.0
 google-genai>=0.1.0
-google-api-core>=2.15.0
-
-# --- Text Splitting & Tokenization ---
-langchain-text-splitters>=0.0.1
-tiktoken>=0.6.0
-
-# --- Resilienza e Concorrenza ---
-aiolimiter>=1.1.0
-tenacity>=8.2.3
-
-# --- Database (per db_logger.py) ---
-# Sostituisci con pymysql se nel tuo db_logger usi quello
-mysql-connector-python>=8.3.0
-
-python-dotenv
-
+tenacity>=8.2.0

@@ -59,6 +59,7 @@ async def setup_infrastructure():
             "source": models.PayloadSchemaType.KEYWORD,
             "parent_id": models.PayloadSchemaType.KEYWORD,
             "file_name": models.PayloadSchemaType.KEYWORD,
+            "percorso_originale": models.PayloadSchemaType.TEXT,
             "content": models.TextIndexParams(
                 type="text", tokenizer=models.TokenizerType.WORD, min_token_len=2, max_token_len=20, lowercase=True
             ),

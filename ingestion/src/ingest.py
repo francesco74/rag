@@ -10,24 +10,27 @@ import json
 from google import genai
 from google.genai import types
 
-# Vector DB
+# --- VECTOR DB ---
 from qdrant_client import models
 from qdrant_client import AsyncQdrantClient
 
-# Text Splitting
+# --- TEXT SPLITTING ---
 from langchain_text_splitters import (
     MarkdownHeaderTextSplitter,
     RecursiveCharacterTextSplitter
 )
 
-# Async & Resilience
+# --- ASYNC, RESILIENCE & MESSAGING ---
+import aio_pika
 from aiolimiter import AsyncLimiter
 from tenacity import (
     retry,
     stop_after_attempt,
     wait_random_exponential,
+    wait_exponential,
     retry_if_exception_type
 )
+
 from google.api_core.exceptions import ResourceExhausted, ServiceUnavailable
 
 from db_logger import MySQLLogHandler, get_db_connection
@@ -46,7 +49,7 @@ QDRANT_COLLECTION = "document_chunks"
 PARENT_COLLECTION = "parent_documents"
 
 PROTECTED_KEYS = {"topic_id", "sub_topic_id", "source", "parent_id", "content",
-                  "parent_index", "child_index", "file_name"}
+                  "parent_index", "child_index", "file_name", "_ingestion_error"}
 
 log_level_str = os.environ.get("LOG_LEVEL", "INFO").upper() 
 logging.basicConfig(
@@ -55,6 +58,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("IngestWorker")
 
+# Aggiunta handler su database
 db_handler = MySQLLogHandler()
 db_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s'))
 log.addHandler(db_handler)
@@ -62,26 +66,23 @@ log.addHandler(db_handler)
 # --- DIRECTORY LOGIC ---
 DATA_FOLDER = pathlib.Path(os.environ.get("DATA_FOLDER", str(BASE_DIR)))
 WATCH_FOLDER = DATA_FOLDER / "watch"
-PROCESSED_FOLDER = DATA_FOLDER / "processed"
-ERROR_FOLDER = DATA_FOLDER / "error"
+PROCESSED_FOLDER = DATA_FOLDER / "ingestion" / "processed"
+ERROR_FOLDER = DATA_FOLDER / "ingestion" / "error"
 
 for folder in [DATA_FOLDER, WATCH_FOLDER, PROCESSED_FOLDER, ERROR_FOLDER]:
     folder.mkdir(parents=True, exist_ok=True)
 
 # --- AI & DB Init ---
-# Inizializzazione pulita tramite il nuovo modulo google.genai
 ai_client = genai.Client(api_key=os.environ.get("GOOGLE_API_KEY"))
-
-# Aggiornamento al modello Embedding di punta
 EMBEDDING_MODEL_NAME = "gemini-embedding-001"
 
-# NOTA: La creazione delle collection è delegata a setup_qdrant.py
 qdrant_client = AsyncQdrantClient(
     host=os.environ.get("QDRANT_HOST", "localhost"), 
     port=int(os.environ.get("QDRANT_PORT", 6333)),
     timeout=60.0
 )
 
+# Concurrency & Limiting
 CONCURRENCY_LIMIT = asyncio.Semaphore(5)
 GEMINI_LIMITER = AsyncLimiter(max_rate=100, time_period=60)
 
@@ -92,9 +93,22 @@ markdown_splitter = MarkdownHeaderTextSplitter(headers_to_split_on=headers_to_sp
 # 2. CORE HELPER FUNCTIONS
 # ==============================================================================
 
+@retry(
+    wait=wait_exponential(multiplier=2, min=4, max=60), # Attese: 4s, 8s, 16s, 32s, 60s...
+    stop=stop_after_attempt(5),                         # Massimo 5 tentativi
+    reraise=True                                        # Rilancia l'errore se fallisce definitivamente
+)
+async def process_with_retry(payload: dict):
+    """Esegue il job ritentando con backoff esponenziale in caso di eccezioni non previste."""
+    log.info(f"Tentativo di elaborazione payload: {payload.get('json_manifest_path')}")
+    await process_single_job(payload)
+
 def get_subtopic_config(topic_id, sub_topic_id):
+    """Recupera i parametri di chunking dal DB."""
     conn = get_db_connection()
-    if not conn: return None
+    if not conn: 
+        log.error("Connessione al DB fallita. Impossibile recuperare i config.")
+        return None
     try:
         with conn.cursor(dictionary=True) as cursor:
             cursor.execute(
@@ -106,6 +120,7 @@ def get_subtopic_config(topic_id, sub_topic_id):
         conn.close()
 
 def safe_move_file(src_path, dest_folder):
+    """Muove fisicamente il file, sovrascrivendo se necessario."""
     try:
         src = pathlib.Path(src_path)
         dest = pathlib.Path(dest_folder) / src.name
@@ -121,12 +136,11 @@ def safe_move_file(src_path, dest_folder):
     stop=stop_after_attempt(20)
 )
 async def async_embed_batch(batch_texts):
+    """Genera embeddings in batch con backoff esponenziale in caso di rate limit."""
     if not batch_texts: return []
     async with GEMINI_LIMITER:
         log.debug(f"Calling Embeddings API for a batch of {len(batch_texts)} chunks...")
         
-        # Nuova sintassi google.genai con output_dimensionality a 768
-        # per allinearsi al setup_qdrant.py
         response = await ai_client.aio.models.embed_content(
             model=EMBEDDING_MODEL_NAME, 
             contents=batch_texts, 
@@ -137,8 +151,82 @@ async def async_embed_batch(batch_texts):
         )
         return [emb.values for emb in response.embeddings]
 
+async def finalize_file_move(file_path, root_folder, topic_id, sub_topic_id, error_msg: str = None):
+    """Smista i file processati. Se error_msg è presente, lo inietta nel JSON."""
+    success = error_msg is None
+    try:
+        try: 
+            relative_path = file_path.relative_to(root_folder)
+        except ValueError: 
+            relative_path = pathlib.Path(file_path.name)
+
+        dest_root = PROCESSED_FOLDER if success else ERROR_FOLDER
+        final_dest = dest_root / topic_id / sub_topic_id / relative_path
+        final_dest.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Se è un fallimento ed è il JSON, iniettiamo l'errore
+        if not success and file_path.suffix.lower() == '.json' and file_path.exists():
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                
+                # Aggiungiamo il tracciato dell'errore
+                data['_ingestion_error'] = str(error_msg)
+                
+                # Scriviamo direttamente nella destinazione per evitare race condition
+                with open(final_dest, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, indent=2)
+                
+                # Cancelliamo l'originale
+                file_path.unlink()
+            except Exception as e:
+                log.error(f"Impossibile iniettare l'errore nel JSON {file_path.name}: {e}")
+                await asyncio.to_thread(safe_move_file, file_path, final_dest.parent)
+        else:
+            # Spostamento standard per successi o per file non-JSON (.md, .txt)
+            await asyncio.to_thread(safe_move_file, file_path, final_dest.parent)
+            
+        status_tag = '[SUCCESS]' if success else '[ERROR]'
+        log.info(f"File lifecycle complete: {status_tag} {file_path.name}")
+    except Exception as e:
+        log.error(f"Failed during finalize_file_move for {file_path.name}: {e}")
+
+def sync_upsert_parents_mysql(source_name, topic_id, sub_topic_id, parents_data):
+    """
+    Cancella i vecchi parent per idempotenza e inserisce i nuovi in batch.
+    parents_data è una lista di tuple: (id, topic_id, sub_topic_id, source, file_name, parent_index, content, metadata_json)
+    """
+    conn = get_db_connection()
+    if not conn:
+        raise Exception("Impossibile connettersi a MySQL per il salvataggio dei parent_documents.")
+    
+    try:
+        with conn.cursor() as cursor:
+            # 1. Cancellazione atomica preventiva (idempotenza)
+            delete_query = """
+                DELETE FROM parent_documents 
+                WHERE source = %s AND topic_id = %s AND sub_topic_id = %s
+            """
+            cursor.execute(delete_query, (source_name, topic_id, sub_topic_id))
+            
+            # 2. Inserimento massivo dei nuovi parent
+            if parents_data:
+                insert_query = """
+                    INSERT INTO parent_documents 
+                    (id, topic_id, sub_topic_id, source, file_name, parent_index, content, metadata)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                """
+                cursor.executemany(insert_query, parents_data)
+        
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        raise e
+    finally:
+        conn.close()
+
 # ==============================================================================
-# 3. PIPELINE ORCHESTRATION
+# 3. PIPELINE ORCHESTRATION (DOCUMENT PROCESSING)
 # ==============================================================================
 
 async def process_single_file_async(topic_id, sub_topic_id, json_path, root_folder, chunk_size, chunk_overlap, parent_chunk_size):
@@ -147,7 +235,6 @@ async def process_single_file_async(topic_id, sub_topic_id, json_path, root_fold
         base_name = json_path.stem
         log.info(f"--- Trigger pacchetto rilevato dal JSON: {json_path.name} ---")
 
-        # 1. Risoluzione deterministica del file di testo normalizzato (.md o .txt)
         text_file_path = json_path.with_suffix(".md")
         is_markdown = True
         
@@ -156,8 +243,8 @@ async def process_single_file_async(topic_id, sub_topic_id, json_path, root_fold
             is_markdown = False
             
         if not text_file_path.exists():
-            log.error(f"File di testo (.md/.txt) mancante per il manifest {json_path.name}. Ingestione abortita.")
-            await finalize_file_move(json_path, root_folder, topic_id, sub_topic_id, success=False)
+            log.error(f"HARD STOP: File di testo mancante per {json_path.name}.")
+            await finalize_file_move(json_path, root_folder, topic_id, sub_topic_id, error_msg="File di testo nativo (.md/.txt) mancante.")
             return False
 
         try:
@@ -165,44 +252,35 @@ async def process_single_file_async(topic_id, sub_topic_id, json_path, root_fold
                 raw_json = json.load(f)
             
             source_name = raw_json.get("source")
-            
             if not source_name or not source_name.strip():
                 log.error(f"HARD STOP: Chiave 'source' mancante o vuota nel manifest {json_path.name}.")
-                await finalize_file_move(json_path, root_folder, topic_id, sub_topic_id, success=False)
-                if text_file_path.exists():
-                    await finalize_file_move(text_file_path, root_folder, topic_id, sub_topic_id, success=False)
+                await finalize_file_move(json_path, root_folder, topic_id, sub_topic_id, error_msg="Chiave 'source' mancante o vuota nel manifest.")
+                await finalize_file_move(text_file_path, root_folder, topic_id, sub_topic_id, error_msg="Chiave 'source' mancante o vuota nel manifest.")
                 return False
 
-            # --- ESTRAZIONE NOME FILE
             files_array = raw_json.get("files", [])
             if not isinstance(files_array, list) or not files_array:
                 log.error(f"HARD STOP: Array 'files' mancante o vuoto nel manifest {json_path.name}.")
-                await finalize_file_move(json_path, root_folder, topic_id, sub_topic_id, success=False)
-                if text_file_path.exists():
-                    await finalize_file_move(text_file_path, root_folder, topic_id, sub_topic_id, success=False)
+                await finalize_file_move(json_path, root_folder, topic_id, sub_topic_id, error_msg="Array 'files' mancante o vuoto nel manifest.")
+                await finalize_file_move(text_file_path, root_folder, topic_id, sub_topic_id, error_msg="Array 'files' mancante o vuoto nel manifest.")
                 return False
                 
             file_name = str(files_array[0])
-            # -----------------------------------------------------
-
             extra_metadata = raw_json.get("metadati", {})
-            if not isinstance(extra_metadata, dict):
-                extra_metadata = {}
+            if not isinstance(extra_metadata, dict): extra_metadata = {}
                 
         except Exception as e:
-            log.error(f"Errore critico nel parsing del file JSON {json_path.name}: {e}")
-            await finalize_file_move(json_path, root_folder, topic_id, sub_topic_id, success=False)
-            if text_file_path.exists():
-                await finalize_file_move(text_file_path, root_folder, topic_id, sub_topic_id, success=False)
+            log.error(f"Errore critico nel parsing JSON {json_path.name}: {e}")
+            await finalize_file_move(json_path, root_folder, topic_id, sub_topic_id, error_msg=f"JSON Parsing Error: {str(e)}")
+            await finalize_file_move(text_file_path, root_folder, topic_id, sub_topic_id, error_msg=f"JSON Parsing Error")
             return False
 
-        # 3. Lettura del testo normalizzato ed esecuzione del chunking
         try:
             full_text = await asyncio.to_thread(text_file_path.read_text, encoding='utf-8')
             if not full_text.strip(): 
-                log.warning(f"Contenuto del file di testo vuoto per '{text_file_path.name}'. File scartato.")
-                await finalize_file_move(json_path, root_folder, topic_id, sub_topic_id, success=False)
-                await finalize_file_move(text_file_path, root_folder, topic_id, sub_topic_id, success=False)
+                log.warning(f"Contenuto file vuoto per '{text_file_path.name}'. Scartato.")
+                await finalize_file_move(json_path, root_folder, topic_id, sub_topic_id, error_msg="Contenuto file vuoto.")
+                await finalize_file_move(text_file_path, root_folder, topic_id, sub_topic_id, error_msg="Contenuto file vuoto.")
                 return False
             
             parent_text_splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
@@ -218,9 +296,9 @@ async def process_single_file_async(topic_id, sub_topic_id, json_path, root_fold
             else:
                 parent_docs = parent_text_splitter.create_documents([full_text])
             
-            log.info(f"Generati {len(parent_docs)} Parent Documents (Token size: ~{parent_chunk_size}).")
+            log.info(f"Chunking: {len(parent_docs)} Parent Documents generati.")
 
-            parent_points = []
+            mysql_parents_data = []
             all_child_points = []
 
             def build_payload(base_dict, extra_meta):
@@ -232,61 +310,57 @@ async def process_single_file_async(topic_id, sub_topic_id, json_path, root_fold
                     payload[key] = value
                 return payload
         
-            # 4. Generazione dei vettori
             for p_idx, p_doc in enumerate(parent_docs):
                 parent_id = str(uuid.uuid4())
                 
-                # --- INIEZIONE IN PARENT ---
-                parent_base_payload = {
-                    "topic_id": topic_id, 
-                    "sub_topic_id": sub_topic_id, 
-                    "source": source_name,
-                    "file_name": file_name,
-                    "parent_index": p_idx, 
-                    "content": p_doc.page_content, 
-                    **p_doc.metadata
-                }
+                merged_metadata = {**p_doc.metadata, **extra_metadata}
                 
-                parent_points.append(
-                    models.PointStruct(
-                        id=parent_id, vector=[0.0] * 768, payload=build_payload(parent_base_payload, extra_metadata)
-                    )
-                )
+                mysql_parents_data.append((
+                    parent_id,
+                    topic_id,
+                    sub_topic_id,
+                    source_name,
+                    file_name,
+                    p_idx,
+                    p_doc.page_content,
+                    json.dumps(merged_metadata) # Salviamo i metadati come stringa JSON
+                ))
 
+                # PREPARAZIONE DATI PER QDRANT (Child Chunks)
                 child_docs = child_text_splitter.create_documents([p_doc.page_content])
                 batch_texts = [c.page_content for c in child_docs]
                 
-                if not batch_texts:
-                    continue
+                if not batch_texts: continue
 
-                log.debug(f"Parent {p_idx+1}/{len(parent_docs)}: Richiesta embedding per {len(child_docs)} Child Chunks...")
-                
                 child_vectors = []
+                # Batch processing per superare i limiti API
                 for i in range(0, len(batch_texts), 250):
                     child_vectors.extend(await async_embed_batch(batch_texts[i:i+250]))
 
                 for c_idx, vec in enumerate(child_vectors):
-                    
-                    # --- INIEZIONE IN CHILD ---
                     child_base_payload = {
+                        **child_docs[c_idx].metadata,
                         "parent_id": parent_id, 
                         "topic_id": topic_id, 
                         "sub_topic_id": sub_topic_id,
                         "source": source_name, 
                         "file_name": file_name, 
                         "child_index": c_idx, 
-                        "content": child_docs[c_idx].page_content,
-                        **child_docs[c_idx].metadata
+                        "content": child_docs[c_idx].page_content
+                        
                     }
-                    
                     all_child_points.append(
                         models.PointStruct(
                             id=str(uuid.uuid4()), vector=vec, payload=build_payload(child_base_payload, extra_metadata)
                         )
                     )
 
-            # 5. Upsert su Qdrant
-            log.info(f"Fase Upsert Qdrant: Preparazione di {len(parent_points)} Parents e {len(all_child_points)} Children.")
+            # 1. Salvataggio su MySQL (Sincrono, spostato su thread separato)
+            log.info(f"MySQL Upsert: {len(mysql_parents_data)} Parent Documents.")
+            await asyncio.to_thread(sync_upsert_parents_mysql, source_name, topic_id, sub_topic_id, mysql_parents_data)
+
+            # 2. Upsert su DB Vettoriale Qdrant (Solo Child)
+            log.info(f"Qdrant Upsert: {len(all_child_points)} Child Chunks.")
             
             cleanup_filter = models.FilterSelector(  
                 filter=models.Filter(must=[
@@ -297,89 +371,143 @@ async def process_single_file_async(topic_id, sub_topic_id, json_path, root_fold
             )
 
             await qdrant_client.delete(collection_name=QDRANT_COLLECTION, points_selector=cleanup_filter)
-            await qdrant_client.delete(collection_name=PARENT_COLLECTION, points_selector=cleanup_filter)
             
-            if parent_points:
-                for i in range(0, len(parent_points), 100):
-                    await qdrant_client.upsert(collection_name=PARENT_COLLECTION, points=parent_points[i:i+100])
-
+            # Upsert solo dei child
             if all_child_points:
                 for i in range(0, len(all_child_points), 100):
                     await qdrant_client.upsert(collection_name=QDRANT_COLLECTION, points=all_child_points[i:i+100])
 
-            log.info(f"SUCCESS: Indicizzazione completata con successo per source '{source_name}'.")
-            await finalize_file_move(json_path, root_folder, topic_id, sub_topic_id, success=True)
-            await finalize_file_move(text_file_path, root_folder, topic_id, sub_topic_id, success=True)
+            log.info(f"SUCCESS: Indicizzazione completata per source '{source_name}'.")
+            await finalize_file_move(json_path, root_folder, topic_id, sub_topic_id)
+            await finalize_file_move(text_file_path, root_folder, topic_id, sub_topic_id)
             return True
 
         except Exception as e:
             log.error(f"Fallimento critico durante l'indicizzazione del pacchetto '{base_name}': {e}", exc_info=True)
-            await finalize_file_move(json_path, root_folder, topic_id, sub_topic_id, success=False)
-            await finalize_file_move(text_file_path, root_folder, topic_id, sub_topic_id, success=False)
+            await finalize_file_move(json_path, root_folder, topic_id, sub_topic_id, error_msg=f"Error: {str(e)}")
+            await finalize_file_move(text_file_path, root_folder, topic_id, sub_topic_id, error_msg=f"Error: {str(e)}")
             return False
 
-async def finalize_file_move(file_path, root_folder, topic_id, sub_topic_id, success):
-    try:
-        try: 
-            relative_path = file_path.relative_to(root_folder)
-        except ValueError: 
-            relative_path = pathlib.Path(file_path.name)
 
-        dest_root = PROCESSED_FOLDER if success else ERROR_FOLDER
-        final_dest = dest_root / topic_id / sub_topic_id / relative_path
-        final_dest.parent.mkdir(parents=True, exist_ok=True)
-        
-        await asyncio.to_thread(safe_move_file, file_path, final_dest.parent)
+# ==============================================================================
+# 4. EVENT-DRIVEN ORCHESTRATION (RABBITMQ)
+# ==============================================================================
 
-        # RIMOSSO IL CONTROLLO SUL JSON SIBLING PER EVITARE RACE CONDITIONS
-            
-        status_tag = '[SUCCESS]' if success else '[ERROR]'
-        log.info(f"File lifecycle complete: {status_tag} {file_path.name}")
-    except Exception as e:
-        log.error(f"Failed during finalize_file_move for {file_path.name}: {e}")
-
-async def process_topic_folder_async(topic_id, sub_topic_id, folder_path): 
-    folder_path = pathlib.Path(folder_path)
-    log.info(f"====== Topic Start: '{topic_id}' -> Sub: '{sub_topic_id}' ======")
+async def process_single_job(payload: dict):
+    """Analizza il payload di RabbitMQ ed avvia l'ingestione se il file è valido."""
+    rel_path_str = payload.get("json_manifest_path")
     
-    config = await asyncio.to_thread(get_subtopic_config, topic_id, sub_topic_id)
-    if not config or not config.get('chunk_size'):
-        log.error(f"CONFIG ERROR: Configurazione mancante per '{sub_topic_id}'.")
+    if not rel_path_str:
+        log.error(f"Payload malformato. Chiave 'json_manifest_path' mancante: {payload}")
         return
 
-    chunk_size = config['chunk_size'] or 500
+    rel_path = pathlib.Path(rel_path_str)
+    
+    # Path Resolution Dinamica: assuming topic/subtopic/file.json
+    if len(rel_path.parts) < 3:
+        log.error(f"Struttura path non supportata (attesa: topic/sub/file.json). Ricevuta: {rel_path}")
+        return
+
+    sub_topic_id = rel_path.parent.name
+    topic_id = rel_path.parent.parent.name
+    
+    json_path = WATCH_FOLDER / rel_path
+    root_folder = WATCH_FOLDER / topic_id / sub_topic_id
+
+    if not json_path.exists():
+        log.warning(f"File non trovato in watch dir: {json_path}. Probabilmente già processato o cancellato.")
+        return
+
+    # Recupero dinamico dei parametri via DB
+    config = await asyncio.to_thread(get_subtopic_config, topic_id, sub_topic_id)
+    if not config:
+        log.error(f"CONFIG ERROR: Dati non trovati nel database per il sub_topic '{sub_topic_id}'. Ingestione annullata.")
+        await finalize_file_move(json_path, root_folder, topic_id, sub_topic_id, success=False)
+        # Muove anche l'md/txt associato in errore se esiste
+        text_md = json_path.with_suffix(".md")
+        if text_md.exists(): await finalize_file_move(text_md, root_folder, topic_id, sub_topic_id, success=False)
+        text_txt = json_path.with_suffix(".txt")
+        if text_txt.exists(): await finalize_file_move(text_txt, root_folder, topic_id, sub_topic_id, success=False)
+        return
+
+    chunk_size = config.get('chunk_size') or 500
     chunk_overlap = config.get('chunk_overlap') or 100
     parent_size = config.get('parent_chunk_size') or 1500
-    
-    all_files_gen = (p for p in folder_path.rglob("*") if p.is_file() and p.name.endswith(".json"))
-    
-    results = []
-    batch = []
-    BATCH_LIMIT = 10 
 
-    for json_file in all_files_gen:
-        batch.append(process_single_file_async(topic_id, sub_topic_id, json_file, folder_path, chunk_size, chunk_overlap, parent_size))
-        
-        if len(batch) >= BATCH_LIMIT:
-            results.extend(await asyncio.gather(*batch))
-            batch = [] 
+    log.info(f"Job Iniziato: {json_path.name} | Topic: {topic_id} | SubTopic: {sub_topic_id}")
+    
+    await process_single_file_async(
+        topic_id=topic_id, 
+        sub_topic_id=sub_topic_id, 
+        json_path=json_path, 
+        root_folder=root_folder, 
+        chunk_size=chunk_size, 
+        chunk_overlap=chunk_overlap, 
+        parent_chunk_size=parent_size
+    )
+async def on_message_received(message: aio_pika.IncomingMessage):
+    """
+    Gestisce il ciclo di vita del messaggio: Ack se ok, Reject (verso DLQ) se fallisce dopo i retry.
+    """
+    # ignore_processed=True ci permette di chiamare manualmente ack() o reject()
+    async with message.process(ignore_processed=True):
+        try:
+            payload = json.loads(message.body.decode())
             
-    if batch:
-        results.extend(await asyncio.gather(*batch))
+            # Avviamo il processing con i retry
+            await process_with_retry(payload)
+            
+            # Se arriviamo qui, l'elaborazione è andata a buon fine
+            await message.ack()
+            
+        except json.JSONDecodeError as e:
+            log.error(f"Decode JSON Fallito: {e}. Payload irrecuperabile, invio a DLQ.")
+            await message.reject(requeue=False)
+            
+        except Exception as e:
+            # Se siamo qui, i 5 tentativi di tenacity sono falliti
+            log.error(f"Fallimento definitivo dopo i retry. Spostamento in DLQ (rag_dlx). Errore: {e}", exc_info=True)
+            # requeue=False previene il loop infinito e innesca la Dead Letter Policy
+            await message.reject(requeue=False)
 
-    log.info(f"====== Topic End: '{sub_topic_id}' (Processati: {len(results)}) ======")
-
-async def main_run():
-    log.info("Ingestion Worker Active - Beginning One Shot Run")
-    folders = [f for f in os.listdir(WATCH_FOLDER) if (WATCH_FOLDER / f).is_dir()]
+async def main_worker():
+    """Worker principale per RabbitMQ."""
+    rabbitmq_host = os.environ.get("RABBITMQ_HOST", "rabbitmq-service.rag.svc.cluster.local")
+    log.info(f"Ingestion Worker Start - Connessione a: amqp://{rabbitmq_host}/")
     
-    for tid in folders:
-        topic_path = WATCH_FOLDER / tid
-        sub_folders = [f for f in os.listdir(topic_path) if (topic_path / f).is_dir()]
-        for sub_tid in sub_folders:
-            await process_topic_folder_async(tid, sub_tid, topic_path / sub_tid)
-    
-    log.info("One Shot Run Finished Successfully.")
+    try:
+        connection = await aio_pika.connect_robust(f"amqp://{rabbitmq_host}/")
+        
+        async with connection:
+            channel = await connection.channel()
+            
+            # QoS prefeth per bilanciare memoria e rate limits
+            await channel.set_qos(prefetch_count=3)
+            
+            queue_in = await channel.declare_queue(
+                "da-indicizzare", 
+                durable=True,
+                arguments={
+                    "x-dead-letter-exchange": "rag_dlx",
+                    "x-dead-letter-routing-key": "da-indicizzare" 
+                }
+            )
+            
+            log.info("✓ Worker Ingestione attivo. In ascolto su 'da-indicizzare'.")
+            
+            async with queue_in.iterator() as queue_iter:
+                async for message in queue_iter:
+                    await on_message_received(message)
+                    
+    except Exception as e:
+        log.error(f"Errore critico di connettività broker: {e}")
+        raise
 
 if __name__ == "__main__":
-    asyncio.run(main_run())
+    log.info("=== START: Servizio Ingestione (Event-Driven) ===")
+    try:
+        asyncio.run(main_worker())
+    except KeyboardInterrupt:
+        log.info("Interruzione catturata. Spegnimento worker...")
+    finally:
+        log.info("=== STOP: Worker spento ===")

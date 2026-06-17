@@ -8,8 +8,6 @@ from qdrant_client import AsyncQdrantClient, models
 
 load_dotenv()
 
-QDRANT_COLLECTION = "document_chunks"
-
 async def inspect_collection_payloads(collection_name: str, limit: int = 5, file_name: Optional[str] = None):
     """
     Esegue lo scroll di una collection per mostrare ID e metadati.
@@ -51,15 +49,15 @@ async def inspect_collection_payloads(collection_name: str, limit: int = 5, file
             return
 
         for record in records:
-            print(f"\n🔹 [ID]: {record.id}")
+            print(f"\n🏷️ [ID]: {record.id}")
             formatted_payload = json.dumps(record.payload, indent=2, ensure_ascii=False)
-            print(f"🔹 [Metadati / Payload]:\n{formatted_payload}")
+            print(f"📄 [Metadati / Payload]:\n{formatted_payload}")
             print("-" * 50)
             
         if next_page_offset:
-            print(f"📌 Ci sono altri dati. Offset per la pagina successiva: {next_page_offset}")
+            print(f"⏩ Ci sono altri dati. Offset per la pagina successiva: {next_page_offset}")
         else:
-            print("🏁 Fine dei dati per questa ricerca.")
+            print("✅ Fine dei dati per questa ricerca.")
 
     except Exception as e:
         print(f"Errore durante lo scroll su {collection_name}: {e}")
@@ -67,26 +65,51 @@ async def inspect_collection_payloads(collection_name: str, limit: int = 5, file
         await client.close()
 
 if __name__ == "__main__":
-    # Configurazione degli argomenti da riga di comando
-    parser = argparse.ArgumentParser(description="Ispetta i metadati dei record in Qdrant.")
+    # Configurazione del parser con un help personalizzato e formattato
+    help_description = """
+=== Qdrant Collection Inspector ===
+Ispetta i metadati (payload) e gli ID dei record salvati in una collection di Qdrant.
+
+Esempi di utilizzo:
+  1. Base:
+     python qdrant_scroll.py --collection document_chunks
+
+  2. Limita il numero di risultati (es. 5 record):
+     python qdrant_scroll.py --collection document_chunks --limit 5
+
+  3. Filtra per nome di un file specifico:
+     python qdrant_scroll.py --collection document_chunks --file_name "report_2023.pdf"
+"""
+
+    parser = argparse.ArgumentParser(
+        description=help_description,
+        formatter_class=argparse.RawTextHelpFormatter # Permette di mantenere le andate a capo nella stringa sopra
+    )
+    
     parser.add_argument(
-        "--file_name", 
+        "-c", "--collection", 
         type=str, 
-        default=None, 
-        help="Nome del file per cui filtrare i chunk (opzionale)"
+        required=True, 
+        help="[OBBLIGATORIO] Il nome della collection in Qdrant da ispezionare."
     )
     parser.add_argument(
-        "--limit", 
+        "-f", "--file_name", 
+        type=str, 
+        default=None, 
+        help="[OPZIONALE] Filtra i record mostrando solo i chunk appartenenti a questo file."
+    )
+    parser.add_argument(
+        "-l", "--limit", 
         type=int, 
         default=15, 
-        help="Numero massimo di record da mostrare (default: 5)"
+        help="[OPZIONALE] Il numero massimo di record da stampare a schermo. (Default: 15)"
     )
     
     args = parser.parse_args()
 
     # Avvio dell'asincrono passando i parametri catturati
     asyncio.run(inspect_collection_payloads(
-        collection_name=QDRANT_COLLECTION, 
+        collection_name=args.collection, 
         limit=args.limit, 
         file_name=args.file_name
     ))

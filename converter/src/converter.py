@@ -9,8 +9,9 @@ from PIL import Image
 
 import fitz          # PyMuPDF
 import pymupdf4llm   # Native PDF to Markdown
+import aio_pika      # Asynchronous RabbitMQ client
 
-# --- Dipendenze AI importate da ingest.py ---
+# --- Dipendenze AI importate ---
 from google import genai
 from google.genai import types
 from google.cloud import vision
@@ -19,10 +20,15 @@ from tenacity import retry, stop_after_attempt, wait_random_exponential, retry_i
 from google.api_core.exceptions import ResourceExhausted, ServiceUnavailable
 
 from dotenv import load_dotenv
+import html
+import re
 
 load_dotenv()
 
-# Configurazione dinamica del logging
+# ==============================================================================
+# 1. CONFIGURAZIONE E LOGGING
+# ==============================================================================
+
 log_level_str = os.environ.get("LOG_LEVEL", "INFO").upper()
 log_level = getattr(logging, log_level_str, logging.INFO)
 
@@ -32,31 +38,34 @@ logging.basicConfig(
 )
 log = logging.getLogger("ConverterWorker")
 
-# --- CONFIGURAZIONI ---
+# --- DIRECTORY SYSTEM ---
 BASE_DIR = Path("./data")
 DATA_FOLDER = Path(os.environ.get("DATA_FOLDER", str(BASE_DIR)))
-STAGING_DIRECT = DATA_FOLDER / "staging" / "direct"
-STAGING_JSON = DATA_FOLDER / "staging" / "json"
+STAGING_DIR = DATA_FOLDER / "staging"
 INGESTION_WATCH_DIR = DATA_FOLDER / "watch"
-ERROR_DIR = BASE_DIR / "error"
-ARCHIVE_DIR = DATA_FOLDER / "archive"
+ERROR_DIR = DATA_FOLDER / "converter" / "error"
+ARCHIVE_DIR = DATA_FOLDER / "converter" / "archive"
+
+# Assicuriamo che le directory esistano allo startup
+for d in [STAGING_DIR, INGESTION_WATCH_DIR, ERROR_DIR, ARCHIVE_DIR]:
+    d.mkdir(parents=True, exist_ok=True)
 
 CROP_OCR_LIMIT = 0
 OCR_MODEL_NAME = os.environ.get("OCR_MODEL_NAME", "gemini-3-flash-preview")
+
+IMG_EXTENSIONS = [".png", ".jpg", ".jpeg"]
+
+# Limiter asincrono: gestisce internamente la concorrenza garantendo max 10 chiamate/minuto
 GEMINI_LIMITER = AsyncLimiter(max_rate=10, time_period=60)
 
-# Inizializzazione del nuovo client Google GenAI
-api_key = os.environ.get("GOOGLE_API_KEY") 
+# Inizializzazione Client AI
+api_key = os.environ.get("GOOGLE_API_KEY")
 client = genai.Client(api_key=api_key)
-
 vision_client = vision.ImageAnnotatorClient()
 
-def setup_dirs():
-    for d in [STAGING_DIRECT, STAGING_JSON, INGESTION_WATCH_DIR, ERROR_DIR, ARCHIVE_DIR]:
-        d.mkdir(parents=True, exist_ok=True)
-    log.debug(f"Directory di sistema verificate in: {BASE_DIR.absolute()}")
 
 def safe_move(src: Path, dest: Path):
+    """Sposta i file in modo sicuro con sovrascrittura se necessario."""
     if dest.exists(): 
         log.debug(f"Sovrascrittura file esistente in destinazione: {dest.name}")
         dest.unlink()
@@ -64,10 +73,11 @@ def safe_move(src: Path, dest: Path):
     log.debug(f"File spostato: {src.name} -> {dest.parent.name}/")
 
 # ==============================================================================
-# LOGICA IBRIDA EREDITATA DA INGEST.PY
+# 2. MOTORE IBRIDO DI ESTRAZIONE E OCR
 # ==============================================================================
 
 def _cloud_vision_fallback(image: Image.Image) -> str:
+    """Esegue il fallback su Google Cloud Vision API in caso di blocco policy."""
     log.info("Esecuzione fallback su Google Cloud Vision API...")
     img_byte_arr = io.BytesIO()
     image.save(img_byte_arr, format='PNG')
@@ -85,6 +95,7 @@ def _cloud_vision_fallback(image: Image.Image) -> str:
     stop=stop_after_attempt(20)
 )
 async def async_ocr_generate(image_input, as_markdown=False) -> str:
+    """Interroga Gemini Vision API rispettando i limiti di rate e gestendo i fallback."""
     async with GEMINI_LIMITER:
         prompt = "Transcribe the text in this image precisely. Format the output strictly as Markdown." if as_markdown else "Transcribe the text in this image precisely as raw text."
         
@@ -95,22 +106,10 @@ async def async_ocr_generate(image_input, as_markdown=False) -> str:
                 contents=[prompt, image_input],
                 config=types.GenerateContentConfig(
                     safety_settings=[
-                        types.SafetySetting(
-                            category=types.HarmCategory.HARM_CATEGORY_HARASSMENT,
-                            threshold=types.HarmBlockThreshold.BLOCK_NONE,
-                        ),
-                        types.SafetySetting(
-                            category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
-                            threshold=types.HarmBlockThreshold.BLOCK_NONE,
-                        ),
-                        types.SafetySetting(
-                            category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
-                            threshold=types.HarmBlockThreshold.BLOCK_NONE,
-                        ),
-                        types.SafetySetting(
-                            category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
-                            threshold=types.HarmBlockThreshold.BLOCK_NONE,
-                        )
+                        types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_HARASSMENT, threshold=types.HarmBlockThreshold.BLOCK_NONE),
+                        types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold=types.HarmBlockThreshold.BLOCK_NONE),
+                        types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold=types.HarmBlockThreshold.BLOCK_NONE),
+                        types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold=types.HarmBlockThreshold.BLOCK_NONE)
                     ]
                 )
             )
@@ -133,6 +132,7 @@ async def async_ocr_generate(image_input, as_markdown=False) -> str:
             raise ValueError(f"OCR Generation Failed: {e}")
 
 async def extract_hybrid_markdown_from_pdf_async(file_path: Path, file_bytes: bytes = None) -> str:
+    """Estrae il testo nativo dal PDF o innesca l'OCR per le pagine scansionate."""
     md_pages = []
     
     def evaluate_and_extract_page(doc, p_num):
@@ -150,6 +150,8 @@ async def extract_hybrid_markdown_from_pdf_async(file_path: Path, file_bytes: by
         else:
             log.debug(f"Pagina {p_num+1}: Rilevato testo nativo sufficiente ({char_count} chars). Estrazione Markdown.")
             page_md = pymupdf4llm.to_markdown(doc, pages=[p_num])
+            page_md = page_md.replace("<br>", "\n")
+            
             return {"type": "markdown", "content": page_md}
 
     log.info(f"Avvio estrazione ibrida per: {file_path.name}")
@@ -181,158 +183,166 @@ async def extract_hybrid_markdown_from_pdf_async(file_path: Path, file_bytes: by
         raise
 
 # ==============================================================================
-# LOGICA DI ROUTING E MERGE
+# 3. CORE LOGIC - GESTIONE MESSAGGI (EVENT-DRIVEN)
 # ==============================================================================
 
-async def process_direct_folder():
-    """Elabora file orfani in direct mantenendo l'alberatura delle directory."""
-    log.info("--- Controllo coda DIRECT ---")
+async def process_single_job(payload: dict, channel: aio_pika.Channel):
+    """
+    Riceve il task decodificato. Cerca il file direttamente in STAGING_DIR.
+    """
+    source_type = payload.get("source_type")
+    rel_path_str = payload.get("rel_path")
     
-    files = list(STAGING_DIRECT.rglob("*.*"))
-    if not files:
+    if source_type != "json" or not rel_path_str:
+        log.error(f"Payload invalido o non supportato: {payload}")
         return
 
-    for file_path in files:
-        if not file_path.is_file(): continue
-        
-        ext = file_path.suffix.lower()
-        rel_path = file_path.relative_to(STAGING_DIRECT)
-        base_name = rel_path.stem
-        
-        dest_dir = INGESTION_WATCH_DIR / rel_path.parent
-        dest_dir.mkdir(parents=True, exist_ok=True)
+    rel_path = Path(rel_path_str)
+    
+    # La risoluzione del percorso ora è immediata
+    file_path = STAGING_DIR / rel_path
+    
+    if not file_path.exists():
+        log.warning(f"Manifesto JSON non trovato sul filesystem: {file_path}. Ignorato.")
+        return
 
-        archive_target_dir = ARCHIVE_DIR / rel_path.parent
-        archive_target_dir.mkdir(parents=True, exist_ok=True)
-        
-        log.info(f"Inizio processo file diretto: {rel_path}")
-        
-        try:
-            target_text_file = None
+    if file_path.suffix.lower() != ".json":
+        log.error(f"Il Converter accetta solo file .json. Trovato: {file_path.name}")
+        err_dir = ERROR_DIR / rel_path.parent
+        err_dir.mkdir(parents=True, exist_ok=True)
+        safe_move(file_path, err_dir / file_path.name)
+        return
 
-            if ext in [".txt", ".md"]:
-                target_text_file = dest_dir / file_path.name
-                # Copia il file per il watcher, poi sposta l'originale in archive
-                shutil.copy2(file_path, target_text_file)
-                safe_move(file_path, archive_target_dir / file_path.name)
-                
-            elif ext == ".pdf":
-                md_content = await extract_hybrid_markdown_from_pdf_async(file_path)
-                if md_content:
-                    target_text_file = dest_dir / f"{base_name}.md"
-                    target_text_file.write_text(md_content, encoding="utf-8")
-                # Archiviazione del file originale invece di .unlink()
-                safe_move(file_path, archive_target_dir / file_path.name)
-                
-            else:
-                log.warning(f"File diretto ignorato (estensione non valida per la conversione): {rel_path}")
-                err_dir = ERROR_DIR / rel_path.parent
-                err_dir.mkdir(parents=True, exist_ok=True)
-                safe_move(file_path, err_dir / file_path.name)
+    base_name = file_path.stem
+    dest_dir = INGESTION_WATCH_DIR / rel_path.parent
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    archive_target_dir = ARCHIVE_DIR / rel_path.parent
+    archive_target_dir.mkdir(parents=True, exist_ok=True)
+
+    log.info(f"Elaborazione manifesto JSON iniziata: {rel_path}")
+    
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            manifest = json.load(f)
+        
+        attached_files = manifest.get("files", [])
+        original_source = manifest.get("source", str(rel_path))
+        current_json_dir = file_path.parent
+        
+        for filename in attached_files:
+            attached_file_path = current_json_dir / filename
+            
+            if not attached_file_path.exists():
+                log.warning(f"Allegato mancante {filename} nella cartella {current_json_dir.name}.")
                 continue
+
+            log.info(f"Conversione allegato: {filename}")
+            attached_ext = attached_file_path.suffix.lower()
+            md_content = None
+
+            # Pipeline di conversione
+            if attached_ext == ".pdf":
+                md_content = await extract_hybrid_markdown_from_pdf_async(attached_file_path)
+            elif attached_ext in [".txt", ".md"]:
+                md_content = attached_file_path.read_text(encoding="utf-8", errors="ignore")
+            elif attached_ext in IMG_EXTENSIONS:
+                log.info(f"Rilevata immagine {filename}. Avvio OCR nativo...")
+                with Image.open(attached_file_path) as img:
+                    md_content = await async_ocr_generate(img, as_markdown=True)
+            else:
+                log.warning(f"Estensione {attached_ext} ignorata per il file {filename}.")
+            
+            if md_content:
+                safe_stem = Path(filename).stem
+                unique_base_name = f"{base_name}_{safe_stem}"
                 
-            if target_text_file and target_text_file.exists():
-                unique_source = f"direct://{str(rel_path.with_suffix('')).replace(os.sep, '/')}"
+                final_md_path = dest_dir / f"{unique_base_name}.md"
+                final_md_path.write_text(md_content, encoding="utf-8")
                 
-                json_manifest = {
-                    "source": unique_source,
-                    "files": [file_path.name],
-                    "metadati": {
-                        "percorso_originale": str(rel_path)
-                    }
-                }
-                json_dest = dest_dir / f"{base_name}.json"
-                with open(json_dest, "w", encoding="utf-8") as f:
-                    json.dump(json_manifest, f, indent=2)
-                log.info(f"File e JSON generati in {dest_dir.name}")
+                child_manifest = manifest.copy()
+                child_manifest["source"] = f"{original_source}::{filename}"
+                child_manifest["files"] = [filename]
+                
+                final_json_path = dest_dir / f"{unique_base_name}.json"
+                with open(final_json_path, "w", encoding="utf-8") as f:
+                    json.dump(child_manifest, f, indent=2)
+                
+                # Notifica ad Ingest
+                ingest_payload = {"json_manifest_path": str(final_json_path.relative_to(INGESTION_WATCH_DIR))}
+                await channel.default_exchange.publish(
+                    aio_pika.Message(body=json.dumps(ingest_payload).encode(), delivery_mode=aio_pika.DeliveryMode.PERSISTENT),
+                    routing_key="da-indicizzare"
+                )
+                log.info(f"✓ Notificato Ingest per file generato: {unique_base_name}.json")
 
-        except Exception as e:
-            log.error(f"Errore irreversibile nell'elaborazione del file diretto {rel_path}", exc_info=True)
-            err_dir = ERROR_DIR / rel_path.parent
-            err_dir.mkdir(parents=True, exist_ok=True)
-            safe_move(file_path, err_dir / file_path.name)
+            # Archiviazione allegato processato
+            safe_move(attached_file_path, archive_target_dir / attached_file_path.name)
 
-async def process_json_folder():
-    """Elabora gruppi da Manifest JSON esplodendoli in file 1:1."""
-    log.info("--- Controllo coda JSON (Manifests) ---")
-    
-    manifests = list(STAGING_JSON.rglob("*.json"))
-    if not manifests:
-        return
+        # Archiviazione manifesto radice
+        safe_move(file_path, archive_target_dir / file_path.name)
+        log.info(f"✓ Manifesto JSON '{file_path.name}' completato e archiviato con successo.")
 
-    for json_path in manifests:
-        rel_path = json_path.relative_to(STAGING_JSON)
-        base_name = rel_path.stem
-        
-        dest_dir = INGESTION_WATCH_DIR / rel_path.parent
-        dest_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        log.error(f"Fallimento durante l'esplosione del manifest {rel_path}: {e}", exc_info=True)
+        err_dir = ERROR_DIR / rel_path.parent
+        err_dir.mkdir(parents=True, exist_ok=True)
+        safe_move(file_path, err_dir / file_path.name)
 
-        archive_target_dir = ARCHIVE_DIR / rel_path.parent
-        archive_target_dir.mkdir(parents=True, exist_ok=True)
-        
-        log.info(f"Avvio esplosione manifesto: {rel_path}")
-        
+# ==============================================================================
+# 4. ORCHESTRAZIONE MESSAGE BROKER E LOOP PRINCIPALE
+# ==============================================================================
+
+async def on_message_received(message: aio_pika.IncomingMessage, channel: aio_pika.Channel):
+    """Callback triggered all'arrivo di ogni messaggio da RabbitMQ."""
+    async with message.process():
         try:
-            with open(json_path, "r", encoding="utf-8") as f:
-                manifest = json.load(f)
-            
-            attached_files = manifest.get("files", [])
-            original_source = manifest.get("source", str(rel_path))
-            current_json_dir = json_path.parent 
-            
-            for filename in attached_files:
-                file_path = current_json_dir / filename
-                
-                if not file_path.exists(): 
-                    log.warning(f"Allegato mancante nella cartella {current_json_dir.name}: {filename}")
-                    continue
-
-                log.info(f"Estrazione singolo allegato: {filename}")
-                ext = file_path.suffix.lower()
-                md_content = None
-
-                # Pipeline di conversione
-                if ext == ".pdf":
-                    md_content = await extract_hybrid_markdown_from_pdf_async(file_path)
-                elif ext in [".txt", ".md"]:
-                    md_content = file_path.read_text(encoding="utf-8", errors="ignore")
-                else:
-                    log.warning(f"Estensione ignorata durante la conversione: {ext} per il file {filename}")
-                
-                if md_content:
-                    safe_stem = Path(filename).stem
-                    unique_base_name = f"{base_name}_{safe_stem}"
-                    
-                    final_md_path = dest_dir / f"{unique_base_name}.md"
-                    final_md_path.write_text(md_content, encoding="utf-8")
-                    
-                    child_manifest = manifest.copy()
-                    child_manifest["source"] = f"{original_source}::{filename}"
-                    child_manifest["files"] = [filename]
-                    
-                    final_json_path = dest_dir / f"{unique_base_name}.json"
-                    with open(final_json_path, "w", encoding="utf-8") as f:
-                        json.dump(child_manifest, f, indent=2)
-                        
-                # Archiviazione del file originale invece di .unlink()
-                safe_move(file_path, archive_target_dir / file_path.name)
-
-            # Archiviazione anche del JSON/manifest originario (raggruppatore)
-            if json_path.exists():
-                safe_move(json_path, archive_target_dir / json_path.name)
-
+            payload = json.loads(message.body.decode())
+            log.debug(f"Payload RabbitMQ Ricevuto: {payload}")
+            await process_single_job(payload, channel)
+        except json.JSONDecodeError as e:
+            log.error(f"Impossibile decodificare il messaggio RabbitMQ: {e}. Messaggio scartato.")
         except Exception as e:
-            log.error(f"Fallimento critico nell'elaborazione del manifest {rel_path}", exc_info=True)
-            err_dir = ERROR_DIR / rel_path.parent
-            err_dir.mkdir(parents=True, exist_ok=True)
-            safe_move(json_path, err_dir / json_path.name)
+            log.error(f"Errore non gestito durante l'elaborazione del messaggio: {e}", exc_info=True)
 
-async def main_run():
-    setup_dirs()
-    log.info("=== START: Servizio Normalizzazione Documentale (Ibrido) ===")
-    await process_direct_folder()
-    await process_json_folder()
-    log.info("=== STOP: Ciclo terminato ===")
+async def main_worker():
+    rabbitmq_host = os.environ.get("RABBITMQ_HOST", "rabbitmq-service.rag.svc.cluster.local")
+    
+    log.info(f"Avvio Worker. Tentativo di connessione a RabbitMQ su {rabbitmq_host}...")
+    
+    try:
+        connection = await aio_pika.connect_robust(f"amqp://{rabbitmq_host}/")
+        
+        async with connection:
+            channel = await connection.channel()
+            
+            # Limita a 1 il numero di messaggi presi in carico contemporaneamente per proteggere la RAM e il Limiter
+            await channel.set_qos(prefetch_count=1)
+            
+            queue_in = await channel.declare_queue("da-convertire", durable=True)
+            await channel.declare_queue(
+                "da-indicizzare", 
+                durable=True,
+                arguments={
+                    "x-dead-letter-exchange": "rag_dlx",
+                    "x-dead-letter-routing-key": "da-indicizzare"
+                }
+            )
+            
+            log.info("✓ Connessione stabilita. In ascolto sulla coda 'da-convertire'.")
+            
+            async with queue_in.iterator() as queue_iter:
+                async for message in queue_iter:
+                    await on_message_received(message, channel)
+                    
+    except Exception as e:
+        log.error(f"Errore critico di connessione a RabbitMQ: {e}")
+        raise
 
 if __name__ == "__main__":
-    asyncio.run(main_run())
+    log.info("=== START: Servizio Normalizzazione Documentale (Event-Driven) ===")
+    try:
+        asyncio.run(main_worker())
+    except KeyboardInterrupt:
+        log.info("Interruzione manuale ricevuta. Spegnimento gracefull in corso...")
+    finally:
+        log.info("=== STOP: Worker terminato ===")
