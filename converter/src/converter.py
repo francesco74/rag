@@ -120,7 +120,11 @@ async def async_ocr_generate(image_input, as_markdown=False) -> str:
                 
                 if reason in ['SAFETY', 'RECITATION', 'BLOCKLIST', 'PROHIBITED_CONTENT', '3', '4']:
                     log.warning(f"Gemini API bloccata per policy (Reason: {reason}). Avvio fallback visivo.")
+                    if not isinstance(image_input, Image.Image):
+                        log.error("Fallback Cloud Vision richiede un PIL.Image. Tipo ricevuto: %s", type(image_input))
+                        raise ValueError("Tipo immagine non supportato per il fallback.")
                     fallback_text = await asyncio.to_thread(_cloud_vision_fallback, image_input)
+                    
                     return fallback_text.strip()
                 raise ValueError(f"Gemini API Blocked Page. Exact Finish Reason: {reason}")
             
@@ -294,15 +298,18 @@ async def process_single_job(payload: dict, channel: aio_pika.Channel):
 
 async def on_message_received(message: aio_pika.IncomingMessage, channel: aio_pika.Channel):
     """Callback triggered all'arrivo di ogni messaggio da RabbitMQ."""
-    async with message.process():
+    async with message.process(ignore_processed=True):  # ← non auto-ack
         try:
             payload = json.loads(message.body.decode())
             log.debug(f"Payload RabbitMQ Ricevuto: {payload}")
             await process_single_job(payload, channel)
+            await message.ack()
         except json.JSONDecodeError as e:
-            log.error(f"Impossibile decodificare il messaggio RabbitMQ: {e}. Messaggio scartato.")
+            log.error(f"Impossibile decodificare il messaggio: {e}. Scartato in DLQ.")
+            await message.reject(requeue=False)
         except Exception as e:
-            log.error(f"Errore non gestito durante l'elaborazione del messaggio: {e}", exc_info=True)
+            log.error(f"Errore durante l'elaborazione: {e}", exc_info=True)
+            await message.reject(requeue=False)
 
 async def main_worker():
     rabbitmq_host = os.environ.get("RABBITMQ_HOST", "rabbitmq-service.rag.svc.cluster.local")
@@ -314,22 +321,12 @@ async def main_worker():
         
         async with connection:
             channel = await connection.channel()
-            
-            # Limita a 1 il numero di messaggi presi in carico contemporaneamente per proteggere la RAM e il Limiter
             await channel.set_qos(prefetch_count=1)
-            
-            queue_in = await channel.declare_queue("da-convertire", durable=True)
-            await channel.declare_queue(
-                "da-indicizzare", 
-                durable=True,
-                arguments={
-                    "x-dead-letter-exchange": "rag_dlx",
-                    "x-dead-letter-routing-key": "da-indicizzare"
-                }
-            )
-            
+
+            queue_in = await channel.get_queue("da-convertire")  # ← assume che esista già
+
             log.info("✓ Connessione stabilita. In ascolto sulla coda 'da-convertire'.")
-            
+
             async with queue_in.iterator() as queue_iter:
                 async for message in queue_iter:
                     await on_message_received(message, channel)

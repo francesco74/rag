@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS `sub_topics` (
   `chunk_size` int DEFAULT NULL,     
   `chunk_overlap` int DEFAULT 50,
   `parent_chunk_size` int DEFAULT 1500,
+  `use_markdown_splitter` TINYINT(1) DEFAULT 1,
   UNIQUE KEY `unique_sub_topic` (`topic_id`, `sub_topic_id`),
   CONSTRAINT `fk_sub_topics_topic_id` 
     FOREIGN KEY (`topic_id`) 
@@ -82,6 +83,7 @@ CREATE TABLE IF NOT EXISTS parent_documents (
     content LONGTEXT NOT NULL,
     metadata JSON,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP;
     INDEX idx_search (source, topic_id, sub_topic_id)
 );
 

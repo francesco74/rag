@@ -19,6 +19,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 ESTENSIONI_CONSENTITE = {".pdf", ".p7m"}
+RABBITMQ_HOST = os.environ.get("RABBITMQ_HOST", "rabbitmq-service.rag.svc.cluster.local")
+    
 
 log = logging.getLogger("main_extractor")
 BASE_DIR = pathlib.Path(__file__).parent.resolve()
@@ -47,14 +49,18 @@ def extract_file_from_p7m(p7m_bytes: bytes, filename: str) -> bytes:
     
 def get_rabbitmq_channel():
     """Inizializza la connessione al broker per pubblicare gli eventi."""
-    rabbitmq_host = os.environ.get("RABBITMQ_HOST", "rabbitmq-service.rag.svc.cluster.local")
     try:
-        connection = pika.BlockingConnection(pika.ConnectionParameters(host=rabbitmq_host))
+        connection = pika.BlockingConnection(
+        pika.ConnectionParameters(
+            host=RABBITMQ_HOST,
+            heartbeat=60,
+            blocked_connection_timeout=300
+        )
+    )
         channel = connection.channel()
-        channel.queue_declare(queue='da-convertire', durable=True)
         return connection, channel
     except Exception as e:
-        log.error(f"Errore critico di connessione a RabbitMQ su {rabbitmq_host}: {e}")
+        log.error(f"Errore critico di connessione a RabbitMQ su {RABBITMQ_HOST}: {e}")
         raise
 
 def main():
@@ -136,6 +142,8 @@ def main():
         try:
             lista_allegati_raw, attributi_plus = repwss_client.leggi_atto_plus(str_uid)
             meta_atto = risultato_ricerca.documenti_metadata.get(str_uid, {})
+
+            log.debug(f"Metadati estratti per UID {str_uid}: {meta_atto}")
             
             nomi_file_presenti = {f_name.lower() for _, f_name in lista_allegati_raw}
             lista_allegati_filtrata = []

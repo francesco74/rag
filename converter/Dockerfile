@@ -26,8 +26,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # --- Copy Application Code ---
 # Copy the rest of the application code into the container
-COPY src/ingest.py .
-COPY src/db_logger.py .
+COPY src/converter.py .
 
 # --- Configure and Run ---
 # Make port 8080 available to the world outside this container
@@ -39,12 +38,7 @@ ENV DB_HOST=""
 ENV DB_USER=""
 ENV DB_PASS=""
 ENV DB_NAME=""
-ENV QDRANT_HOST=""
-ENV QDRANT_PORT=""
 ENV RABBITMQ_HOST=""
 
-# Make port 8080 available to the world outside this container
-EXPOSE 5000
-
 # Define the command to run the app using Gunicorn for production
-CMD ["sh", "-c", "python ingest.py"]
+CMD ["sh", "-c", "python converter.py"]

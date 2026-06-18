@@ -7,6 +7,7 @@ def get_db_connection():
     """Helper function to get a MySQL connection using environment variables."""
     db_config = {
         "host": os.environ.get("DB_HOST", "localhost"),
+        "port": int(os.environ.get("DB_PORT", 3306)),
         "user": os.environ.get("DB_USER"),
         "password": os.environ.get("DB_PASS"),
         "database": os.environ.get("DB_NAME", "rag_system"),

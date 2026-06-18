@@ -8,6 +8,7 @@ import json
 
 # --- NUOVO SDK GOOGLE GENAI ---
 from google import genai
+from typeguard import config
 from google.genai import types
 
 # --- VECTOR DB ---
@@ -46,9 +47,11 @@ load_dotenv()
 BASE_DIR = pathlib.Path(__file__).parent.resolve()
 
 QDRANT_COLLECTION = "document_chunks"
+RABBITMQ_HOST = os.environ.get("RABBITMQ_HOST", "localhost")
+    
 
 PROTECTED_KEYS = {"topic_id", "sub_topic_id", "source", "parent_id", "content",
-                  "parent_index", "child_index", "file_name", "_ingestion_error"}
+                  "parent_index", "child_index", "file_name", "_ingestion_error", "_ingestion_id"}
 
 log_level_str = os.environ.get("LOG_LEVEL", "INFO").upper() 
 logging.basicConfig(
@@ -111,7 +114,9 @@ def get_subtopic_config(topic_id, sub_topic_id):
     try:
         with conn.cursor(dictionary=True) as cursor:
             cursor.execute(
-                "SELECT chunk_size, chunk_overlap, parent_chunk_size FROM sub_topics WHERE topic_id = %s AND sub_topic_id = %s", 
+                """SELECT chunk_size, chunk_overlap, parent_chunk_size, use_markdown_splitter 
+                   FROM sub_topics 
+                   WHERE topic_id = %s AND sub_topic_id = %s""", 
                 (topic_id, sub_topic_id)
             )
             return cursor.fetchone() 
@@ -228,7 +233,7 @@ def sync_upsert_parents_mysql(source_name, topic_id, sub_topic_id, parents_data)
 # 3. PIPELINE ORCHESTRATION (DOCUMENT PROCESSING)
 # ==============================================================================
 
-async def process_single_file_async(topic_id, sub_topic_id, json_path, root_folder, chunk_size, chunk_overlap, parent_chunk_size):
+async def process_single_file_async(topic_id, sub_topic_id, json_path, root_folder, chunk_size, chunk_overlap, parent_chunk_size, use_markdown_splitter=True):
     async with CONCURRENCY_LIMIT:
         json_path = pathlib.Path(json_path)
         base_name = json_path.stem
@@ -265,7 +270,19 @@ async def process_single_file_async(topic_id, sub_topic_id, json_path, root_fold
                 return False
                 
             file_name = str(files_array[0])
+
             extra_metadata = raw_json.get("metadati", {})
+            if not isinstance(extra_metadata, dict):
+                extra_metadata = {}
+
+            conflicting_keys = set(extra_metadata.keys()) & PROTECTED_KEYS
+            if conflicting_keys:
+                err = f"Chiavi riservate trovate nei metadati extra: {conflicting_keys}. Ingestione bloccata."
+                log.error(f"HARD STOP: {err}")
+                await finalize_file_move(json_path, root_folder, topic_id, sub_topic_id, error_msg=err)
+                await finalize_file_move(text_file_path, root_folder, topic_id, sub_topic_id, error_msg=err)
+                return False
+
             if not isinstance(extra_metadata, dict): extra_metadata = {}
                 
         except Exception as e:
@@ -290,8 +307,13 @@ async def process_single_file_async(topic_id, sub_topic_id, json_path, root_fold
             )
 
             if is_markdown:
-                md_header_splits = markdown_splitter.split_text(full_text)
-                parent_docs = parent_text_splitter.split_documents(md_header_splits)
+                if use_markdown_splitter:
+                    log.info("Applico MarkdownHeaderTextSplitter come da configurazione DB.")
+                    md_header_splits = markdown_splitter.split_text(full_text)
+                    parent_docs = parent_text_splitter.split_documents(md_header_splits)
+                else:
+                    log.info("Markdown Splitter disabilitato da DB. Tratto il file come blocco unico.")
+                    parent_docs = parent_text_splitter.create_documents([full_text])
             else:
                 parent_docs = parent_text_splitter.create_documents([full_text])
             
@@ -309,6 +331,8 @@ async def process_single_file_async(topic_id, sub_topic_id, json_path, root_fold
                     payload[key] = value
                 return payload
         
+            ingestion_id = str(uuid.uuid4())
+
             for p_idx, p_doc in enumerate(parent_docs):
                 parent_id = str(uuid.uuid4())
                 
@@ -345,8 +369,8 @@ async def process_single_file_async(topic_id, sub_topic_id, json_path, root_fold
                         "source": source_name, 
                         "file_name": file_name, 
                         "child_index": c_idx, 
-                        "content": child_docs[c_idx].page_content
-                        
+                        "content": child_docs[c_idx].page_content,
+                        "_ingestion_id": ingestion_id
                     }
                     all_child_points.append(
                         models.PointStruct(
@@ -361,20 +385,29 @@ async def process_single_file_async(topic_id, sub_topic_id, json_path, root_fold
             # 2. Upsert su DB Vettoriale Qdrant (Solo Child)
             log.info(f"Qdrant Upsert: {len(all_child_points)} Child Chunks.")
             
-            cleanup_filter = models.FilterSelector(  
-                filter=models.Filter(must=[
-                    models.FieldCondition(key="source", match=models.MatchValue(value=source_name)),
-                    models.FieldCondition(key="topic_id", match=models.MatchValue(value=topic_id)),
-                    models.FieldCondition(key="sub_topic_id", match=models.MatchValue(value=sub_topic_id))
-                ])
-            )
-
-            await qdrant_client.delete(collection_name=QDRANT_COLLECTION, points_selector=cleanup_filter)
-            
-            # Upsert solo dei child
+            # 1. UPSERT prima (i nuovi punti hanno ingestion_id fresco)
             if all_child_points:
                 for i in range(0, len(all_child_points), 100):
-                    await qdrant_client.upsert(collection_name=QDRANT_COLLECTION, points=all_child_points[i:i+100])
+                    await qdrant_client.upsert(
+                        collection_name=QDRANT_COLLECTION,
+                        points=all_child_points[i:i + 100]
+                    )
+
+            # 2. Solo se l'upsert è andato a buon fine, cancella i punti VECCHI
+            #    cioè quelli con lo stesso source/topic/subtopic ma ingestion_id diverso
+            cleanup_filter = models.FilterSelector(
+                filter=models.Filter(
+                    must=[
+                        models.FieldCondition(key="source",        match=models.MatchValue(value=source_name)),
+                        models.FieldCondition(key="topic_id",      match=models.MatchValue(value=topic_id)),
+                        models.FieldCondition(key="sub_topic_id",  match=models.MatchValue(value=sub_topic_id)),
+                    ],
+                    must_not=[
+                        models.FieldCondition(key="_ingestion_id",  match=models.MatchValue(value=ingestion_id)),
+                    ]
+                )
+            )
+            await qdrant_client.delete(collection_name=QDRANT_COLLECTION, points_selector=cleanup_filter)
 
             log.info(f"SUCCESS: Indicizzazione completata per source '{source_name}'.")
             await finalize_file_move(json_path, root_folder, topic_id, sub_topic_id)
@@ -383,9 +416,7 @@ async def process_single_file_async(topic_id, sub_topic_id, json_path, root_fold
 
         except Exception as e:
             log.error(f"Fallimento critico durante l'indicizzazione del pacchetto '{base_name}': {e}", exc_info=True)
-            await finalize_file_move(json_path, root_folder, topic_id, sub_topic_id, error_msg=f"Error: {str(e)}")
-            await finalize_file_move(text_file_path, root_folder, topic_id, sub_topic_id, error_msg=f"Error: {str(e)}")
-            return False
+            raise
 
 
 # ==============================================================================
@@ -421,20 +452,21 @@ async def process_single_job(payload: dict):
     config = await asyncio.to_thread(get_subtopic_config, topic_id, sub_topic_id)
     if not config:
         log.error(f"CONFIG ERROR: Dati non trovati nel database per il sub_topic '{sub_topic_id}'. Ingestione annullata.")
-        await finalize_file_move(json_path, root_folder, topic_id, sub_topic_id, success=False)
+        await finalize_file_move(json_path, root_folder, topic_id, sub_topic_id, error_msg="sub_topic non trovata in DB.")
         # Muove anche l'md/txt associato in errore se esiste
         text_md = json_path.with_suffix(".md")
-        if text_md.exists(): await finalize_file_move(text_md, root_folder, topic_id, sub_topic_id, success=False)
+        if text_md.exists(): await finalize_file_move(text_md, root_folder, topic_id, sub_topic_id, error_msg="sub_topic non trovata in DB.")
         text_txt = json_path.with_suffix(".txt")
-        if text_txt.exists(): await finalize_file_move(text_txt, root_folder, topic_id, sub_topic_id, success=False)
+        if text_txt.exists(): await finalize_file_move(text_txt, root_folder, topic_id, sub_topic_id, error_msg="sub_topic non trovata in DB.")
         return
 
-    chunk_size = config.get('chunk_size') or 500
-    chunk_overlap = config.get('chunk_overlap') or 100
+    chunk_size = config.get('chunk_size') if config.get('chunk_size') is not None else 500
+    chunk_overlap = config.get('chunk_overlap') if config.get('chunk_overlap') is not None else 100
     parent_size = config.get('parent_chunk_size') or 1500
+    use_md_splitter = bool(config.get('use_markdown_splitter', True))
 
     log.info(f"Job Iniziato: {json_path.name} | Topic: {topic_id} | SubTopic: {sub_topic_id}")
-    
+
     await process_single_file_async(
         topic_id=topic_id, 
         sub_topic_id=sub_topic_id, 
@@ -442,14 +474,18 @@ async def process_single_job(payload: dict):
         root_folder=root_folder, 
         chunk_size=chunk_size, 
         chunk_overlap=chunk_overlap, 
-        parent_chunk_size=parent_size
+        parent_chunk_size=parent_size,
+        use_markdown_splitter=use_md_splitter
     )
+
+    
 async def on_message_received(message: aio_pika.IncomingMessage):
     """
     Gestisce il ciclo di vita del messaggio: Ack se ok, Reject (verso DLQ) se fallisce dopo i retry.
     """
     # ignore_processed=True ci permette di chiamare manualmente ack() o reject()
     async with message.process(ignore_processed=True):
+        payload = {}
         try:
             payload = json.loads(message.body.decode())
             
@@ -464,14 +500,30 @@ async def on_message_received(message: aio_pika.IncomingMessage):
             await message.reject(requeue=False)
             
         except Exception as e:
-            # Se siamo qui, i 5 tentativi di tenacity sono falliti
+            # Se siamo qui, tutti i 5 tentativi di Tenacity sono falliti.
             log.error(f"Fallimento definitivo dopo i retry. Spostamento in DLQ (rag_dlx). Errore: {e}", exc_info=True)
-            # requeue=False previene il loop infinito e innesca la Dead Letter Policy
+            
+            rel_path_str = payload.get("json_manifest_path")
+            if rel_path_str:
+                rel_path = pathlib.Path(rel_path_str)
+                topic_id = rel_path.parent.parent.name
+                sub_topic_id = rel_path.parent.name
+                root_folder = WATCH_FOLDER / topic_id / sub_topic_id
+                json_path = WATCH_FOLDER / rel_path
+                
+                # Sposta JSON e il file di testo associato
+                await finalize_file_move(json_path, root_folder, topic_id, sub_topic_id, error_msg=str(e))
+                for ext in [".md", ".txt"]:
+                    text_path = json_path.with_suffix(ext)
+                    if text_path.exists():
+                        await finalize_file_move(text_path, root_folder, topic_id, sub_topic_id, error_msg=str(e))
+            
+            # Invio in Dead Letter Queue per ispezione
             await message.reject(requeue=False)
 
 async def main_worker():
     """Worker principale per RabbitMQ."""
-    rabbitmq_host = os.environ.get("RABBITMQ_HOST", "rabbitmq-service.rag.svc.cluster.local")
+    rabbitmq_host = RABBITMQ_HOST
     log.info(f"Ingestion Worker Start - Connessione a: amqp://{rabbitmq_host}/")
     
     try:
@@ -482,15 +534,11 @@ async def main_worker():
             
             # QoS prefeth per bilanciare memoria e rate limits
             await channel.set_qos(prefetch_count=3)
-            
-            queue_in = await channel.declare_queue(
-                "da-indicizzare", 
-                durable=True,
-                arguments={
-                    "x-dead-letter-exchange": "rag_dlx",
-                    "x-dead-letter-routing-key": "da-indicizzare" 
-                }
-            )
+
+            channel = await connection.channel()
+            await channel.set_qos(prefetch_count=3)
+
+            queue_in = await channel.get_queue("da-indicizzare") 
             
             log.info("✓ Worker Ingestione attivo. In ascolto su 'da-indicizzare'.")
             
