@@ -8,6 +8,8 @@ You MUST output exclusively a valid JSON object with three keys:
 - "search_queries" (array of strings): 
     - If the query is SPECIFIC, this array should contain ONLY the "standalone_query".
     - If the query is BROAD or aggregative (e.g., "How did lifestyle change?", "Summarize the events"), generate 2 or 3 specific, targeted sub-queries exploring different facets of the topic (e.g., "daily habits", "hobbies", "transportation") to maximize document retrieval.
+    - If the query is SPECIFIC but contains a geographical macro-area (e.g., "Versilia", "Garfagnana", "Mediavalle", "Provincia di Lucca", "Provincia"), you MUST decompose it. For each specific municipality or town belonging to that area (e.g., Viareggio, Pietrasanta, Seravezza, ecc), generate a dedicated, ATOMIC sub-query combining the user's core request with ONLY ONE town name at a time.
+    - CRITICAL RULE: DO NOT cluster or concatenate multiple town names inside the same query string. Every town must have its own separate string in the array to prevent retrieval dilution.
 - "keywords" (array of strings): 1 to 5 highly significant, unique keywords extracted from the query (excluding stop words) optimized for exact-match text search. Include proper nouns.
 Respond with ONLY the JSON object.
 </instructions>
@@ -26,6 +28,54 @@ Output:
     "Mario Rossi mezzi di trasporto"
   ],
   "keywords": ["Mario", "Rossi", "automobile"]
+}}
+</example>
+<example>
+<chat_history></chat_history>
+<last_query>Quali sono i progetti PNRR per le scuole in Versilia?</last_query>
+Output:
+{{
+  "standalone_query": "Quali sono i progetti PNRR per le scuole nei comuni della Versilia?",
+  "search_queries": [
+    "progetti PNRR edilizia scolastica Viareggio",
+    "progetti PNRR edilizia scolastica Pietrasanta",
+    "progetti PNRR edilizia scolastica Forte dei Marmi",
+    "progetti PNRR edilizia scolastica Seravezza",
+    "progetti PNRR edilizia scolastica Camaiore"
+  ],
+  "keywords": ["PNRR", "scuole", "Versilia", "Viareggio", "Seravezza"]
+}}
+</example>
+<example>
+<chat_history></chat_history>
+<last_query>Quali sono i progetti PNRR per le scuole della Provincia di Lucca?</last_query>
+Output:
+{{
+  "standalone_query": "Quali sono i progetti PNRR per le scuole nei comuni della Versilia?",
+  "search_queries": [
+    "progetti PNRR edilizia scolastica Viareggio",
+    "progetti PNRR edilizia scolastica Pietrasanta",
+    "progetti PNRR edilizia scolastica Forte dei Marmi",
+    "progetti PNRR edilizia scolastica Seravezza",
+    "progetti PNRR edilizia scolastica Camaiore"
+  ],
+  "keywords": ["PNRR", "scuole", "Versilia", "Viareggio", "Seravezza"]
+}}
+</example>
+<example>
+<chat_history></chat_history>
+<last_query>Quali sono i progetti PNRR per le scuole della Provincia di Lucca?</last_query>
+Output:
+{{
+  "standalone_query": "Quali sono i progetti PNRR per le scuole dell'intera Provincia di Lucca?",
+  "search_queries": [
+    "progetti PNRR edilizia scolastica Lucca",
+    "progetti PNRR edilizia scolastica Viareggio",
+    "progetti PNRR edilizia scolastica Pietrasanta",
+    "progetti PNRR edilizia scolastica Barga",
+    "progetti PNRR edilizia scolastica Seravezza"
+  ],
+  "keywords": ["PNRR", "scuole", "Lucca", "Viareggio", "Pietrasanta", "Barga", "Seravezza"]
 }}
 </example>
 </examples>

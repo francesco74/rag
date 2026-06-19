@@ -37,9 +37,14 @@ FORMATTING RULE FOR THE "answer" FIELD:
 LANGUAGE RULE: 
 You MUST detect the language used in the <query> and write the "answer" field exclusively in that same language.
 
+RULE FOR PARTIAL CONTEXT:
+If the <query> asks about multiple locations, entities, or items (e.g., multiple municipalities like Lucca, Capannori, Altopascio) and the <context> contains information ONLY for some of them:
+1. You MUST answer for the entities present in the context (e.g., provide details for Lucca).
+2. You MUST explicitly list the entities for which NO information was found in the text (e.g., state that no documents were found for Capannori and Altopascio).
+3. In this case, you MUST set "is_found" to true, because you are delivering a valid, partial factual answer based on the text.
+
 NEGATIVE RESPONSE:
-Only use this response if the answer is not in the context AND you cannot reasonably draft a helpful response using the Constructive Answering rule above.
-In this specific case, set "is_found" to false, and set "answer" EXACTLY to:
+Set "is_found" to false ONLY if the <context> contains absolutely zero relevant information for ANY of the items or locations requested in the query. In this specific case of total absence, set "answer" EXACTLY to:
 - English: <p>I could not find an answer in the provided documents.</p>
 - Italian: <p>Non sono riuscito a trovare la risposta nei documenti che ho analizzato.</p>
 

@@ -62,6 +62,7 @@ QDRANT_THRESHOLD = float(os.environ.get("QDRANT_THRESHOLD", 0.60))
 MAX_CONTEXT_CHARS = int(os.environ.get("MAX_CONTEXT_CHARS", 30000)) 
 
 MIN_PROB_THRESHOLD = float(os.environ.get("MIN_PROB_THRESHOLD", 0.02))
+PARENTS_PER_QUERY = int(os.environ.get("PARENTS_PER_QUERY", 4))
 
 MAX_AGE_SECONDS = 86400  # 24 hours
 MAX_MODEL_RETRIES = 2
@@ -335,6 +336,7 @@ def generate_answer(query, rich_context, topic_id):
             formatted_chunks.append(chunk)
             curr_len += len(chunk)
         else:
+            log.warning(f"Contesto limitato a causa della lunghezza: {curr_len}. The remaining {len(rich_context) - len(formatted_chunks)} is skipped.")
             break
     
     context_str = "".join(formatted_chunks)
@@ -513,7 +515,6 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
     log.debug(f"Search Queries: {search_queries} | Keywords: {keywords}")
     
     try:
-        fused_hits = {}
         must_conditions = [models.FieldCondition(key="topic_id", match=models.MatchValue(value=topic_id))]
         if selected_sub_topics:
             must_conditions.append(models.FieldCondition(key="sub_topic_id", match=models.MatchAny(any=selected_sub_topics)))
@@ -593,137 +594,229 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
                 return []
 
         # ==========================================================
-        # 2. ESECUZIONE PARALLELA 
+        # ESECUZIONE PARALLELA 
         # ==========================================================
-        with ThreadPoolExecutor(max_workers=min(10, len(vectors_list) + 1)) as executor:
-            futures = []
-            
-            # Lancio ricerca testuale
-            futures.append(executor.submit(safe_keyword_search))
-            
-            # Lancio ricerche vettoriali
-            for idx, vec in enumerate(vectors_list):
-                futures.append(executor.submit(safe_vector_search, vec, idx))
-                
-            # Aggregazione e De-duplicazione
-            for future in as_completed(futures):
-                try:
-                    hits = future.result()
-                    for hit in hits:
-                        if hit.id not in fused_hits: 
-                            fused_hits[hit.id] = hit
-                except Exception as e:
-                    log.error(f"Error resolving search future: {e}", exc_info=True)
-
-        candidates = list(fused_hits.values())
-        if not candidates: 
-            log.warning("Nessun Child Chunk trovato da nessuna delle query.")
-            return [], []
-            
-        log.info(f"Ricerca parallela completata. Trovati {len(candidates)} candidati unici (Child).")
-
-        # ==========================================================
-        # 3. RERANKING LOCALE (Con Graceful Degradation)
-        # ==========================================================
-        top_child_docs = []
+        hits_per_query = [[] for _ in search_queries]
         
-        try:
-            reranker = get_reranker()
-            if reranker and candidates:
-                log.debug("Inizio Reranking locale...")
-                # Usa la query originale per valutare la coerenza
-                eval_query = search_queries[0] 
-                docs_content = [c.payload.get("content", "")[:RERANK_TRUNCATE] for c in candidates]
-                
-                reranked_results = reranker.rerank(eval_query, docs_content)
-                reranked_results.sort(key=lambda x: x.score, reverse=True)
-
-                for res in reranked_results[:RERANK_SIZE]:
-                    prob = safe_sigmoid(res.score)
-                    if prob >= MIN_PROB_THRESHOLD or len(top_child_docs) < 2:
-                        top_child_docs.append(candidates[res.index])
-                    else:
-                        break # Soglia minima non raggiunta, interrompiamo (sono già ordinati)
-                
-                log.info(f"Reranking completato. Sopravvissuti {len(top_child_docs)} Child validi.")
-            else:
-                log.warning("Reranker non disponibile. Fallback sui risultati grezzi di Qdrant.")
-                # Ordinamento per score Qdrant (approssimativo) e taglio a RERANK_SIZE
-                candidates.sort(key=lambda x: getattr(x, 'score', 0), reverse=True)
-                top_child_docs = candidates[:RERANK_SIZE]
-                
-        except Exception as e:
-            log.error(f"Errore fatale durante il Reranking: {e}. Fallback sui risultati grezzi.", exc_info=True)
-            top_child_docs = candidates[:RERANK_SIZE]
+        with ThreadPoolExecutor(max_workers=min(10, len(vectors_list) + 1)) as executor:
+            future_kw = executor.submit(safe_keyword_search)
+            future_map = {
+                executor.submit(safe_vector_search, vec, idx): idx
+                for idx, vec in enumerate(vectors_list)
+            }
+            keyword_hits = future_kw.result()
+            for future, idx in future_map.items():
+                try:
+                    hits_per_query[idx] = future.result()
+                except Exception as e:
+                    log.error(f"Error resolving vector search future #{idx}: {e}")
+ 
+        # Keyword hits come candidati extra della query principale
+        if keyword_hits:
+            kw_ids = {h.id for h in hits_per_query[0]}
+            hits_per_query[0] = hits_per_query[0] + [h for h in keyword_hits if h.id not in kw_ids]
 
         # ==========================================================
-        # 4. RECUPERO PARENT DOCUMENTS
+        # 3. RERANK PER-QUERY — salva top_chunks per riuso nella redistribuzione
         # ==========================================================
-        try:
-            # Estrazione sicura dei parent_id
-            parent_ids = list({
-                doc.payload.get("parent_id") 
-                for doc in top_child_docs 
-                if doc.payload and doc.payload.get("parent_id")
-            })
-
-            if not parent_ids:
-                log.error("I Child document non contengono alcun 'parent_id' nel payload.")
-                return [], []
+        reranker = get_reranker()
+        n_queries = len(search_queries)
+        top_chunks_per_query: list[list] = []
+ 
+        for q_idx, (query_str, candidates) in enumerate(zip(search_queries, hits_per_query)):
+            if not candidates:
+                log.debug(f"Sottoquery #{q_idx} '{query_str[:40]}': nessun candidato.")
+                top_chunks_per_query.append([])
+                continue
+ 
+            # De-duplica i chunk per id
+            seen_chunk_ids: dict = {}
+            for c in candidates:
+                if c.id not in seen_chunk_ids:
+                    seen_chunk_ids[c.id] = c
+            unique_candidates = list(seen_chunk_ids.values())
+ 
+            # Rerank con la query specifica di questa sottoquery
+            if reranker:
+                docs_content = [
+                    c.payload.get("content", "")[:RERANK_TRUNCATE]
+                    for c in unique_candidates
+                ]
+                try:
+                    reranked = reranker.rerank(query_str, docs_content)
+                    reranked.sort(key=lambda x: x.score, reverse=True)
+                    top_chunks = []
+                    for res in reranked[:RERANK_SIZE]:
+                        prob = safe_sigmoid(res.score)
+                        if prob >= MIN_PROB_THRESHOLD or len(top_chunks) < 2:
+                            top_chunks.append(unique_candidates[res.index])
+                        else:
+                            break
+                except Exception as e:
+                    log.error(f"Reranker failed for query #{q_idx}: {e}. Fallback.")
+                    unique_candidates.sort(key=lambda x: getattr(x, 'score', 0), reverse=True)
+                    top_chunks = unique_candidates[:RERANK_SIZE]
             else:
-                log.debug("Trovati i seguenti 'parent_id' nel payload: " + ", ".join(map(str, parent_ids)))
+                unique_candidates.sort(key=lambda x: getattr(x, 'score', 0), reverse=True)
+                top_chunks = unique_candidates[:RERANK_SIZE]
+ 
+            top_chunks_per_query.append(top_chunks)
+            log.debug(f"Sottoquery #{q_idx} '{query_str[:40]}': {len(unique_candidates)} candidati → {len(top_chunks)} chunk dopo rerank.")
 
-            log.debug(f"parent_id individuati: {parent_ids}. Inizio retrieval dei parent dal database...")
-            parent_records = []
-            conn = get_db_connection()
-            if not conn:
-                log.error("Connessione al database MySQL fallita durante il retrieval dei parent.")
-                return [], []
-            
-            try:
-                # Creazione di una query con numero variabile di segnaposto (%s) per prevenire SQL Injection
-                format_strings = ','.join(['%s'] * len(parent_ids))
-                query = f"""
-                    SELECT id, topic_id, sub_topic_id, source, content, metadata 
-                    FROM parent_documents 
-                    WHERE id IN ({format_strings})
-                """
 
-                with conn.cursor(dictionary=True) as cursor:
-                    cursor.execute(query, tuple(parent_ids))
-                    parent_records = cursor.fetchall()
-                        
-            finally:
-                conn.close()
-
-        except Exception as e:
-            log.error(f"Errore recupero Parent Documents: {e}", exc_info=True)
+        # ==========================================================
+        # 4. QUOTA GARANTITA PER SOTTOQUERY
+        #
+        # Ogni sottoquery contribuisce al massimo PARENTS_PER_QUERY
+        # parent distinti. Si scende la lista rerankkata e si prendono
+        # i primi PARENTS_PER_QUERY parent_id unici incontrati.
+        # I parent già selezionati da sottoquery precedenti non vengono
+        # ricontati: ogni slot è un documento NUOVO nel pool finale.
+        # ==========================================================
+        quota_per_query: list[list[str]] = []
+        already_selected: set[str] = set()
+ 
+        for q_idx, (query_str, top_chunks) in enumerate(zip(search_queries, top_chunks_per_query)):
+            selected_for_query: list[str] = []
+            seen_parents_this_query: set[str] = set()
+ 
+            for chunk in top_chunks:
+                pid = chunk.payload.get("parent_id") if chunk.payload else None
+                if not pid or pid in seen_parents_this_query:
+                    continue
+                seen_parents_this_query.add(pid)
+                if pid not in already_selected:
+                    already_selected.add(pid)
+                    selected_for_query.append(pid)
+                    if len(selected_for_query) >= PARENTS_PER_QUERY:
+                        break
+ 
+            quota_per_query.append(selected_for_query)
+            log.info(
+                f"Sottoquery #{q_idx} '{query_str[:40]}': "
+                f"{len(top_chunks)} chunk → {len(selected_for_query)} parent in quota."
+            )
+ 
+        # ==========================================================
+        # 5. REDISTRIBUZIONE SLOT LIBERI
+        #
+        # Se alcune sottoquery hanno trovato 0 risultati (o meno di
+        # PARENTS_PER_QUERY), i loro slot vengono offerti alle
+        # sottoquery con più materiale disponibile, in round-robin.
+        # Questo evita di sprecare budget quando, ad esempio, 4 comuni
+        # su 5 non hanno documenti e uno solo ha molti risultati.
+        # ==========================================================
+        total_budget = PARENTS_PER_QUERY * n_queries
+        slots_free = total_budget - len(already_selected)
+ 
+        if slots_free > 0:
+            log.info(f"Redistribuzione: {slots_free} slot liberi su {total_budget} totali.")
+ 
+            # Riserve per ogni query: parent validi oltre la quota, nell'ordine del reranker
+            reserve_per_query: list[list[str]] = []
+            for top_chunks in top_chunks_per_query:
+                reserve: list[str] = []
+                seen_parents: set[str] = set()
+                for chunk in top_chunks:
+                    pid = chunk.payload.get("parent_id") if chunk.payload else None
+                    if not pid or pid in seen_parents:
+                        continue
+                    seen_parents.add(pid)
+                    if pid not in already_selected:
+                        reserve.append(pid)
+                reserve_per_query.append(reserve)
+ 
+            # Round-robin tra le sottoquery finché slot esauriti o riserve vuote
+            redistributed = 0
+            changed = True
+            while slots_free > 0 and changed:
+                changed = False
+                for q_idx, reserve in enumerate(reserve_per_query):
+                    if slots_free == 0:
+                        break
+                    if not reserve:
+                        continue
+                    pid = reserve.pop(0)
+                    if pid in already_selected:
+                        continue
+                    quota_per_query[q_idx].append(pid)
+                    already_selected.add(pid)
+                    slots_free -= 1
+                    redistributed += 1
+                    changed = True
+ 
+            log.info(f"Redistribuzione completata: {redistributed} parent aggiunti.")
+ 
+        # ==========================================================
+        # 6. POOL FINALE — ordine FIFO per sottoquery
+        # ==========================================================
+        final_parent_ids_ordered: list[str] = []
+        seen_final: set[str] = set()
+ 
+        for selected_pids in quota_per_query:
+            for pid in selected_pids:
+                if pid not in seen_final:
+                    final_parent_ids_ordered.append(pid)
+                    seen_final.add(pid)
+ 
+        if not final_parent_ids_ordered:
+            log.warning("Nessun parent_id estratto da nessuna sottoquery.")
             return [], []
-
+ 
+        log.info(
+            f"Pool finale: {len(final_parent_ids_ordered)} parent distinti "
+            f"(budget={PARENTS_PER_QUERY}×{n_queries}={total_budget})."
+        )
+ 
+ 
         # ==========================================================
-        # 5. FORMATTAZIONE OUTPUT
+        # 7. RECUPERO PARENT DOCUMENTS (dal DB)
+        # ==========================================================
+        parent_records = []
+        conn = get_db_connection()
+        if not conn:
+            return [], []
+ 
+        try:
+            format_strings = ','.join(['%s'] * len(final_parent_ids_ordered))
+            sql = f"""
+                SELECT id, topic_id, sub_topic_id, source, content, metadata
+                FROM parent_documents
+                WHERE id IN ({format_strings})
+            """
+            with conn.cursor(dictionary=True) as cursor:
+                cursor.execute(sql, tuple(final_parent_ids_ordered))
+                parent_records = cursor.fetchall()
+        finally:
+            conn.close()
+ 
+        # Riordina i parent nell'ordine in cui sono stati aggiunti
+        # (rispetta la priorità per sottoquery)
+        pid_to_record = {r['id']: r for r in parent_records}
+        parent_records = [pid_to_record[pid] for pid in final_parent_ids_ordered if pid in pid_to_record]
+ 
+ 
+        # ==========================================================
+        # 8. FORMATTAZIONE OUTPUT
         # ==========================================================
         rich_context = []
         unique_sources_map = {}
-
+ 
         for p_doc in parent_records:
-            # Peschiamo direttamente dal dizionario MySQL senza passare per 'payload'
             source = p_doc.get("source", "Fonte_Sconosciuta")
             sub_topic_id = p_doc.get("sub_topic_id", "")
             content = p_doc.get("content", "").strip()
-            metadata = p_doc.get("metadata", {})
-            
+ 
             if content:
                 rich_context.append({"content": content, "source": source})
-                
                 if source not in unique_sources_map:
                     unique_sources_map[source] = {"file": source, "sub_topic": sub_topic_id}
-
-        log.info(f"=== Retrieval terminata con successo. Parent passati al generatore: {len(rich_context)} ===")
+ 
+        log.info(f"=== Retrieval completata. Parent al generatore: {len(rich_context)} ===")
         return rich_context, list(unique_sources_map.values())
-        
+ 
     except Exception as e:
-        log.critical(f"Errore critico imprevisto nel Retrieval: {e}", exc_info=True)
+        log.critical(f"Errore critico nel Retrieval: {e}", exc_info=True)
         return [], []
 
 
@@ -884,12 +977,16 @@ def process_rag_query(self, query, history, topic_id, selected_sub_topics=None, 
             answer = "<p>Non sono riuscito a trovare la risposta nei documenti che ho analizzato.</p>"
             log.debug(f"[{task_id}] Context empty. Breaking loop.")
             break
+        else:
+            log.debug(f"Contesto da passare alla generazione: {context[:1500]}")
 
         # A. Generazione (JSON Mode)
         try:
             gen_result = generate_answer(standalone_query, context, topic_id)
             is_found = gen_result.get("is_found", False)
             answer = gen_result.get("answer", "")
+
+            log.debug(f"Risposta generata: {answer[:500]}... | is_found: {is_found}")
         except Exception as e:
             log.error(f"[{task_id}] Answer generation API failed: {e}", exc_info=True)
             return {"error": "Generation Failed", "message": "Impossibile elaborare la risposta.", "status": "failed"}
