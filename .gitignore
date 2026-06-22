@@ -2,7 +2,7 @@
 !.gitignore
 !ingestion/
 !saga_extract/
-!backend/
+!api/
 !web/greenlees/
 !web/greenlees/src/
 !web/greenlees/src/lib/
@@ -18,7 +18,7 @@
 !direct/
 
 !ingestion/**
-!backend/**
+!api/**
 !saga_extract/**
 !misc/**
 !web/greenlees/src/web/**
@@ -44,7 +44,7 @@
 !README-TECH.MD
 !TECH.MD
 
-backend/model_cache/
+api/model_cache/
 ingestion/src/error/
 ingestion/src/watch/
 ingestion/src/processed/

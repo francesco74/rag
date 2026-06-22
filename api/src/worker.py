@@ -7,17 +7,18 @@ from celery.signals import worker_process_init, worker_shutdown
 from celery.schedules import crontab
 from mysql.connector import pooling
 from qdrant_client import QdrantClient, models
-import google.generativeai as genai
+import google.generativeai as genai  # embedding only
 import math
 import json, re
 import hashlib
-
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from dotenv import load_dotenv
 
 # Use the optimized reranker
 from reranker import ONNXReranker, RerankResult
+
+# Provider-agnostic LLM adapter
+from llm_provider import init_llm_provider, get_llm_provider
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tenacity import (
@@ -67,13 +68,13 @@ PARENTS_PER_QUERY = int(os.environ.get("PARENTS_PER_QUERY", 4))
 MAX_AGE_SECONDS = 86400  # 24 hours
 MAX_MODEL_RETRIES = 2
 
-# Gemini Retry Configuration
-GEMINI_RETRY = retry(
+# Embedding retry (Gemini only — embedding stays on Google)
+GEMINI_EMBEDDING_RETRY = retry(
     retry=retry_if_exception_type((ResourceExhausted, ServiceUnavailable)),
     wait=wait_random_exponential(multiplier=2, min=4, max=60),
     stop=stop_after_attempt(6),
     before_sleep=lambda retry_state: log.warning(
-        f"Rate limit hit. Retrying in {retry_state.next_action.sleep}s..."
+        f"Embedding rate limit hit. Retrying in {retry_state.next_action.sleep}s..."
     )
 )
 
@@ -106,10 +107,9 @@ qdrant_client = None
 _RERANKER_INSTANCE = None
 
 EMBEDDING_MODEL = "gemini-embedding-001"
-TRANSFORM_MODEL = None
-OCR_MODEL_NAME = None
-GENERATOR_MODEL = None
-TRANSFORM_MODEL_NAME = None
+QUERY_REWRITER_MODEL_NAME = None
+ANSWER_GENERATOR_MODEL_NAME = None
+GRADER_MODEL_NAME = None
 
 @worker_process_init.connect
 def init_worker_process(**kwargs):
@@ -117,7 +117,7 @@ def init_worker_process(**kwargs):
     Initializes network connections and models ONLY after Celery forks the process.
     Prevents Socket Corruption and BrokenPipeErrors.
     """
-    global db_pool, qdrant_client, TRANSFORM_MODEL, GENERATOR_MODEL,  OCR_MODEL_NAME, TRANSFORM_MODEL_NAME
+    global db_pool, qdrant_client, QUERY_REWRITER_MODEL_NAME, ANSWER_GENERATOR_MODEL_NAME, GRADER_MODEL_NAME
     log.info("Initializing Worker Resources (Post-Fork)...")
 
     try:
@@ -131,16 +131,21 @@ def init_worker_process(**kwargs):
             database=os.environ.get("DB_NAME", "rag_system")
         )
         qdrant_client = QdrantClient(
-            host=os.environ.get("QDRANT_HOST", "localhost"), 
+            host=os.environ.get("QDRANT_HOST", "localhost"),
             port=int(os.environ.get("QDRANT_PORT", 6333))
         )
+
+        # Embedding rimane su Gemini — configura solo la chiave
         genai.configure(api_key=os.environ.get("GOOGLE_API_KEY"))
-        
-        # Instantiate models here
-        OCR_MODEL_NAME = os.environ.get("OCR_MODEL_NAME", "gemini-3.5-flash")
-        TRANSFORM_MODEL_NAME = os.environ.get("TRANSFORM_MODEL_NAME", "gemini-3.1-flash-lite")
-        TRANSFORM_MODEL = genai.GenerativeModel(TRANSFORM_MODEL_NAME)
-        GENERATOR_MODEL = genai.GenerativeModel(OCR_MODEL_NAME)
+
+        # Model names (usati come stringhe, passati al provider)
+        QUERY_REWRITER_MODEL_NAME   = os.environ.get("QUERY_REWRITER_MODEL_NAME",   "gemini-3.1-flash-lite")
+        ANSWER_GENERATOR_MODEL_NAME = os.environ.get("ANSWER_GENERATOR_MODEL_NAME", "gemini-3.5-flash")
+        GRADER_MODEL_NAME           = os.environ.get("GRADER_MODEL_NAME",           "gemini-3.1-flash-lite")
+
+        # Inizializza il provider LLM (legge LLM_PROVIDER dall'env)
+        init_llm_provider()
+
         log.info("✓ Resources successfully initialized for this process.")
     except Exception as e:
         log.critical(f"✗ Failed to initialize worker resources: {e}")
@@ -236,14 +241,13 @@ def load_prompt_template(filename):
 
 
 # ==============================================================================
-# 5. GEMINI API FUNCTIONS (With Retry Logic)
+# 5. LLM API FUNCTIONS
 # ==============================================================================
 
-@GEMINI_RETRY
+@GEMINI_EMBEDDING_RETRY
 def embed_query(query):
-    """Generate embedding for a query with retry logic."""
+    """Generate embedding for a single query (Gemini only)."""
     log.debug(f"Embedding query: '{query[:50]}...'")
-    
     result = genai.embed_content(
         model=EMBEDDING_MODEL,
         content=query,
@@ -253,128 +257,116 @@ def embed_query(query):
     return result['embedding']
 
 
-@GEMINI_RETRY
-def transform_query(history, query, task_id="UNKNOWN"):
-    """Transform conversational query into standalone query via JSON Mode with full tracing."""
-    log.info(f"[{task_id}] [REWRITER] Avvio analisi query: '{query}'")
-    
-    if not history:
-        log.debug(f"[{task_id}] [REWRITER] Nessuna history fornita.")
-        history_str = ""
-    else:
-        history_str = "\n".join([
-            f"{msg.get('role', 'user')}: {msg.get('text', '')}" 
-            for msg in history
-        ])
-        log.debug(f"[{task_id}] [REWRITER] History iniettata (elementi: {len(history)})")
-    
-    prompt = load_prompt_template("query_rewriter").format(
-        history_str=history_str, 
-        query=query
-    )
-    
-    try:
-        log.debug(f"[{task_id}] [REWRITER] Chiamata a Gemini API in corso...")
-        
-        response = TRANSFORM_MODEL.generate_content(
-            prompt,
-            generation_config=genai.types.GenerationConfig(
-                response_mime_type="application/json",
-                temperature=0.1
-            )
-        )
-        
-        # Logghiamo l'intero testo restituito da Gemini PRIMA di parsarlo
-        log.debug(f"[{task_id}] [REWRITER] Risposta grezza Gemini:\n{response.text}")
-        
-        # Uso del parser robusto passandogli il task_id
-        data = safe_json_parse(response.text, task_id)
-        
-        standalone = data.get("standalone_query", query)
-        searches = data.get("search_queries", [query])
-        keywords = data.get("keywords", [])
-        
-        log.info(f"[{task_id}] [REWRITER] ✓ Query processata. Standalone: '{standalone}' | Facets: {len(searches)} | Keywords: {len(keywords)}")
-        
-        return {
-            "standalone_query": standalone,
-            "search_queries": searches,
-            "keywords": keywords
-        }
-        
-    except Exception as e:
-        # Se cade qui, o l'API è down o safe_json_parse ha sollevato il ValueError estremo
-        log.warning(f"[{task_id}] [REWRITER] ✗ Fallimento critico: {e}. Attivazione fallback (query raw).", exc_info=True)
-        return {
-            "standalone_query": query,
-            "search_queries": [query],
-            "keywords": []
-        }
-
-@GEMINI_RETRY
+@GEMINI_EMBEDDING_RETRY
 def embed_queries_batch(queries_list):
-    """Generate embeddings for MULTIPLE queries in a single API call."""
+    """Generate embeddings for multiple queries in a single API call (Gemini only)."""
     result = genai.embed_content(
         model=EMBEDDING_MODEL,
         content=queries_list,
         task_type="RETRIEVAL_QUERY",
         output_dimensionality=768
     )
-    # result['embedding'] will be a list of vectors if input is a list
     return result['embedding'] if isinstance(queries_list, list) else [result['embedding']]
 
 
-@GEMINI_RETRY
+def transform_query(history, query, task_id="UNKNOWN"):
+    """Transform conversational query into standalone query + search facets + keywords."""
+    log.info(f"[{task_id}] [REWRITER] Avvio analisi query: '{query}'")
+
+    if not history:
+        log.debug(f"[{task_id}] [REWRITER] Nessuna history fornita.")
+        history_str = ""
+    else:
+        history_str = "\n".join([
+            f"{msg.get('role', 'user')}: {msg.get('text', '')}"
+            for msg in history
+        ])
+        log.debug(f"[{task_id}] [REWRITER] History iniettata (elementi: {len(history)})")
+
+    prompt = load_prompt_template("query_rewriter").format(
+        history_str=history_str,
+        query=query
+    )
+
+    try:
+        log.debug(f"[{task_id}] [REWRITER] Chiamata al provider LLM in corso...")
+        raw = get_llm_provider().generate_json(
+            QUERY_REWRITER_MODEL_NAME, prompt, temperature=0.1
+        )
+        log.debug(f"[{task_id}] [REWRITER] Risposta grezza:\n{raw}")
+
+        data = safe_json_parse(raw, task_id)
+        standalone = data.get("standalone_query", query)
+        searches   = data.get("search_queries", [query])
+        keywords   = data.get("keywords", [])
+
+        log.info(
+            f"[{task_id}] [REWRITER] ✓ Query processata. "
+            f"Standalone: '{standalone}' | Facets: {len(searches)} | Keywords: {len(keywords)}"
+        )
+        return {"standalone_query": standalone, "search_queries": searches, "keywords": keywords}
+
+    except Exception as e:
+        log.warning(
+            f"[{task_id}] [REWRITER] ✗ Fallimento critico: {e}. Attivazione fallback (query raw).",
+            exc_info=True
+        )
+        return {"standalone_query": query, "search_queries": [query], "keywords": []}
+
+
 def generate_answer(query, rich_context, topic_id):
     """Generate final answer using retrieved context, returning a structured dict."""
     formatted_chunks = []
     curr_len = 0
-    
+
     for item in rich_context:
         chunk = f"[Source: {item['source']}]\n{item['content']}\n\n"
         if curr_len + len(chunk) < MAX_CONTEXT_CHARS:
             formatted_chunks.append(chunk)
             curr_len += len(chunk)
         else:
-            log.warning(f"Contesto limitato a causa della lunghezza: {curr_len}. The remaining {len(rich_context) - len(formatted_chunks)} is skipped.")
+            log.warning(
+                f"Contesto limitato a {curr_len} chars. "
+                f"{len(rich_context) - len(formatted_chunks)} parent scartati."
+            )
             break
-    
-    context_str = "".join(formatted_chunks)
-    prompt_file = get_topic_prompt(topic_id)
-    
-    prompt_tmpl = load_prompt_template(prompt_file)
-    prompt = prompt_tmpl.format(context_str=context_str, query=query)
-    
+
+    context_str  = "".join(formatted_chunks)
+    prompt_file  = get_topic_prompt(topic_id)
+    prompt_tmpl  = load_prompt_template(prompt_file)
+    prompt       = prompt_tmpl.format(context_str=context_str, query=query)
+
     log.info(f"Generating structured answer for topic '{topic_id}'")
     log.debug(f"Context size: {len(context_str)} chars")
-    
-    # 1. Chiediamo ESPLICITAMENTE il JSON tramite la configurazione
-    response = GENERATOR_MODEL.generate_content(
-        prompt,
-        generation_config=genai.types.GenerationConfig(
-            response_mime_type="application/json"
-        )
-    )
 
-    log.debug(f"Raw response from Gemini:\n{response.text[:500]}...")  # Log first 500 chars
-    
-    # 2. Parsing sicuro del JSON
+    raw = get_llm_provider().generate_json(ANSWER_GENERATOR_MODEL_NAME, prompt)
+    log.debug(f"Raw response:\n{raw[:500]}...")
+
     try:
-        raw_text = response.text.strip()
-        result_data = json.loads(raw_text)
-        
-        # Garantiamo che restituisca sempre le chiavi attese
+        result_data = json.loads(raw.strip())
         return {
             "is_found": bool(result_data.get("is_found", True)),
-            "answer": str(result_data.get("answer", ""))
+            "answer":   str(result_data.get("answer", ""))
         }
     except json.JSONDecodeError as e:
-        log.error(f"Generazione JSON fallita: {e}. Output grezzo: {response.text}")
-        # Fallback difensivo in caso di errore del modello
-        return {
-            "is_found": True,
-            "answer": response.text.strip()
-        }
+        log.error(f"Generazione JSON fallita: {e}. Output grezzo: {raw}")
+        return {"is_found": True, "answer": raw.strip()}
+
+
+def grade_answer(query, context_snippet, answer):
+    """Ask the grader model whether the answer is satisfactory. Returns True/False."""
+    grader_tmpl   = load_prompt_template("grader")
+    grader_prompt = grader_tmpl.format(
+        query=query,
+        context_snippet=context_snippet,
+        answer=answer
+    )
+    raw = get_llm_provider().generate_text(
+        GRADER_MODEL_NAME, grader_prompt, temperature=0.0, max_tokens=5
+    )
+    result = raw.strip().upper()
+    log.info(f"Grader response: '{result}'")
+    return result.startswith("YES")
 
 
 # ==============================================================================
@@ -831,9 +823,6 @@ def get_reranker():
             log.info("Initializing ONNX Reranker (Lazy Load)...")
             num_threads = os.cpu_count() or 4
 
-            # CRITICAL FIX 3: num_threads=1
-            # We want the WORKER to be the unit of parallelism, not the matrix math.
-            # This prevents 32 threads fighting for resources inside one worker.
             _RERANKER_INSTANCE = ONNXReranker(
                 model_folder=ONNX_MODEL_CACHE_PATH,
                 batch_size=RERANK_BATCH_SIZE,
@@ -1000,16 +989,7 @@ def process_rag_query(self, query, history, topic_id, selected_sub_topics=None, 
             # C. Grader LLM
             try:
                 context_snippet = context if isinstance(context, str) else str(context)
-                grader_tmpl = load_prompt_template("grader")
-                grader_prompt = grader_tmpl.format(query=standalone_query, context_snippet=context_snippet, answer=answer)
-                
-                grade_response = TRANSFORM_MODEL.generate_content(
-                    grader_prompt,
-                    generation_config=genai.types.GenerationConfig(temperature=0.0, max_output_tokens=5)
-                ).text.strip().upper()
-                
-                log.info(f"[{task_id}] Grader response: '{grade_response}'")
-                is_satisfactory = grade_response.startswith("YES")
+                is_satisfactory = grade_answer(standalone_query, context_snippet, answer)
                 
             except Exception as e:
                 log.error(f"[{task_id}] Grader LLM failed (non-blocking): {e}. Defaulting to YES.")
@@ -1095,4 +1075,3 @@ def cleanup_worker(**kwargs):
     if qdrant_client:
         qdrant_client.close()
         log.info("Qdrant client closed.")
-
