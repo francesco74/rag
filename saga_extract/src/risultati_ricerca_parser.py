@@ -1,6 +1,4 @@
 from __future__ import annotations
-
-import os
 import html
 import logging
 import xml.etree.ElementTree as ET
@@ -9,9 +7,9 @@ from config import settings
 from soap_ricerca_builder import SoapDocWSRicercheBuilder, DocWSRicercheClient
 from ricerca_filtri import RicercaFiltri
 
-log_level_str = os.environ.get("LOG_LEVEL", "INFO").upper()
+# Usa la validazione di livello globale ereditata dal config unificato
 logging.basicConfig(
-    level=getattr(logging, log_level_str, logging.INFO),
+    level=getattr(logging, settings.log_level, logging.INFO),
     format='%(asctime)s - PARSER - %(levelname)s - %(message)s',
     force=True
 )
@@ -98,7 +96,7 @@ def run_search(filtri: RicercaFiltri, dry_run: bool = False) -> ParsedRicercaRis
     try:
         client = DocWSRicercheClient(
             endpoint_url=settings.docws_ricerca_endpoint,
-            cid=settings.docws_cid,
+            cid=settings.ws_username,
             timeout=settings.http_timeout_seconds,
             verify_tls=settings.verify_tls,
         )
