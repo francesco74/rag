@@ -64,37 +64,34 @@ Questo modulo assicura che qualsiasi formato di input venga convertito in un for
 
 
 
-              ┌──────────────────────┐
-              │ Ricezione file .json │
-              └──────────┬───────────┘
-                         │
-                         ▼
-             [ Tipo di File Allegato? ]
-            /            │             \
-     (PDF) /             │ (.txt/.md)   \ (Immagine)
-          ▼              ▼               ▼
-┌─────────────────┐ ┌──────────┐ ┌───────────────┐
-│Lettura Pagine   │ │ Lettura  │ │  Gemini OCR   │
-│con PyMuPDF      │ │ Diretta  │ │  (Markdown)   │
-└────────┬────────┘ └────┬─────┘ └───────┬───────┘
-         │               │               │
-  [Densità Testo?]       │               │
- /                \      │               │
-/ <50 crt.         \>=50 │               │
-
-
-
-▼                    ▼    │               │
-┌──────────────┐ ┌──────────┐│               │
-│  Gemini OCR  │ │PyMuPDF4LL││               │
-│(con fallback)│ │Markdown  ││               │
-└──────┬───────┘ └────┬─────┘│               │
-│              │      │               │
-▼              ▼      ▼               ▼
-┌────────────────────────────────────────┐
-│  Salvataggio .md + .json in data/watch │
-│    Notifica coda "da-indicizzare"      │
-└────────────────────────────────────────┘
+                ┌──────────────────────┐
+                │ Ricezione file .json │
+                └──────────┬───────────┘
+                          │
+                          ▼
+              [ Tipo di File Allegato? ]
+              /            │             \
+      (PDF) /             │ (.txt/.md)   \ (Immagine)
+            ▼              ▼               ▼
+  ┌─────────────────┐     ┌──────────┐ ┌───────────────┐
+  │Lettura Pagine   │     │ Lettura  │ │  Gemini OCR   │
+  │con PyMuPDF      │     │ Diretta  │ │  (Markdown)   │
+  └────────┬────────┘     └────┬─────┘ └───────┬───────┘
+           │                   │               │
+      [Densità Testo?]         │               │
+      /                 \      │               │
+    / <50 crt.           \>=50 │               │
+  ▼                   ▼        │               │
+┌──────────────┐ ┌──────────┐  │               │
+│  Gemini OCR  │ │PyMuPDF4LL│  │               │
+│(con fallback)│ │Markdown  │  │               │
+└──────┬───────┘ └────┬─────┘  │               │
+       │              │        │               │
+       ▼              ▼        ▼               ▼
+┌──────────────────────────────────────────────┐
+│     Salvataggio .md + .json in data/watch    │
+│       Notifica coda "da-indicizzare"         │
+└──────────────────────────────────────────────┘
 
 
 
