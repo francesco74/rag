@@ -11,6 +11,7 @@ log = logging.getLogger("qdrant_setup")
 
 QDRANT_COLLECTION = "document_chunks"
 CACHE_COLLECTION = "semantic_cache"
+CONCEPT_COLLECTION = "conceptual_dictionary"  
 
 async def create_collection_if_missing(client, name, size=768):
     """Crea la collection solo se non esiste."""
@@ -44,9 +45,10 @@ async def setup_infrastructure():
         )
         log.info("Connessione a Qdrant stabilita.")
 
-        # 1. CREAZIONE COLLECTION
+        # 1. CREAZIONE COLLECTION (Inclusa quella concettuale)
         await create_collection_if_missing(client, QDRANT_COLLECTION)
         await create_collection_if_missing(client, CACHE_COLLECTION)
+        await create_collection_if_missing(client, CONCEPT_COLLECTION) # <-- Creazione della nuova collection
 
         log.info("Inizio configurazione indici (Payload Indexes)...")
 
@@ -66,14 +68,24 @@ async def setup_infrastructure():
         for field, schema in indexes_chunks.items():
             await safe_create_payload_index(client, QDRANT_COLLECTION, field, schema)
 
-        # INDICI PER SEMANTIC CACHE (Aggiornati con i filtri)
+        # 3. INDICI PER SEMANTIC CACHE (Aggiornati con i filtri)
         indexes_cache = {
             "topic_id": models.PayloadSchemaType.KEYWORD,
-            "sub_topics_key": models.PayloadSchemaType.KEYWORD, # stringa generata "al volo" dal backend unendo in ordine alfabetico tutti i sub-topic che l'utente ha selezionato per una specifica ricerca
-            "filters_key": models.PayloadSchemaType.KEYWORD # Indispensabile per isolare la cache dei filtri
+            "sub_topics_key": models.PayloadSchemaType.KEYWORD,
+            "filters_key": models.PayloadSchemaType.KEYWORD 
         }
         for field, schema in indexes_cache.items():
             await safe_create_payload_index(client, CACHE_COLLECTION, field, schema)
+
+        # 4. INDICI PER CONCEPTUAL DICTIONARY (Nuovo Dizionario Semantico)
+        # Indicizziamo 'concept' e 'aliases' per permetterti, se necessario, 
+        # di fare anche lookup testuali diretti o eliminazioni mirate via codice.
+        indexes_concept = {
+            "concept": models.PayloadSchemaType.KEYWORD,
+            "aliases": models.PayloadSchemaType.KEYWORD
+        }
+        for field, schema in indexes_concept.items():
+            await safe_create_payload_index(client, CONCEPT_COLLECTION, field, schema)
 
         log.info("Configurazione architettura Vector DB completata con successo.")
         

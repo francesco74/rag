@@ -3,6 +3,7 @@ import logging
 import time
 import uuid
 from celery import Celery
+from celery.signals import setup_logging
 from celery.signals import worker_process_init, worker_shutdown
 from celery.schedules import crontab
 from mysql.connector import pooling
@@ -36,10 +37,16 @@ load_dotenv()
 # 1. CONFIGURATION & LOGGING
 # ==============================================================================
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - [WORKER-%(process)d] - %(levelname)s - %(message)s'
-)
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+
+@setup_logging.connect
+def configure_worker_logging(*args, **kwargs):
+    logging.basicConfig(
+        level=getattr(logging, LOG_LEVEL, logging.INFO),
+        format='%(asctime)s - [WORKER-%(process)d] - %(levelname)s - %(message)s',
+        force=True  # Svuota e sovrascrive gli handler precedentemente configurati da Celery
+    )
+
 log = logging.getLogger("rag_queue")
 
 # Load Configuration
@@ -51,19 +58,36 @@ RERANK_SIZE = int(os.environ.get("RERANK_SIZE", 25))
 RERANK_TRUNCATE = int(os.environ.get("RERANK_TRUNCATE", 1200))
 RERANK_BATCH_SIZE = int(os.environ.get("RERANK_BATCH_SIZE", 32))  
 RERANK_MAX_LENGTH = int(os.environ.get("RERANK_MAX_LENGTH", 512))
+CONCEPT_THRESHOLD = float(os.environ.get("QDRANT_CONCEPT_THRESHOLD", 0.80))
+ANSWER_MAX_TOKENS = int(os.environ.get("ANSWER_MAX_TOKENS", 4096))
+
+
+ALLOW_GENERAL_KNOWLEDGE = os.environ.get("ALLOW_GENERAL_KNOWLEDGE", "true").lower() == "true"
 
 ONNX_MODEL_CACHE_PATH = os.environ.get(
     "RERANKER_MODEL_PATH", 
     "./model_cache/mmarco-mMiniLMv2-L12-H384-v1"
 )
 
-QDRANT_SYNTATIC_SIZE = int(os.environ.get("QDRANT_SYNTATIC_SIZE", 20))
+QDRANT_SYNTACTIC_SIZE = int(os.environ.get("QDRANT_SYNTACTIC_SIZE", 20))
 QDRANT_SEMANTIC_SIZE = int(os.environ.get("QDRANT_SEMANTIC_SIZE", 30))
 QDRANT_THRESHOLD = float(os.environ.get("QDRANT_THRESHOLD", 0.60))
 MAX_CONTEXT_CHARS = int(os.environ.get("MAX_CONTEXT_CHARS", 30000)) 
+MAX_SUB_QUERIES=int(os.environ.get("MAX_SUB_QUERIES", 5)) 
+PARENT_BUDGET_RATIO=float(os.environ.get("PARENT_BUDGET_RATIO", 0.80))
 
 MIN_PROB_THRESHOLD = float(os.environ.get("MIN_PROB_THRESHOLD", 0.02))
 PARENTS_PER_QUERY = int(os.environ.get("PARENTS_PER_QUERY", 4))
+
+DB_HOST = os.environ.get("MYSQL_SERVICE_HOST", "localhost")
+DB_USER = os.environ.get("MYSQL_USER", "root")
+DB_PORT = int(os.environ.get("MYSQL_SERVICE_PORT", 3306))
+DB_PASS = os.environ.get("MYSQL_PASSWORD", "password")
+DB_NAME = os.environ.get("MYSQL_DATABASE", "rag_system")
+
+QDRANT_HOST = os.environ.get("QDRANT_HOST", "localhost")
+QDRANT_PORT = int(os.environ.get("QDRANT_PORT", 6333))
+
 
 MAX_AGE_SECONDS = 86400  # 24 hours
 MAX_MODEL_RETRIES = 2
@@ -83,10 +107,11 @@ os.environ["ONNXRUNTIME_EXECUTION_MODE"] = "PARALLEL"
 
 QDRANT_COLLECTION = "document_chunks"
 CACHE_COLLECTION = "semantic_cache"
+CONCEPT_COLLECTION = "conceptual_dictionary"
 
 # ==============================================================================
 # 2. CELERY INITIALIZATION
-# ==============================================================================
+# =========================================", "rag_system")=====================================
 celery_app = Celery('rag_queue', broker=REDIS_URL, backend=REDIS_URL)
 celery_app.conf.update(
     result_expires=3600,
@@ -96,6 +121,7 @@ celery_app.conf.update(
     task_reject_on_worker_lost=True,
     worker_max_tasks_per_child=100,  # Restart worker after 100 tasks
     worker_max_memory_per_child=2000000, # 2GB limit
+    worker_hijack_root_logger=False,
 )
 
 # ==============================================================================
@@ -117,7 +143,7 @@ def init_worker_process(**kwargs):
     Initializes network connections and models ONLY after Celery forks the process.
     Prevents Socket Corruption and BrokenPipeErrors.
     """
-    global db_pool, qdrant_client, QUERY_REWRITER_MODEL_NAME, ANSWER_GENERATOR_MODEL_NAME, GRADER_MODEL_NAME
+    global db_pool, qdrant_client, QUERY_REWRITER_MODEL_NAME, ANSWER_GENERATOR_MODEL_NAME, GRADER_MODEL_NAME, DB_HOST, DB_USER, DB_PORT, DB_PASS, DB_NAME
     log.info("Initializing Worker Resources (Post-Fork)...")
 
     try:
@@ -125,14 +151,15 @@ def init_worker_process(**kwargs):
             pool_name=f"worker_pool_{os.getpid()}",
             pool_size=3,
             pool_reset_session=True,
-            host=os.environ.get("DB_HOST", "localhost"),
-            user=os.environ.get("DB_USER", "root"),
-            password=os.environ.get("DB_PASS", "password"),
-            database=os.environ.get("DB_NAME", "rag_system")
+            host=DB_HOST,
+            user=DB_USER,
+            port=DB_PORT,
+            password=DB_PASS,
+            database=DB_NAME
         )
         qdrant_client = QdrantClient(
-            host=os.environ.get("QDRANT_HOST", "localhost"),
-            port=int(os.environ.get("QDRANT_PORT", 6333))
+            host=QDRANT_HOST,
+            port=QDRANT_PORT
         )
 
         # Embedding rimane su Gemini — configura solo la chiave
@@ -188,6 +215,15 @@ def safe_json_parse(raw_text: str, task_id: str = "UNKNOWN") -> dict:
         return parsed_data
     except json.JSONDecodeError as e:
         log.debug(f"[{task_id}] [JSON_PARSE] Livello 2 fallito: {e}. Passo al Livello 3 (Brute Force Regex).")
+
+    # 2b. Tentativo di riparazione stringa troncata
+    try:
+        repaired = clean_text.rstrip() + '"}'
+        parsed_data = json.loads(repaired)
+        log.debug(f"[{task_id}] [JSON_PARSE] ✓ Successo al Livello 2b (Stringa riparata).")
+        return parsed_data
+    except json.JSONDecodeError as e:
+        log.debug(f"[{task_id}] [JSON_PARSE] Livello 2b fallito: {e}. Passo al Livello 3 (Brute Force Regex).")
 
     # 3. Tentativo "Forza Bruta": Cerca tutto ciò che è tra parentesi graffe
     match = re.search(r'\{.*\}', raw_text, re.DOTALL)
@@ -268,6 +304,33 @@ def embed_queries_batch(queries_list):
     )
     return result['embedding'] if isinstance(queries_list, list) else [result['embedding']]
 
+@GEMINI_EMBEDDING_RETRY
+def embed_for_concept_lookup(query):
+    """Embedding per confronto con il dizionario concettuale (task simmetrico)."""
+    result = genai.embed_content(
+        model=EMBEDDING_MODEL,
+        content=query,
+        task_type="SEMANTIC_SIMILARITY",
+        output_dimensionality=768
+    )
+    return result['embedding']
+
+def expand_standalone_with_aliases(standalone_query, aliases, task_id="UNKNOWN"):
+    aliases_str = ", ".join(aliases)
+    
+    prompt = load_prompt_template("expand_with_alias").format(
+        aliases_str=aliases_str,
+        standalone_query=standalone_query,
+        max_sub_queries=MAX_SUB_QUERIES
+    )
+    
+    try:
+        raw = get_llm_provider().generate_json(QUERY_REWRITER_MODEL_NAME, prompt, temperature=0.2, max_tokens=ANSWER_MAX_TOKENS)
+        data = safe_json_parse(raw, task_id)
+        return data.get("search_queries", [standalone_query])
+    except Exception as e:
+        log.error(f"[{task_id}] Errore nell'espansione alias: {e}. Fallback su query standalone.")
+        return [standalone_query]
 
 def transform_query(history, query, task_id="UNKNOWN"):
     """Transform conversational query into standalone query + search facets + keywords."""
@@ -285,7 +348,8 @@ def transform_query(history, query, task_id="UNKNOWN"):
 
     prompt = load_prompt_template("query_rewriter").format(
         history_str=history_str,
-        query=query
+        query=query,
+        max_sub_queries=MAX_SUB_QUERIES
     )
 
     try:
@@ -304,6 +368,10 @@ def transform_query(history, query, task_id="UNKNOWN"):
             f"[{task_id}] [REWRITER] ✓ Query processata. "
             f"Standalone: '{standalone}' | Facets: {len(searches)} | Keywords: {len(keywords)}"
         )
+
+        log.debug(f"Standalone query: {standalone}")
+        log.debug(f"Query individuate: {searches}")
+        log.debug(f"Keywords: {keywords}")
         return {"standalone_query": standalone, "search_queries": searches, "keywords": keywords}
 
     except Exception as e:
@@ -315,23 +383,48 @@ def transform_query(history, query, task_id="UNKNOWN"):
 
 
 def generate_answer(query, rich_context, topic_id):
-    """Generate final answer using retrieved context, returning a structured dict."""
     formatted_chunks = []
     curr_len = 0
+    n_parents = len(rich_context)
 
-    for item in rich_context:
-        chunk = f"[Source: {item['source']}]\n{item['content']}\n\n"
-        if curr_len + len(chunk) < MAX_CONTEXT_CHARS:
+    if n_parents == 0:
+        context_str = ""
+    else:
+        theoretical_budget_per_parent = MAX_CONTEXT_CHARS // (PARENTS_PER_QUERY * MAX_SUB_QUERIES)
+        cap_per_parent = int(theoretical_budget_per_parent / PARENT_BUDGET_RATIO)
+        budget_per_parent = min(MAX_CONTEXT_CHARS // n_parents, cap_per_parent)
+
+        log.debug(
+            f"Budget per parent: {budget_per_parent} chars "
+            f"(teorico={theoretical_budget_per_parent}, cap={cap_per_parent}, "
+            f"parent effettivi={n_parents})."
+        )
+
+        for item in rich_context:
+            content = item['content']
+            if len(content) > budget_per_parent:
+                log.debug(f"Parent '{item['source']}' troncato: {len(content)} → {budget_per_parent} chars.")
+                content = content[:budget_per_parent]
+
+            chunk = f"[Source: {item['source']}]\n{content}\n\n"
+
+            if curr_len + len(chunk) > MAX_CONTEXT_CHARS:
+                log.warning(
+                    f"Budget complessivo raggiunto ({curr_len}/{MAX_CONTEXT_CHARS} chars). "
+                    f"{n_parents - len(formatted_chunks)} parent scartati."
+                )
+                break
+
             formatted_chunks.append(chunk)
             curr_len += len(chunk)
-        else:
-            log.warning(
-                f"Contesto limitato a {curr_len} chars. "
-                f"{len(rich_context) - len(formatted_chunks)} parent scartati."
-            )
-            break
 
-    context_str  = "".join(formatted_chunks)
+        context_str = "".join(formatted_chunks)
+
+    log.info(
+        f"Contesto finale: {len(formatted_chunks)}/{n_parents} parent, "
+        f"{curr_len}/{MAX_CONTEXT_CHARS} chars utilizzati."
+    )
+
     prompt_file  = get_topic_prompt(topic_id)
     prompt_tmpl  = load_prompt_template(prompt_file)
     prompt       = prompt_tmpl.format(context_str=context_str, query=query)
@@ -339,7 +432,7 @@ def generate_answer(query, rich_context, topic_id):
     log.info(f"Generating structured answer for topic '{topic_id}'")
     log.debug(f"Context size: {len(context_str)} chars")
 
-    raw = get_llm_provider().generate_json(ANSWER_GENERATOR_MODEL_NAME, prompt)
+    raw = get_llm_provider().generate_json(ANSWER_GENERATOR_MODEL_NAME, prompt, max_tokens=ANSWER_MAX_TOKENS)
     log.debug(f"Raw response:\n{raw[:500]}...")
 
     try:
@@ -351,7 +444,7 @@ def generate_answer(query, rich_context, topic_id):
     except json.JSONDecodeError as e:
         log.error(f"Generazione JSON fallita: {e}. Output grezzo: {raw}")
         return {"is_found": True, "answer": raw.strip()}
-
+    
 
 def grade_answer(query, context_snippet, answer):
     """Ask the grader model whether the answer is satisfactory. Returns True/False."""
@@ -576,7 +669,7 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
                 res = qdrant_client.scroll(
                     collection_name=QDRANT_COLLECTION,
                     scroll_filter=models.Filter(must=must_conditions + [models.Filter(should=should_cond)]),
-                    limit=QDRANT_SYNTATIC_SIZE * 2,
+                    limit=QDRANT_SYNTACTIC_SIZE * 2,
                     with_payload=True
                 )
                 log.debug(f"Keyword search returned {len(res[0])} hits.")
@@ -770,6 +863,8 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
             return [], []
  
         try:
+            log.debug(f"Parent ID da recuperare da DB: {final_parent_ids_ordered}")
+
             format_strings = ','.join(['%s'] * len(final_parent_ids_ordered))
             sql = f"""
                 SELECT id, topic_id, sub_topic_id, source, content, metadata
@@ -779,6 +874,14 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
             with conn.cursor(dictionary=True) as cursor:
                 cursor.execute(sql, tuple(final_parent_ids_ordered))
                 parent_records = cursor.fetchall()
+
+            log.debug(f"Record restituiti dal DB: {len(parent_records)}")
+            if not parent_records:
+                log.error(
+                    f"MySQL ha restituito 0 record per {len(final_parent_ids_ordered)} parent_id. "
+                    f"Primo ID cercato: {final_parent_ids_ordered[0] if final_parent_ids_ordered else 'N/A'}. "
+                    f"Verificare tipo colonna id e sincronizzazione Qdrant↔MySQL."
+                )
         finally:
             conn.close()
  
@@ -855,6 +958,74 @@ def get_all_sub_topics(topic_id):
     finally:
         conn.close()
 
+def get_aliases_by_concept(query_vector, threshold=CONCEPT_THRESHOLD):
+    """
+    Cerca nella collezione Qdrant se la query esprime un concetto 
+    mappato nel nostro dizionario semantico.
+    """
+    if not qdrant_client:
+        return []
+        
+    try:
+        hits = qdrant_client.query_points(
+            collection_name=CONCEPT_COLLECTION,
+            query=query_vector,
+            limit=1,
+            score_threshold=threshold
+        ).points
+        
+        if hits:
+            aliases = hits[0].payload.get("aliases", [])
+            log.info(f"[CONCEPT HIT] Rilevato concetto '{hits[0].payload.get('concept')}' (score: {hits[0].score:.3f}) -> Alias: {aliases}")
+            return aliases
+        else:
+            log.debug(f"[CONCEPT MISS]")
+        return []
+    except Exception as e:
+        log.error(f"Errore lookup concettuale su Qdrant: {e}")
+        return []
+
+
+def log_automatic_negative_feedback(query, answer, topic_id, history, task_id="UNKNOWN"):
+    """
+    Salva automaticamente nel database le query che non hanno trovato risposte
+    valide o che sono state scartate dal Grader.
+    """
+    conn = get_db_connection()
+    if not conn:
+        log.error(f"[{task_id}] [AUTO_FEEDBACK] Impossibile salvare: DB pool non disponibile.")
+        return
+        
+    try:
+        # Serializziamo la cronologia come fatto sul gateway Flask
+        history_json = json.dumps(history) if history else "[]"
+        
+        sql = """
+            INSERT INTO chat_feedback 
+            (user_query, ai_response, topic_id, rating, chat_history, comment) 
+            VALUES (%s, %s, %s, %s, %s, %s)
+        """
+        
+        with conn.cursor() as cursor:
+            cursor.execute(sql, (
+                query,
+                answer,
+                topic_id,
+                0,  # Rating 0 per identificare i fallimenti automatici del sistema
+                history_json,
+                "Auto-Log: Risposta non trovata o non soddisfacente (Grader/Self-Correction Fail)"
+            ))
+        conn.commit()
+        log.info(f"[{task_id}] [AUTO_FEEDBACK] ✓ Query non risposta registrata con successo nel DB.")
+        
+    except Exception as e:
+        log.error(f"[{task_id}] [AUTO_FEEDBACK] ✗ Errore durante il salvataggio a DB: {e}")
+        conn.rollback()
+    finally:
+        conn.close()
+
+
+
 # ==============================================================================
 # 8. MAIN CELERY TASK
 # ==============================================================================
@@ -867,7 +1038,7 @@ def process_rag_query(self, query, history, topic_id, selected_sub_topics=None, 
     log.info(f"[{task_id}] Task started: '{query[:50]}...' su topic: {topic_id}")
 
     # ==========================================================
-    # 1. SETUP & VALIDATION
+    # SETUP & VALIDATION
     # ==========================================================
     try:
         if not selected_sub_topics:
@@ -886,46 +1057,53 @@ def process_rag_query(self, query, history, topic_id, selected_sub_topics=None, 
         return {"error": "Internal Error", "message": "Errore di inizializzazione.", "status": "failed"}
 
     # ==========================================================
-    # 2. QUERY TRANSFORMATION & MULTI-QUERY EXPANSION
+    # QUERY TRANSFORMATION & MULTI-QUERY EXPANSION
     # ==========================================================
     try:
         # Nota l'aggiunta di task_id qui
         rewritten_data = transform_query(history, query, task_id)
         
         standalone_query = rewritten_data.get("standalone_query", query)
-        search_queries = rewritten_data.get("search_queries", [standalone_query])
+        # Generiamo l'embedding della sola query standalone per capire il concetto
+        primary_vector = embed_query(standalone_query)
+
         extracted_keywords = rewritten_data.get("keywords", [])
-        
         # Fallback testuale di sicurezza
         if not extracted_keywords:
             log.debug(f"[{task_id}] Nessuna keyword restituita, attivo fallback testuale in Python.")
             extracted_keywords = [w.strip("?.,!'\"") for w in standalone_query.split() if len(w) > 3]
 
+        # Verifichiamo SEMANTICAMENTE se la query esprime un concetto nel dizionario
+        concept_vector = embed_for_concept_lookup(standalone_query)
+        db_aliases = get_aliases_by_concept(concept_vector)
+        
+        if db_aliases:
+            # Se c'è un concetto corrispondente, generiamo le sotto-query dedicate
+            search_queries = expand_standalone_with_aliases(standalone_query, db_aliases, task_id)
+            if not search_queries:
+                search_queries = [standalone_query]
+        else:
+            # Altrimenti proseguiamo con il flusso nativo dell'LLM
+            search_queries = rewritten_data.get("search_queries", [standalone_query])
+        
         if standalone_query not in search_queries:
-            search_queries.insert(0, standalone_query)
+                    search_queries.insert(0, standalone_query)
+        vectors_list = embed_queries_batch(search_queries) 
+        all_keywords = list(set(extracted_keywords + db_aliases))
             
     except Exception as e:
         log.warning(f"[{task_id}] [MAIN_TASK] Pipeline di trasformazione caduta: {e}. Uso raw query.")
-        standalone_query, search_queries, extracted_keywords = query, [query], []
+        standalone_query, search_queries, all_keywords = query, [query], []
+        primary_vector = embed_query(query)  # fallback sul raw query
+        vectors_list = [primary_vector]
 
     # ==========================================================
-    # 3. BATCH EMBEDDING
-    # ==========================================================
-    try:
-        vectors_list = embed_queries_batch(search_queries)
-        # Vettore primario usato per la Semantic Cache
-        primary_query_vector = vectors_list[0] 
-    except Exception as e:
-        log.error(f"[{task_id}] AI Embedding service failed: {e}", exc_info=True)
-        return {"error": "AI Service Unavailable", "message": "Servizio momentaneamente sovraccarico.", "status": "failed"}
-
-    # ==========================================================
-    # 4. SEMANTIC CACHE CHECK
+    # SEMANTIC CACHE CHECK
     # ==========================================================
     try:
         filters_key = generate_filters_key(metadata_filters)
 
-        cached = check_semantic_cache(primary_query_vector, topic_id, st_key, filters_key)
+        cached = check_semantic_cache(primary_vector, topic_id, st_key, filters_key)
         if cached:
             log.info(f"[{task_id}] Cache HIT. Returning cached response.")
             return {
@@ -939,13 +1117,13 @@ def process_rag_query(self, query, history, topic_id, selected_sub_topics=None, 
         log.warning(f"[{task_id}] Cache check failed (non-blocking): {e}")
 
     # ==========================================================
-    # 5. RETRIEVAL (Parallel Vector + Keyword)
+    # RETRIEVAL (Parallel Vector + Keyword)
     # ==========================================================
     try:
         context, sources = retrieve_chunks(
             search_queries, 
             vectors_list, 
-            extracted_keywords, 
+            all_keywords, 
             topic_id, 
             selected_sub_topics,
             metadata_filters
@@ -955,7 +1133,7 @@ def process_rag_query(self, query, history, topic_id, selected_sub_topics=None, 
         return {"error": "Database Error", "message": "Errore durante il recupero dei documenti.", "status": "failed"}
 
     # ==========================================================
-    # 6. SELF-CORRECTION LOOP (Generation & Grading)
+    # SELF-CORRECTION LOOP (Generation & Grading)
     # ==========================================================
     attempt = 0
     answer = None
@@ -985,15 +1163,30 @@ def process_rag_query(self, query, history, topic_id, selected_sub_topics=None, 
             log.info(f"[{task_id}] Model explicitly flagged is_found=False. Skipping Grader.")
             log.debug(f"[{task_id}] Model answer: {answer}")
             is_satisfactory = False
+
+        elif gen_result.get("is_general_knowledge"):
+            if ALLOW_GENERAL_KNOWLEDGE:
+                log.info(f"[{task_id}] Answer based on general knowledge (allowed). Skipping Grader.")
+                is_satisfactory = True
+            else:
+                # Il modello ha sforato i limiti: forza il retry senza sprecare una chiamata al grader
+                log.warning(f"[{task_id}] Answer based on general knowledge but ALLOW_GENERAL_KNOWLEDGE=false. Forcing retry.")
+                is_satisfactory = False
+
         else:
-            # C. Grader LLM
+            # Risposta ancorata al contesto: valutazione normale
             try:
-                context_snippet = context if isinstance(context, str) else str(context)
+                if isinstance(context, list):
+                    context_snippet = "\n\n".join(
+                        f"[{item.get('source', '')}]\n{item.get('content', '')}"
+                        for item in context
+                    )
+                else:
+                    context_snippet = str(context)
                 is_satisfactory = grade_answer(standalone_query, context_snippet, answer)
-                
             except Exception as e:
                 log.error(f"[{task_id}] Grader LLM failed (non-blocking): {e}. Defaulting to YES.")
-                is_satisfactory = True 
+                is_satisfactory = True
 
         # D. Gestione Retry Fallimento
         if not is_satisfactory:
@@ -1037,13 +1230,27 @@ def process_rag_query(self, query, history, topic_id, selected_sub_topics=None, 
                 log.warning(f"[{task_id}] Max retries exhausted. Returning best effort answer.")
 
     # ==========================================================
-    # 7. CACHE SAVING & RETURN
+    # FEEDBACK NEGATIVO AUTOMATICO
+    # ==========================================================
+    if not is_satisfactory:
+        log.info(f"[{task_id}] [MAIN_TASK] Rilevato fallimento retrieval/grading. Avvio auto-logging.")
+        # Usiamo la query originale dell'utente passata al task
+        log_automatic_negative_feedback(
+            query=query, 
+            answer=answer, 
+            topic_id=topic_id, 
+            history=history, 
+            task_id=task_id
+        )
+
+    # ==========================================================
+    # CACHE SAVING & RETURN
     # ==========================================================
     try:
         # Evitiamo di cacchare risposte troppo brevi o palesemente vuote
         if answer and is_satisfactory and len(answer) > 20:
             save_to_semantic_cache(
-                primary_query_vector, 
+                primary_vector, 
                 standalone_query, 
                 answer, 
                 sources, 

@@ -1,35 +1,58 @@
 <role>
-You are an expert search query analyzer and expander for a vector database.
+You are an expert search query analyzer for a Retrieval-Augmented Generation system built on a municipal and administrative document database.
 </role>
+
 <instructions>
 Analyze the <chat_history> and the <last_query>.
 You MUST output exclusively a valid JSON object with three keys:
-- "standalone_query" (string): The user's query rewritten to be self-contained (resolving pronouns).
-- "search_queries" (array of strings): 
-    - If the query is SPECIFIC, this array should contain ONLY the "standalone_query".
-    - If the query is BROAD or aggregative (e.g., "How did lifestyle change?", "Summarize the events"), generate 2 or 3 specific, targeted sub-queries exploring different facets of the topic (e.g., "daily habits", "hobbies", "transportation") to maximize document retrieval.
-    - If the query is SPECIFIC but contains a geographical macro-area (e.g., "Versilia", "Garfagnana", "Mediavalle", "Provincia di Lucca", "Provincia"), you MUST decompose it. For each specific municipality or town belonging to that area (e.g., Viareggio, Pietrasanta, Seravezza, ecc), generate a dedicated, ATOMIC sub-query combining the user's core request with ONLY ONE town name at a time.
-    - CRITICAL RULE: DO NOT cluster or concatenate multiple town names inside the same query string. Every town must have its own separate string in the array to prevent retrieval dilution.
-- "keywords" (array of strings): 1 to 5 highly significant, unique keywords extracted from the query (excluding stop words) optimized for exact-match text search. Include proper nouns.
-Respond with ONLY the JSON object.
+
+- "standalone_query" (string): The user's intent rewritten as a self-contained question,
+  resolving any pronouns or references to previous messages. Do NOT change geographical
+  scope, do NOT expand acronyms, and do NOT introduce information not present in the original query.
+
+- "search_queries" (array of strings):
+    - If the query targets a SPECIFIC place, person, act, or topic, this array contains ONLY the standalone_query.
+    - If the query is BROAD or aggregative (e.g., "Come è cambiato X?", "Dimmi tutto su Y"), generate up to a maximum of {max_sub_queries} targeted sub-queries exploring different semantic facets of the topic.
+    - If the query contains a geographical macro-area or an administrative umbrella term a zone, province, or area that groups multiple municipalities, decompose it: generate one atomic sub-query per municipality or sub-area you can reasonably infer belongs to that macro-area, combining each with the user's core request up to a maximum of {max_sub_queries} sub-queries total.
+      CRITICAL: one municipality per query string, never concatenated.
+
+- "keywords" (array of strings): 1 to 5 highly significant keywords or proper nouns extracted from the query, excluding stop words, optimized for exact-match text search.
+
+Respond with ONLY the JSON object, no preamble, no markdown fences.
 </instructions>
 
-
 <examples>
+
 <example>
 <chat_history></chat_history>
-<last_query>Mario Rossi aveva un'automobile?</last_query>
+<last_query>Sono previsti lavori a Castelnuovo di Garfagnana?</last_query>
 Output:
 {{
-  "standalone_query": "Mario Rossi aveva un'automobile?",
+  "standalone_query": "Sono previsti lavori a Castelnuovo di Garfagnana?",
   "search_queries": [
-    "Mario Rossi aveva un'automobile?",
-    "Mario Rossi veicoli posseduti",
-    "Mario Rossi mezzi di trasporto"
+    "Sono previsti lavori a Castelnuovo di Garfagnana?"
   ],
-  "keywords": ["Mario", "Rossi", "automobile"]
+  "keywords": ["lavori", "Castelnuovo", "Garfagnana"]
 }}
 </example>
+
+<example>
+<chat_history></chat_history>
+<last_query>Sono previsti lavori in Garfagnana?</last_query>
+Output:
+{{
+  "standalone_query": "Sono previsti lavori nei comuni della Garfagnana?",
+  "search_queries": [
+    "lavori previsti Castelnuovo di Garfagnana",
+    "lavori previsti Barga",
+    "lavori previsti Gallicano",
+    "lavori previsti Piazza al Serchio",
+    "lavori previsti Coreglia Antelminelli"
+  ],
+  "keywords": ["lavori", "Garfagnana"]
+}}
+</example>
+
 <example>
 <chat_history></chat_history>
 <last_query>Quali sono i progetti PNRR per le scuole in Versilia?</last_query>
@@ -43,41 +66,38 @@ Output:
     "progetti PNRR edilizia scolastica Seravezza",
     "progetti PNRR edilizia scolastica Camaiore"
   ],
-  "keywords": ["PNRR", "scuole", "Versilia", "Viareggio", "Seravezza"]
+  "keywords": ["PNRR", "scuole", "Versilia"]
 }}
 </example>
+
 <example>
 <chat_history></chat_history>
-<last_query>Quali sono i progetti PNRR per le scuole della Provincia di Lucca?</last_query>
+<last_query>Come è cambiato il modo di lavorare negli uffici pubblici negli ultimi anni?</last_query>
 Output:
 {{
-  "standalone_query": "Quali sono i progetti PNRR per le scuole nei comuni della Versilia?",
+  "standalone_query": "Come è cambiato il modo di lavorare negli uffici pubblici negli ultimi anni?",
   "search_queries": [
-    "progetti PNRR edilizia scolastica Viareggio",
-    "progetti PNRR edilizia scolastica Pietrasanta",
-    "progetti PNRR edilizia scolastica Forte dei Marmi",
-    "progetti PNRR edilizia scolastica Seravezza",
-    "progetti PNRR edilizia scolastica Camaiore"
+    "cambiamenti organizzazione lavoro uffici pubblici",
+    "nuove modalità lavorative settore pubblico",
+    "evoluzione orari e flessibilità uffici pubblici"
   ],
-  "keywords": ["PNRR", "scuole", "Versilia", "Viareggio", "Seravezza"]
+  "keywords": ["uffici pubblici", "modalità lavoro", "flessibilità"]
 }}
 </example>
+
 <example>
-<chat_history></chat_history>
-<last_query>Quali sono i progetti PNRR per le scuole della Provincia di Lucca?</last_query>
+<chat_history>user: parlami delle politiche sul lavoro agile</chat_history>
+<last_query>ci sono aggiornamenti recenti?</last_query>
 Output:
 {{
-  "standalone_query": "Quali sono i progetti PNRR per le scuole dell'intera Provincia di Lucca?",
+  "standalone_query": "Ci sono aggiornamenti recenti sulle politiche sul lavoro agile?",
   "search_queries": [
-    "progetti PNRR edilizia scolastica Lucca",
-    "progetti PNRR edilizia scolastica Viareggio",
-    "progetti PNRR edilizia scolastica Pietrasanta",
-    "progetti PNRR edilizia scolastica Barga",
-    "progetti PNRR edilizia scolastica Seravezza"
+    "Ci sono aggiornamenti recenti sulle politiche sul lavoro agile?"
   ],
-  "keywords": ["PNRR", "scuole", "Lucca", "Viareggio", "Pietrasanta", "Barga", "Seravezza"]
+  "keywords": ["lavoro agile", "aggiornamenti", "politiche"]
 }}
 </example>
+
 </examples>
 
 <chat_history>

@@ -27,9 +27,15 @@ log = logging.getLogger("api_gateway")
 
 app = Flask(__name__)
 
-ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "http://localhost:3000").split(",")
+ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS").split(",")
 #CORS(app, origins="*")
 CORS(app, origins=ALLOWED_ORIGINS)  # Enable CORS for frontend access
+
+DB_HOST = os.environ.get("MYSQL_SERVICE_HOST", "localhost")
+DB_USER = os.environ.get("MYSQL_USER", "root")
+DB_PORT = int(os.environ.get("MYSQL_SERVICE_PORT", 3306))
+DB_PASS = os.environ.get("MYSQL_PASSWORD", "password")
+DB_NAME = os.environ.get("MYSQL_DATABASE", "rag_system")
 
 ALLOW_SUBTOPIC_SELECTION = os.environ.get("ALLOW_SUBTOPIC_SELECTION", "true").lower() == "true"    
 
@@ -50,14 +56,15 @@ celery_client = Celery(
 
 try:
     db_pool = pooling.MySQLConnectionPool(
-        pool_name="api_pool",
-        pool_size=5,
-        pool_reset_session=True,
-        host=os.environ.get("DB_HOST", "localhost"),
-        user=os.environ.get("DB_USER"),
-        password=os.environ.get("DB_PASS"),
-        database=os.environ.get("DB_NAME", "rag_system")
-    )
+            pool_name=f"worker_pool_{os.getpid()}",
+            pool_size=3,
+            pool_reset_session=True,
+            host=DB_HOST,
+            user=DB_USER,
+            port=DB_PORT,
+            password=DB_PASS,
+            database=DB_NAME
+        )
 except Exception as e:
     log.critical(f"Failed to initialize API DB Pool: {e}")
     # Consider whether the app should crash here if the DB is critical

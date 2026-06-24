@@ -138,8 +138,8 @@ class WSAttiSoapClient:
 
 def build_client_from_env() -> WSAttiSoapClient:
     creds = WSAttiCredentials(
-        username=settings.repwss_username,
-        password=settings.repwss_password,
+        username=settings.ws_username,
+        password=settings.ws_password,
     )
     return WSAttiSoapClient(
         endpoint_url=settings.docws_atti_endpoint,

@@ -38,7 +38,10 @@ ENV DB_HOST=""
 ENV DB_USER=""
 ENV DB_PASS=""
 ENV DB_NAME=""
-ENV RABBITMQ_HOST=""
+ENV BROKER_HOST=""
+ENV BROKER_PORT=""
+ENV BROKER_USERNAME=""
+ENV BROKER_PASSWORD=""
 
 # Define the command to run the app using Gunicorn for production
 CMD ["sh", "-c", "python converter.py"]

@@ -34,7 +34,10 @@ COPY src/direct.py .
 # Define the environment variable for the API key (to be set at runtime)
 ENV DATA_FOLDER=""
 ENV LOG_LEVEL=""
-ENV RABBITMQ_HOST=""
+ENV BROKER_HOST=""
+ENV BROKER_PORT=""
+ENV BROKER_USERNAME=""
+ENV BROKER_PASSWORD=""
 
 # Define the command to run the app using Gunicorn for production
 CMD ["sh", "-c", "python direct.py"]

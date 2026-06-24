@@ -34,7 +34,7 @@ from tenacity import (
 
 from google.api_core.exceptions import ResourceExhausted, ServiceUnavailable
 
-from db_logger import MySQLLogHandler, get_db_connection
+from db_logger import MySQLLogHandler, get_db_connection, init_db_pool
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -47,7 +47,25 @@ load_dotenv()
 BASE_DIR = pathlib.Path(__file__).parent.resolve()
 
 QDRANT_COLLECTION = "document_chunks"
-RABBITMQ_HOST = os.environ.get("RABBITMQ_HOST", "localhost")
+BROKER_HOST = os.environ.get("BROKER_HOST", "rabbitmq-service.rag.svc.cluster.local")
+BROKER_PORT = int(os.environ.get("BROKER_PORT", 5672))
+BROKER_USERNAME = os.environ.get("BROKER_USERNAME", "guest")
+BROKER_PASSWORD = os.environ.get("BROKER_PASSWORD", "guest")
+
+# --- DATABASE CONFIGURATION ---
+DB_HOST = os.environ.get("MYSQL_SERVICE_HOST", "localhost")
+DB_PORT = int(os.environ.get("MYSQL_SERVICE_PORT", 3306))
+DB_USER = os.environ.get("MYSQL_USER", "raguser")
+DB_PASS = os.environ.get("MYSQL_PASSWORD", "")
+DB_NAME = os.environ.get("MYSQL_DATABASE", "rag_db")
+
+init_db_pool(
+    host=DB_HOST, 
+    port=DB_PORT, 
+    user=DB_USER, 
+    password=DB_PASS, 
+    database=DB_NAME
+)
     
 
 PROTECTED_KEYS = {"topic_id", "sub_topic_id", "source", "parent_id", "content",
@@ -523,19 +541,15 @@ async def on_message_received(message: aio_pika.IncomingMessage):
 
 async def main_worker():
     """Worker principale per RabbitMQ."""
-    rabbitmq_host = RABBITMQ_HOST
-    log.info(f"Ingestion Worker Start - Connessione a: amqp://{rabbitmq_host}/")
+    log.info(f"Tentativo di connessione a RabbitMQ su {BROKER_HOST}...")
     
     try:
-        connection = await aio_pika.connect_robust(f"amqp://{rabbitmq_host}/")
+        connection = await aio_pika.connect_robust(f"amqp://{BROKER_USERNAME}:{BROKER_PASSWORD}@{BROKER_HOST}:{BROKER_PORT}/")
         
         async with connection:
             channel = await connection.channel()
             
             # QoS prefeth per bilanciare memoria e rate limits
-            await channel.set_qos(prefetch_count=3)
-
-            channel = await connection.channel()
             await channel.set_qos(prefetch_count=3)
 
             queue_in = await channel.get_queue("da-indicizzare") 

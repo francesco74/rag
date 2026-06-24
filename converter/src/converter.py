@@ -53,6 +53,11 @@ for d in [STAGING_DIR, INGESTION_WATCH_DIR, ERROR_DIR, ARCHIVE_DIR]:
 CROP_OCR_LIMIT = 0
 OCR_MODEL_NAME = os.environ.get("OCR_MODEL_NAME", "gemini-3-flash-preview")
 
+BROKER_HOST = os.environ.get("BROKER_HOST", "rabbitmq-service.rag.svc.cluster.local")
+BROKER_PORT = int(os.environ.get("BROKER_PORT", 5672))
+BROKER_USERNAME = os.environ.get("BROKER_USERNAME", "guest")
+BROKER_PASSWORD = os.environ.get("BROKER_PASSWORD", "guest")
+
 IMG_EXTENSIONS = [".png", ".jpg", ".jpeg"]
 
 # Limiter asincrono: gestisce internamente la concorrenza garantendo max 10 chiamate/minuto
@@ -312,12 +317,12 @@ async def on_message_received(message: aio_pika.IncomingMessage, channel: aio_pi
             await message.reject(requeue=False)
 
 async def main_worker():
-    rabbitmq_host = os.environ.get("RABBITMQ_HOST", "rabbitmq-service.rag.svc.cluster.local")
     
-    log.info(f"Avvio Worker. Tentativo di connessione a RabbitMQ su {rabbitmq_host}...")
+    
+    log.info(f"Avvio Worker. Tentativo di connessione a RabbitMQ su {BROKER_HOST}...")
     
     try:
-        connection = await aio_pika.connect_robust(f"amqp://{rabbitmq_host}/")
+        connection = await aio_pika.connect_robust(f"amqp://{BROKER_USERNAME}:{BROKER_PASSWORD}@{BROKER_HOST}:{BROKER_PORT}/")
         
         async with connection:
             channel = await connection.channel()

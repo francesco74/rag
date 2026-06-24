@@ -14,6 +14,12 @@ log = logging.getLogger("Migrazione")
 PROTECTED_KEYS = {"topic_id", "sub_topic_id", "source", "parent_id", "content", 
                   "parent_index", "child_index", "file_name", "_ingestion_error"}
 
+DB_HOST = os.environ.get("MYSQL_SERVICE_HOST", "localhost")
+DB_USER = os.environ.get("MYSQL_USER", "root")
+DB_PORT = int(os.environ.get("MYSQL_SERVICE_PORT", 3306))
+DB_PASS = os.environ.get("MYSQL_PASSWORD", "password")
+DB_NAME = os.environ.get("MYSQL_DATABASE", "rag_system")
+
 def migrate():
     # 1. Connessioni
     q_client = QdrantClient(
@@ -22,10 +28,11 @@ def migrate():
     )
     
     db_conn = mysql.connector.connect(
-        host=os.environ.get("DB_HOST", "localhost"),
-        user=os.environ.get("DB_USER", "root"),
-        password=os.environ.get("DB_PASS", "password"),
-        database=os.environ.get("DB_NAME", "rag_system")
+        host=DB_HOST,
+            user=DB_USER,
+            port=DB_PORT,
+            password=DB_PASS,
+            database=DB_NAME
     )
     cursor = db_conn.cursor()
 

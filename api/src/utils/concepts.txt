@@ -1,0 +1,9 @@
+# --- DIZIONARIO DEI CONCETTI GEOGRAFICI ---
+Versilia: viareggio, forte dei marmi, pietrasanta, camaiore, massarosa, seravezza, stazzema
+Garfagnana: castelnuovo di garfagnana, barga, gallicano, piazza al serchio, coreglia
+Piana di Lucca: lucca, capannori, altopascio, porcari, villa basilica
+
+# --- DIZIONARIO DEI CONCETTI AMMINISTRATIVI / TECNICI ---
+Smart Working: lavoro agile, telelavoro, coworking, lavoro da remoto, flessibilità ordinaria
+Sicurezza sul Lavoro: dvr, dls, prevenzione infortuni, dpi, rspp, antincendio
+Edilizia Scolastica: pnrr scuole, ristrutturazione aule, efficientamento energetico scuole, palestre

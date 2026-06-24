@@ -179,15 +179,3 @@ class DocWSRicercheClient:
         except ET.ParseError:
             return result_text, None
 
-
-# -----------------------------
-# TOML -> RicercaFiltri
-# -----------------------------
-
-def _as_str(x: Any) -> Optional[str]:
-    if x is None:
-        return None
-    s = str(x).strip()
-    return s if s else None
-
-

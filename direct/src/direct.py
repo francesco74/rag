@@ -95,7 +95,7 @@ async def scan_and_wrap(channel: aio_pika.Channel):
             log.error(f"Errore durante il wrapping del file {original_filename}: {e}")
 
 async def main_run():
-    rabbitmq_host = os.environ.get("RABBITMQ_HOST", "rabbitmq-service.rag.svc.cluster.local")
+    rabbitmq_host = os.environ.get("BROKER_HOST", "rabbitmq-service.rag.svc.cluster.local")
     
     log.info("Avvio Wrapper Diretti (Modalità One-Shot CronJob)...")
     connection = await aio_pika.connect_robust(f"amqp://{rabbitmq_host}/")

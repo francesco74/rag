@@ -1,4 +1,3 @@
-import os
 import json
 import logging
 import argparse
@@ -11,20 +10,15 @@ from asn1crypto.cms import ContentInfo
 
 from risultati_ricerca_parser import run_search
 from estrazione_documenti import build_client_from_env
-
-# Importiamo tutte le classi filtro
 from ricerca_filtri import RicercaFiltri, DeterminaFilter, DeliberaFilter, DecretoFilter
-from dotenv import load_dotenv
 
-load_dotenv()
+# Importa l'unica fonte di verità
+from config import settings
 
 ESTENSIONI_CONSENTITE = {".pdf", ".p7m"}
-RABBITMQ_HOST = os.environ.get("RABBITMQ_HOST", "rabbitmq-service.rag.svc.cluster.local")
-    
+STAGING_ATTI_FOLDER = pathlib.Path(settings.data_folder) / "staging" / "attiprovincia"
 
 log = logging.getLogger("main_extractor")
-BASE_DIR = pathlib.Path(__file__).parent.resolve()
-STAGING_ATTI_FOLDER = pathlib.Path(os.environ.get("DATA_FOLDER", str(BASE_DIR))) / "staging" / "provincia"
 
 def clean_iso_date(date_raw: str) -> Optional[str]:
     """Uniforma le date al formato YYYY-MM-DD, rimuovendo le componenti temporali (T)."""
@@ -50,29 +44,33 @@ def extract_file_from_p7m(p7m_bytes: bytes, filename: str) -> bytes:
 def get_rabbitmq_channel():
     """Inizializza la connessione al broker per pubblicare gli eventi."""
     try:
+        credentials = pika.PlainCredentials(settings.broker_username, settings.broker_password)
         connection = pika.BlockingConnection(
-        pika.ConnectionParameters(
-            host=RABBITMQ_HOST,
-            heartbeat=60,
-            blocked_connection_timeout=300
+            pika.ConnectionParameters(
+                host=settings.broker_host,
+                port=settings.broker_port,
+                credentials=credentials,
+                heartbeat=60,
+                blocked_connection_timeout=300
+            )
         )
-    )
         channel = connection.channel()
         return connection, channel
     except Exception as e:
-        log.error(f"Errore critico di connessione a RabbitMQ su {RABBITMQ_HOST}: {e}")
+        log.error(f"Errore critico di connessione a RabbitMQ su {settings.broker_host}: {e}")
         raise
 
 def main():
-    parser = argparse.ArgumentParser(description="Estrattore Massivo Sicr@Web - Generatore Manifest")
+    parser = argparse.ArgumentParser(description="Estrattore Massivo")
     parser.add_argument("--debug", action="store_true", help="Abilita log di livello DEBUG.")
-    parser.add_argument("--dry", action="store_true", help="Simula la ricerca senza scaricare nulla.")
-    parser.add_argument("--json-filters", type=str, required=True, help="Filtri di ricerca in JSON.")
+    parser.add_argument("--dry", action="store_true", help="Simula la ricerca.")
+    parser.add_argument("--json-filters", type=str, required=True, help="Filtri in JSON.")
     args = parser.parse_args()
 
-    log_level = logging.DEBUG if args.debug else logging.INFO
+    # Fallback sul debug richiesto via CLI, altrimenti usa config
+    log_level = logging.DEBUG if args.debug else getattr(logging, settings.log_level, logging.INFO)
     logging.basicConfig(level=log_level, format='%(asctime)s - ESTRATTORE - %(levelname)s - %(message)s', force=True)
-
+    
     try:
         raw_json = json.loads(args.json_filters)
         

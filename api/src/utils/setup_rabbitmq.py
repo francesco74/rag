@@ -1,18 +1,5 @@
-"""
-setup_rabbitmq.py
-Inizializzazione completa della topologia RabbitMQ per il sistema RAG.
-Da eseguire UNA VOLTA prima di avviare qualsiasi servizio applicativo.
-
-Dipendenze: pip install requests python-dotenv
-
-Uso:
-    python setup_rabbitmq.py
-    python setup_rabbitmq.py --host localhost --port 15672 --user guest --pass guest
-    python setup_rabbitmq.py --verify-only
-"""
-
-import argparse
 import logging
+import os
 import sys
 import time
 import requests
@@ -23,8 +10,6 @@ try:
     load_dotenv()
 except ImportError:
     pass
-
-import os
 
 # ==============================================================================
 # CONFIGURAZIONE LOGGING
@@ -50,35 +35,40 @@ TOPOLOGY = {
             "durable": True,
             "auto_delete": False,
             "arguments": {},
-            "description": "Dead Letter Exchange — riceve i messaggi rifiutati da tutte le code operative"
+            "description": "Dead Letter Exchange — riceve i messaggi rejected"
         }
     ],
     "queues": [
-        # --- Dead Letter Queues (dichiarate PRIMA delle code operative) ---
+        # --- Dead Letter Queues (Quorum Queues per Alta Affidabilità) ---
         {
             "name": "da-convertire.dlq",
             "durable": True,
             "auto_delete": False,
-            "arguments": {},
-            "description": "DLQ per messaggi falliti di da-convertire"
+            "arguments": {
+                "x-queue-type": "quorum"  # <-- Forza la replica sui 3 nodi K8s
+            },
+            "description": "DLQ Quorum per messaggi falliti di da-convertire"
         },
         {
             "name": "da-indicizzare.dlq",
             "durable": True,
             "auto_delete": False,
-            "arguments": {},
-            "description": "DLQ per messaggi falliti di da-indicizzare"
+            "arguments": {
+                "x-queue-type": "quorum"  # <-- Forza la replica sui 3 nodi K8s
+            },
+            "description": "DLQ Quorum per messaggi falliti di da-indicizzare"
         },
-        # --- Code Operative ---
+        # --- Code Operative (Quorum Queues + DLX) ---
         {
             "name": "da-convertire",
             "durable": True,
             "auto_delete": False,
             "arguments": {
                 "x-dead-letter-exchange": "rag_dlx",
-                "x-dead-letter-routing-key": "da-convertire"
+                "x-dead-letter-routing-key": "da-convertire",
+                "x-queue-type": "quorum"  # <-- Trasforma la coda in Quorum Queue
             },
-            "description": "Coda input converter — messaggi falliti -> rag_dlx -> da-convertire.dlq"
+            "description": "Coda input converter — HA Quorum + Routing su DLQ"
         },
         {
             "name": "da-indicizzare",
@@ -86,9 +76,10 @@ TOPOLOGY = {
             "auto_delete": False,
             "arguments": {
                 "x-dead-letter-exchange": "rag_dlx",
-                "x-dead-letter-routing-key": "da-indicizzare"
+                "x-dead-letter-routing-key": "da-indicizzare",
+                "x-queue-type": "quorum"  # <-- Trasforma la coda in Quorum Queue
             },
-            "description": "Coda input ingest — messaggi falliti -> rag_dlx -> da-indicizzare.dlq"
+            "description": "Coda input ingest — HA Quorum + Routing su DLQ"
         },
     ],
     "bindings": [
@@ -113,10 +104,11 @@ TOPOLOGY = {
 # ==============================================================================
 
 class RabbitMQClient:
-    def __init__(self, host: str, port: int, user: str, password: str, vhost: str = "/"):
+    def __init__(self, host: str, port: int, user: str, password: str):
         self.base_url = f"http://{host}:{port}/api"
         self.auth = HTTPBasicAuth(user, password)
-        self.vhost_encoded = requests.utils.quote(vhost, safe="")
+        # Il vhost è impostato rigidamente su "/" ed encodato correttamente per le API (%2F)
+        self.vhost_encoded = requests.utils.quote("/", safe="")
         self.session = requests.Session()
         self.session.auth = self.auth
         self.session.headers.update({"Content-Type": "application/json"})
@@ -150,7 +142,6 @@ class RabbitMQClient:
             "arguments": arguments
         }
         r = self.session.put(url, json=payload, timeout=10)
-        # 201 = creato, 204 = già esistente con stessi parametri
         return r.status_code in (201, 204)
 
     def declare_queue(self, name: str, durable: bool,
@@ -271,49 +262,38 @@ def verify_topology(client: RabbitMQClient) -> bool:
 # MAIN
 # ==============================================================================
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Inizializzazione topologia RabbitMQ per il sistema RAG."
-    )
-    parser.add_argument("--host",         default=os.environ.get("RABBITMQ_HOST", "localhost"))
-    parser.add_argument("--port",         default=int(os.environ.get("RABBITMQ_MGMT_PORT", 15672)), type=int)
-    parser.add_argument("--user",         default=os.environ.get("RABBITMQ_USER", "guest"))
-    parser.add_argument("--password",     default=os.environ.get("RABBITMQ_PASS", "guest"))
-    parser.add_argument("--vhost",        default=os.environ.get("RABBITMQ_VHOST", "/"))
-    parser.add_argument("--verify-only",  action="store_true",
-                        help="Non crea nulla, verifica solo che la topologia esista già.")
-    parser.add_argument("--max-attempts", default=30, type=int,
-                        help="Numero massimo di tentativi di connessione (default: 30).")
-    return parser.parse_args()
-
-
 def main():
-    args = parse_args()
+    # Lettura delle configurazioni esclusivamente da os.environ
+    host = os.environ.get("BROKER_HOST", "localhost")
+    port = int(os.environ.get("BROKER_MGMT_PORT", 15672))
+    user = os.environ.get("BROKER_USERNAME", "guest")
+    password = os.environ.get("BROKER_PASSWORD", "guest")
+    
+    
+    max_attempts = int(os.environ.get("RABBITMQ_MAX_ATTEMPTS", 30))
 
     log.info("======================================================")
     log.info(" RabbitMQ Topology Setup")
-    log.info(" Host   : %s:%d", args.host, args.port)
-    log.info(" VHost  : %s", args.vhost)
-    log.info(" Modo   : %s", "VERIFICA" if args.verify_only else "APPLICA + VERIFICA")
+    log.info(" Host   : %s:%d", host, port)
+    log.info(" VHost  : /")
     log.info("======================================================")
 
+    
     client = RabbitMQClient(
-        host=args.host,
-        port=args.port,
-        user=args.user,
-        password=args.password,
-        vhost=args.vhost
+        host=host,
+        port=port,
+        user=user,
+        password=password
     )
 
-    if not client.wait_until_ready(max_attempts=args.max_attempts):
+    if not client.wait_until_ready(max_attempts=max_attempts):
         sys.exit(1)
 
-    if not args.verify_only:
-        log.info("Applicazione topologia...")
-        ok = apply_topology(client)
-        if not ok:
-            log.error("Errore durante l'applicazione della topologia.")
-            sys.exit(1)
+    log.info("Applicazione topologia...")
+    ok = apply_topology(client)
+    if not ok:
+        log.error("Errore durante l'applicazione della topologia.")
+        sys.exit(1)
 
     log.info("Verifica finale...")
     ok = verify_topology(client)
