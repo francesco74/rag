@@ -23,6 +23,8 @@ L'infrastruttura si articola su una serie di microservizi accoppiati in modo las
 Prima che i dati siano pronti per essere interrogati nel database vettoriale, essi attraversano un ciclo di vita rigorosamente strutturato diviso in tre fasi principali: **Rilevamento e Wrapping**, **Normalizzazione/OCR**, ed **Ingestione Parent-Child**.
 
 
+```
+
 [Area Input: data/direct]
 │
 ▼
@@ -40,7 +42,7 @@ Prima che i dati siano pronti per essere interrogati nel database vettoriale, es
 │   ingest.py   │  ──► Parent-Child Splitting + MySQL/Qdrant Atomic Upsert
 └───────────────┘
 
-
+```
 
 ### Fase 1: Rilevamento e Wrapping (`direct.py`)
 
@@ -60,40 +62,38 @@ Prima che i dati siano pronti per essere interrogati nel database vettoriale, es
 
 Questo modulo assicura che qualsiasi formato di input venga convertito in un formato testuale uniforme Markdown. Il processo è guidato da un sistema di estrazione ibrida PDF/OCR:
 
+```
 
-
-
-
-                ┌──────────────────────┐
-                │ Ricezione file .json │
-                └──────────┬───────────┘
-                          │
-                          ▼
-              [ Tipo di File Allegato? ]
-              /            │             \
-      (PDF) /             │ (.txt/.md)   \ (Immagine)
-            ▼              ▼               ▼
-  ┌─────────────────┐     ┌──────────┐ ┌───────────────┐
-  │Lettura Pagine   │     │ Lettura  │ │  Gemini OCR   │
-  │con PyMuPDF      │     │ Diretta  │ │  (Markdown)   │
-  └────────┬────────┘     └────┬─────┘ └───────┬───────┘
-           │                   │               │
-      [Densità Testo?]         │               │
-      /                 \      │               │
-    / <50 crt.           \>=50 │               │
-  ▼                   ▼        │               │
-┌──────────────┐ ┌──────────┐  │               │
-│  Gemini OCR  │ │PyMuPDF4LL│  │               │
-│(con fallback)│ │Markdown  │  │               │
-└──────┬───────┘ └────┬─────┘  │               │
-       │              │        │               │
-       ▼              ▼        ▼               ▼
+               ┌──────────────────────┐
+              │ Ricezione file .json │
+              └──────────┬───────────┘
+                         │
+                         ▼
+             [ Tipo di File Allegato? ]
+            /             │             \
+    (PDF) /               │ (.txt/.md)   \ (Immagine)
+          ▼               ▼               ▼
+ ┌─────────────────┐    ┌──────────┐ ┌───────────────┐
+ │Lettura Pagine   │    │ Lettura  │ │  Gemini OCR   │
+ │con PyMuPDF      │    │ Diretta  │ │  (Markdown)   │
+ └────────┬────────┘    └────┬─────┘ └───────┬───────┘
+          │                  │               │
+   [Densità Testo?]          │               │
+  /                \         │               │
+ / <50 crt.         \>=50    │               │
+▼                    ▼       │               │
+┌──────────────┐ ┌──────────┐│               │
+│  Gemini OCR  │ │PyMuPDF4LL││               │
+│(con fallback)│ │Markdown  ││               │
+└──────┬───────┘ └────┬─────┘│               │
+       │              │      │               │
+       ▼              ▼      ▼               ▼
 ┌──────────────────────────────────────────────┐
-│     Salvataggio .md + .json in data/watch    │
-│       Notifica coda "da-indicizzare"         │
+│      Salvataggio .md + .json in data/watch   │
+│        Notifica coda "da-indicizzare"        │
 └──────────────────────────────────────────────┘
 
-
+```
 
 1. **Lettura del Manifesto**: Il Worker consuma l'evento ed ispeziona i file allegati in staging.
 
@@ -194,9 +194,7 @@ Uno dei problemi principali del RAG multi-query è che una query di ricerca potr
 Il sistema implementa un potente pattern ad agenti basato su un ciclo di auto-correzione prima di servire la risposta all'utente:
 
 
-
-
-
+```
        ┌────────────────────────┐
        │ Generazione Risposta   │
        │ (gemini-3.5-flash)     │
@@ -205,29 +203,25 @@ Il sistema implementa un potente pattern ad agenti basato su un ciclo di auto-co
                    ▼
         [ Il modello segnala? ]
         /                     \
-
-
-
-(is_found = False)                \ (is_found = True)
-▼                           ▼
+(is_found = False)              \ (is_found = True)
+      ▼                           ▼
 ┌──────────────┐          ┌───────────────────┐
 │ Forza Fallito│          │ Valutazione con   │
 │ Senza Grader │          │ Grader LLM        │
 └──────┬───────┘          └─────────┬─────────┘
-│                            │
-│                    [ Risposta valida? ]
-│                    /                 
+       │                            │
+       │                    [ Risposta valida? ]
+       │                    /               \  
+       │            (No)   /                 \ (Sì)
+       ▼                  ▼                    ▼
+┌────────────────────────────┐         ┌───────────────────┐
+│ Incrementa Tentativi.      │         │ Salva in Cache    │
+│ Inietta istruzione di      │         │ Ritorna Risposta  │
+│ ri-formulazione e ri-esegui│         └───────────────────┘
+│ pipeline di Retrieval      │
+└────────────────────────────┘
 
-│            (No)   /                   \ (Sì)
-▼                  ▼                     ▼
-┌───────────────────────────┐         ┌───────────────────┐
-│ Incrementa Tentativi.     │         │ Salva in Cache    │
-│ Inietta istruzione di     │         │ Ritorna Risposta  │
-│ ri-formulazione e ri-esegui│        └───────────────────┘
-│ pipeline di Retrieval     │
-└───────────────────────────┘
-
-
+```
 
 1. **Generazione Strutturata**: L'LLM (`gemini-3.5-flash`) genera la risposta richiedendo esplicitamente un formato JSON strutturato contenente la chiave booleana `is_found`.
 
