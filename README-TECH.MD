@@ -1,450 +1,268 @@
-Specifica Tecnica ed Architetturale: Sistema RAG Enterprise-Grade
+# Specifica Tecnica ed Architetturale: Sistema RAG Enterprise-Grade
 
-Questo documento descrive in modo formale e approfondito l'architettura, le strategie algoritmiche, i flussi dati e i requisiti tecnologici del sistema Retrieval-Augmented Generation (RAG) avanzato implementato. Il sistema è progettato per essere altamente resiliente, scalabile, disaccoppiato e in grado di auto-correggersi a runtime per garantire risposte prive di allucinazioni e rigorosamente ancorate alla base documentale.
+Questo documento descrive in modo formale e approfondito l'architettura, le strategie algoritmiche, i flussi di dati e i requisiti tecnologici del sistema **Retrieval-Augmented Generation (RAG)** avanzato implementato. Il sistema adotta un approccio asincrono, resiliente e guidato dagli eventi (*Event-Driven*) avanzata della fase di ricerca e generazione.
 
-1. Introduzione e Obiettivi dell'Architettura
+## 1. Panoramica dell'Architettura di Sistema
 
-I sistemi RAG tradizionali (Naïve RAG) soffrono di limitazioni intrinseche che ne precludono l'adozione in scenari enterprise:
+L'infrastruttura si articola su una serie di microservizi accoppiati in modo lasco attraverso code di messaggi (**RabbitMQ**) e gestiti in modo distribuito per la parte computazionale intensiva RAG tramite **Celery** (con broker di stato **Redis**). La persistenza è ibrida, combinando un database relazionale (**MySQL**) per i dati strutturati e i testi completi e un database vettoriale (**Qdrant**) per la ricerca semantica rapida su frammenti più piccoli (Child).
 
-Perdita di precisione semantica: Blocchi di testo troppo ampi diluiscono il segnale semantico dei vettori di embedding.
+### Componenti Principali:
 
-Mancanza di contesto: Blocchi di testo troppo piccoli privano il Large Language Model (LLM) del contesto logico-narrativo circostante.
+1. **Wrapper Diretti (`direct.py`)**: Uno script (eseguibile anche como CronJob) che rileva nuovi documenti raw preservando l'alberatura, genera manifesti JSON e notifica RabbitMQ.
 
-Instabilità delle API ed allucinazioni: Fluttuazioni nelle quote delle API esterne e generazione di informazioni plausibili ma errate da parte dell'LLM.
+2. **Normalizzatore Documentale (`converter.py`)**: Consumatore asincrono che trasforma file PDF, immagini o testi grezzi in formato Markdown standardizzato utilizzando motori OCR avanzati e logiche di fallback.
 
-Questo sistema risolve tali sfide combinando un'architettura dati Parent-Child, una pipeline di ingestion asincrona basata su RabbitMQ e un motore di esecuzione con Self-Correction Loop (autocorrezione), Reranking Cross-Encoder locale e Ripartizione Dinamica delle Quote delle sotto-interrogazioni.
+3. **L'Ingestore di Frammenti (`ingest.py`)**: Consumatore asincrono che effettua lo split dei testi, genera embedding vettoriali e popola in modo atomico MySQL (Parent) e Qdrant (Child).
 
-2. Architettura di Sistema & Topologia dei Servizi
+4. **API Gateway (`app.py`)**: Espone le interfacce Flask protette tramite Bearer Token per la gestione del flusso conversazionale e la raccolta di feedback.
 
-Il sistema si basa su una topologia a microservizi orientata agli eventi (Event-Driven), strutturata per eliminare colli di bottiglia e garantire il disaccoppiamento dei carichi di lavoro.
+5. **RAG Worker (`worker.py`)**: Motore Celery che esegue la pipeline di query-transformation, caching semantico, ricerca ibrida, riordinamento (Reranking) locale tramite modelli ONNX e loop di auto-correzione.
 
-                  ┌─────────────────────────────────────────┐
-                  │          Wrapper Diretti               │
-                  │   (direct.py - Scan di data/direct)     │
-                  └────────────────────┬────────────────────┘
-                                       │
-                                       ▼ (RabbitMQ: "da-convertire")
-                  ┌─────────────────────────────────────────┐
-                  │       Convertitore Documentale          │
-                  │   (converter.py - Estrazione & OCR)     │
-                  └────────────────────┬────────────────────┘
-                                       │
-                                       ▼ (RabbitMQ: "da-indicizzare")
-                  ┌─────────────────────────────────────────┐
-                  │            Worker Ingest                │
-                  │ (ingest.py - Parent-Child Splitting)    │
-                  └─────────┬──────────────────────┬────────┘
-                            │                      │
-                            ▼ (MySQL)              ▼ (Qdrant)
-                  ┌──────────────────┐   ┌──────────────────┐
-                  │ parent_documents │   │ document_chunks  │
-                  └─────────▲────────┘   └─────────▲────────┘
-                            │                      │
- ┌─────────────────┐        │                      │
- │   API Gateway   ├────────┼──────────────────────┼─────────────────┐
- │   (app.py)      │        │                      │                 │
- └────────┬────────┘        │                      │                 │
-          │                 │                      │                 │
-          ▼ (Celery Queue)  │                      │                 │
- ┌─────────────────┐        │                      │                 │
- │   Celery RAG    ├────────┴──────────────────────┴─────────────────┘
- │   (worker.py)   │ ──► [Rewriter ──► Retrieval ──► Reranker ──► Grader ──► Cache]
- └─────────────────┘
+## 2. Flusso dei Documenti (Ingestion Pipeline)
 
+Prima che i dati siano pronti per essere interrogati nel database vettoriale, essi attraversano un ciclo di vita rigorosamente strutturato diviso in tre fasi principali: **Rilevamento e Wrapping**, **Normalizzazione/OCR**, ed **Ingestione Parent-Child**.
 
-I Servizi Principali:
 
-API Gateway (app.py - Flask): Espone le interfacce REST protette tramite Bearer Token. Valida le richieste di chat, raccoglie i feedback strutturati, interroga dinamicamente le configurazioni dei sotto-argomenti ed effettua l'offloading asincrono dei task di ricerca e generazione sulla coda Celery, gestendo i tempi di risposta tramite polling client-side.
+[Area Input: data/direct]
+│
+▼
+┌───────────────┐
+│   direct.py   │  ──► Genera Manifest JSON + Sposta in data/staging
+└───────────────┘
+│
+▼ [RabbitMQ: coda "da-convertire"]
+┌───────────────┐
+│  converter.py │  ──► Estrazione Ibrida (PyMuPDF / Gemini OCR / Vision Fallback)
+└───────────────┘
+│
+▼ [RabbitMQ: coda "da-indicizzare"]
+┌───────────────┐
+│   ingest.py   │  ──► Parent-Child Splitting + MySQL/Qdrant Atomic Upsert
+└───────────────┘
 
-Celery Worker (worker.py): Il motore di calcolo distribuito RAG. Gestisce la trasformazione semantica delle query, la ricerca ibrida, il riordinamento locale, la generazione strutturata e l'auditing qualitativo della risposta.
 
-Wrapper Diretti (direct.py - CronJob / Daemon): Scansiona le cartelle di arrivo dei documenti crudi, preserva la struttura dei topic, genera i manifesti strutturati in JSON e pubblica gli eventi di conversione su RabbitMQ.
 
-Convertitore Documentale (converter.py - Worker): Elabora asincronamente i PDF e le immagini. Esegue l'estrazione ibrida del testo e converte i formati complessi in file Markdown puliti e normalizzati.
+### Fase 1: Rilevamento e Wrapping (`direct.py`)
 
-Worker Ingest (ingest.py - Worker): Frammenta i documenti Markdown normalizzati in strutture gerarchiche (Parent-Child), genera gli embedding tramite API esterne e popola in modo transazionale MySQL e Qdrant.
+* Il sistema esegue una scansione ricorsiva della directory `data/direct` alla ricerca di estensioni supportate (`.pdf`, `.txt`, `.md`, `.png`, `.jpg`, `.jpeg`).
 
-3. Pipeline di Ingestion Documentale (End-to-End)
+* Per ciascun file identificato:
 
-Il viaggio di un documento, dalla sua immissione come file grezzo fino alla persistenza indiciata, è suddiviso in tre fasi rigidamente orchestrate:
+  1. Viene calcolato il percorso relativo rispetto alla cartella di origine per preservare l'alberatura del topic.
 
-[Inbound File] ──► (direct.py) ──► Generazione Manifest (.json) e Staging
-      │
-      ▼ (RabbitMQ: da-convertire)
-(converter.py) ──► Analisi Densità ──► [Testo Nativo / Gemini OCR / Vision Fallback] ──► Markdown
-      │
-      ▼ (RabbitMQ: da-indicizzare)
-(ingest.py) ──► Splitting Gerarchico ──► [Parent / Child] ──► Embedding Batch ──► Upsert Atomico
+  2. Il file viene spostato nella directory di `staging` (`data/staging`).
 
+  3. Viene generato un file di manifesto JSON radice (avente lo stesso nome del file ma estensione `.json`). Il manifesto definisce un identificativo univoco per la sorgente (`source`), la lista dei file associati e i metadati originali.
 
-Fase A: Rilevamento, Wrapping e Staging (direct.py)
+  4. Viene pubblicato un messaggio persistente sulla coda RabbitMQ `"da-convertire"` contenente il percorso del manifesto.
 
-Il sistema esegue una scansione ricorsiva della directory INPUT_DIR (data/direct) per rilevare file .pdf, .txt, .md, .png, .jpg, .jpeg.
+### Fase 2: Normalizzazione Documentale (`converter.py`)
 
-Mantiene intatta l'alberatura delle sottocartelle (che rappresentano logicamente la classificazione in topic_id e sub_topic_id).
+Questo modulo assicura che qualsiasi formato di input venga convertito in un formato testuale uniforme Markdown. Il processo è guidato da un sistema di estrazione ibrida PDF/OCR:
 
-Muove il file nativo in data/staging e genera un manifesto JSON strutturato avente come chiave source l'URI logico del file (es. direct://percorso/nomefile).
 
-Notifica RabbitMQ inviando un messaggio persistente sulla coda "da-convertire".
 
-Fase B: Estrazione Ibrida, OCR Avanzato e Fallback Dinamico (converter.py)
 
-Il modulo converter.py consuma il messaggio e attiva una pipeline di normalizzazione testuale:
 
-Analisi della Densità Informativa (PDF):
+              ┌──────────────────────┐
+              │ Ricezione file .json │
+              └──────────┬───────────┘
+                         │
+                         ▼
+             [ Tipo di File Allegato? ]
+            /            │             \
+     (PDF) /             │ (.txt/.md)   \ (Immagine)
+          ▼              ▼               ▼
+┌─────────────────┐ ┌──────────┐ ┌───────────────┐
+│Lettura Pagine   │ │ Lettura  │ │  Gemini OCR   │
+│con PyMuPDF      │ │ Diretta  │ │  (Markdown)   │
+└────────┬────────┘ └────┬─────┘ └───────┬───────┘
+         │               │               │
+  [Densità Testo?]       │               │
+ /                \      │               │
+/ <50 crt.         \>=50 │               │
 
-Per i file PDF, estrae il testo di ogni pagina tramite PyMuPDF (filtrando margini e intestazioni non desiderate tramite un rettangolo di ritaglio configurato da CROP_OCR_LIMIT).
 
-Se i caratteri estratti da una pagina sono inferiori a un limite critico (default 50 caratteri), la pagina viene catalogata come scansionata o a bassa densità.
 
-Generazione OCR tramite Gemini con Fallback Multi-Livello:
+▼                    ▼    │               │
+┌──────────────┐ ┌──────────┐│               │
+│  Gemini OCR  │ │PyMuPDF4LL││               │
+│(con fallback)│ │Markdown  ││               │
+└──────┬───────┘ └────┬─────┘│               │
+│              │      │               │
+▼              ▼      ▼               ▼
+┌────────────────────────────────────────┐
+│  Salvataggio .md + .json in data/watch │
+│    Notifica coda "da-indicizzare"      │
+└────────────────────────────────────────┘
 
-Le pagine scansionate e le immagini native vengono convertite in un buffer PIL e passate a Gemini Vision (gemini-3-flash-preview) con un prompt specifico che impone l'output in formato Markdown strutturato.
 
-Bypass dei Filtri di Safety: Se la chiamata fallisce o viene bloccata a causa delle rigide policy di filtraggio contenuti di Google (es. flag SAFETY, RECITATION o BLOCKLIST), il sistema cattura l'eccezione e attiva istantaneamente un fallback nativo e asincrono su Google Cloud Vision API (document_text_detection). Questo impedisce l'arresto della catena di elaborazione per documenti che contengono falsi positivi per le policy di sicurezza LLM.
 
-Scrittura in Watch:
+1. **Lettura del Manifesto**: Il Worker consuma l'evento ed ispeziona i file allegati in staging.
 
-I flussi testuali derivati (nativi o OCR) vengono fusi e scritti come file .md associati a un nuovo JSON manifest figlio nella cartella data/watch. Il sistema pubblica un evento persistente sulla coda "da-indicizzare".
+2. **Estrazione Ibrida da PDF**:
 
-Fase C: Frammentazione Gerarchica e Upsert Atomico Idempotente (ingest.py)
+   * Per ciascuna pagina del PDF, viene calcolato il rect ed estratto il testo nativo.
 
-Il worker di ingestion si occupa di dividere fisicamente il documento Markdown e inviarlo alle memorie fisiche:
+   * **Valutazione della Densità**: Se la pagina contiene meno di 50 caratteri, viene considerata una pagina scansionata (immagine). Viene renderizzata in un'immagine PIL e inviata alle API di **Gemini Vision** (`gemini-3-flash-preview` o analogo configurato via `OCR_MODEL_NAME`) per l'OCR con output forzato in formato Markdown.
 
-Risoluzione dei Parametri di Chunking:
+   * **Resilienza alle policy e Fallback**: Se le API di Gemini bloccano la trascrizione per motivi di policy di sicurezza (es. flag `SAFETY`, `RECITATION`), il sistema avvia istantaneamente un fallback asincrono su **Google Cloud Vision API** per evitare il blocco del flusso.
 
-Recupera i parametri specifici per il sotto-argomento interrogando la tabella MySQL sub_topics. Se non configurati, applica i valori di sistema predefiniti (es. chunk_size = 500, chunk_overlap = 100, parent_chunk_size = 1500, use_markdown_splitter = True).
+   * Se la pagina contiene testo nativo sufficiente, viene convertita direttamente in Markdown strutturato tramite `pymupdf4llm` (gestendo i tag di interruzione riga `<br>`).
 
-Splitting Gerarchico Parent-Child:
+3. **Gestione Immagini Standard**: I file immagine nativi vengono inviati direttamente alla pipeline OCR di Gemini.
 
-Parent Splitting: Se abilitato, applica prima MarkdownHeaderTextSplitter per dividere il testo basandosi sugli header Markdown (# fino a ####), catturando la gerarchia del documento nei metadati. Successivamente, utilizza RecursiveCharacterTextSplitter con il tokenizer di Tiktoken (cl100k_base) per produrre blocchi coerenti di grandi dimensioni (Parent).
+4. **Scrittura in Watch & Notifica**: Una volta normalizzati i file allegati, vengono salvati file individuali `.md` e i rispettivi manifesti figli aggiornati (aventi la chiave `source` arricchita con la sintassi `sorgente::nomefile.pdf`) all'interno della directory `data/watch`. Il sistema notifica infine la coda `"da-indicizzare"`.
 
-Child Splitting: Ciascun blocco Parent viene ulteriormente frammentato in blocchi Child più piccoli e sovrapposti.
+### Fase 3: Frammentazione e Ingestione Parent-Child (`ingest.py`)
 
-Embedding asincroni e Rate-Limiting:
+Il modulo d'ingestione adotta un'architettura **Parent-Child** studiata per risolvere il classico trade-off dei sistemi RAG (passare al modello generatore contesti ampi e ricchi di dettagli, mantenendo al contempo gli embedding vettoriali focalizzati su segmenti piccoli e semanticamente densi).
 
-I blocchi Child vengono inviati in batch asincroni alle API Google GenAI per generare vettori ad alta dimensionalità (768 dimensioni via gemini-embedding-001).
+1. **Risoluzione Dinamica delle Configurazioni**: Il sistema recupera dal DB MySQL i parametri di chunking impostati per lo specifico sub-topic (es. `chunk_size`, `chunk_overlap`, `parent_chunk_size`, `use_markdown_splitter`). Se non presenti, applica solidi valori di fallback.
 
-Un limitatore asincrono (AsyncLimiter limitato a 100 richieste/minuto) e logiche di retry con backoff esponenziale casuale gestiscono i codici di errore ResourceExhausted (429) o ServiceUnavailable (503).
+2. **Generazione dei Parent Documents**:
 
-Idempotenza e Conservazione della Transazionalità:
+   * Il testo Markdown completo viene elaborato. Se abilitato, viene impiegato il `MarkdownHeaderTextSplitter` per dividere il file basandosi sull'alberatura degli header (da `#` fino a `####`).
 
-MySQL Upsert: Viene eseguita una query di DELETE atomica sulla tabella parent_documents basata sull'indice combinato idx_search (source, topic_id, sub_topic_id). Subito dopo, i nuovi Parent Documents vengono inseriti massivamente via executemany. Questo assicura che un reprocessing dello stesso documento elimini le versioni obsolete e inserisca quelle aggiornate senza lasciare record orfani o duplicati.
+   * Successivamente, viene applicato un `RecursiveCharacterTextSplitter` basato sul tokenizer di Tiktoken (`cl100k_base`) per generare i **Parent Documents** (con una dimensione tipica di \~1500 token).
 
-Qdrant Upsert: I Child Chunks vengono caricati in Qdrant includendo nel payload i metadati estratti, il parent_id di accoppiamento con MySQL e un _ingestion_id univoco.
+3. **Generazione dei Child Chunks**:
 
-Qdrant Garbage Collection: Per prevenire "vettori fantasma" (frammenti Child orfani rimasti in Qdrant dopo che il documento originale è stato modificato), il sistema esegue una query di cancellazione mirata (qdrant_client.delete) per rimuovere tutti i punti associati allo stesso source ma aventi un _ingestion_id non corrispondente a quello appena generato.
+   * Ogni blocco Parent viene ulteriormente frammentato in blocchi **Child** più piccoli (es. 500 token di dimensione con 100 di sovrapposizione).
 
-4. Motore di Retrieval Avanzato & Reranking
+4. **Embedding Asincroni in Batch**:
 
-Il processo di recupero dei contesti all'interno di worker.py supera i limiti della semplice ricerca semantica (K-Nearest Neighbors) implementando una catena di elaborazione avanzata.
+   * I frammenti Child vengono impacchettati e inviati in batch alle API di Google GenAI utilizzando il modello `gemini-embedding-001`.
 
-       Query Utente + History (fino a 20 messaggi)
-                           │
-                           ▼ (gemini-3.1-flash-lite)
-               [ Standalone Query / Sub-Queries / Keywords ]
-                           │
-                 ┌─────────┴─────────┐
-                 ▼ (Embedding)       ▼ (Dizionario Concettuale)
-         [ Query Vector ]       [ Concept Lookup (Qdrant) ]
-                 │                   │
-                 │                   ▼ (Alias rilevati?)
-                 │              ┌────┴────┐
-                 │          (Sì)│     (No)│
-                 │              ▼         ▼
-                 │        Espansione   Continua
-                 │        con Aliases  Normale
-                 │              │         │
-                 └──────────────┼─────────┘
-                                │
-                                ▼
-                  ┌──────────────────────────┐
-                  │ Ricerca Ibrida Parallela  │
-                  │ (Vettoriale + Keyword)   │
-                  └─────────────┬────────────┘
-                                │
-                                ▼ (ONNX Reranker Locale)
-                  ┌──────────────────────────┐
-                  │   De-duplicazione e      │
-                  │   Reranking (Sigmoid)    │
-                  └─────────────┬────────────┘
-                                │
-                                ▼ (Algoritmo di Redistribuzione)
-                  ┌──────────────────────────┐
-                  │ Ripartizione delle Quote │
-                  │     (Parents Pool)       │
-                  └──────────────────────────┘
+   * Per mitigare i limiti di quota di Google, la chiamata viene regolata da un limitatore asincrono (`AsyncLimiter` impostato a 100 richieste/minuto) e da un sistema di riesecuzione robusto (`tenacity`) con backoff esponenziale casuale in caso di errori `ResourceExhausted` o `ServiceUnavailable`.
 
+5. **Persistenza e Idempotenza Transazionale**:
 
-A. Trasformazione delle Query ed Espansione Concettuale Semantica
+   * **MySQL**: I Parent Documents vengono inseriti massivamente nella tabella `parent_documents`. Per garantire l'idempotenza ed evitare la duplicazione dei dati in caso di reprocessing del documento, viene eseguita preventivamente una cancellazione atomica dei vecchi parent associati a quella specifica triade (`source`, `topic_id`, `sub_topic_id`).
 
-Query Rewriting Conversazionale: Il modello gemini-3.1-flash-lite analizza gli ultimi MAX_HISTORY_ITEMS (fino a 20 messaggi di cronologia) e converte l'interrogazione dell'utente in una query decontestualizzata (standalone_query), una lista di sotto-interrogazioni focalizzate (search_queries fino a 5 sotto-query) e un elenco di parole chiave lessicali (keywords).
+   * **Qdrant**: I vettori dei Child vengono caricati massivamente in Qdrant (collezione `document_chunks`) includendo nel payload un identificativo di ingestione univoco (`_ingestion_id`).
 
-Lookup Concettuale:
+   * **Cleanup Vettoriale**: Per prevenire frammenti orfani nel database vettoriale, subito dopo il successo del caricamento dei nuovi vettori viene eseguita un'operazione di eliminazione mirata per rimuovere tutti i punti associati allo stesso `source` ma aventi un `_ingestion_id` obsoleto.
 
-Il sistema esegue l'embedding della query standalone e interroga una collezione speciale in Qdrant denominata conceptual_dictionary.
+## 3. Analisi delle Caratteristiche Avanzate del Sistema RAG
 
-Se la query ha un'affinità semantica superiore a QDRANT_CONCEPT_THRESHOLD (default 0.80) con un concetto mappato a database, estrae un array di alias e sinonimi aziendali.
+Il motore di esecuzione implementato all'interno di `worker.py` dimostra un design all'avanguardia che implementa i pattern più moderni del RAG avanzato.
 
-Se vengono rilevati alias, il sistema invoca expand_standalone_with_aliases per rigenerare e potenziare le sotto-query di ricerca, garantendo che concetti normativi o gerghi tecnici vengano tradotti e ricercati con precisione assoluta.
+### A. Architettura Parent-Child (MySQL + Qdrant)
 
-B. Ricerca Ibrida Parallela e Reranking Locale via ONNX Cross-Encoder
+Invece di cercare un compromesso rischioso sulla dimensione dei blocchi, il sistema divide nettamente le responsabilità:
 
-Per massimizzare le prestazioni ed evitare colli di bottiglia, il recupero dei frammenti candidati avviene in parallelo sfruttando un pool di thread concorrenti (ThreadPoolExecutor):
+* **Qdrant** ospita esclusivamente gli embedding e i payload dei frammenti piccoli (**Child**). Questo massimizza la precisione e la rilevanza semantica durante la fase di ricerca vettoriale (evitando l'effetto di diluizione del segnale semantico tipico dei testi lunghi).
 
-Ricerca Semantica: Esegue query vettoriali parallele su Qdrant (document_chunks) per ciascuna sotto-query generata, applicando soglie di confidenza minime (QDRANT_THRESHOLD = 0.60) e filtrando rigorosamente per i topic_id e sub_topic_id selezionati dall'utente.
+* **MySQL** ospita il testo completo e strutturato del blocco più grande (**Parent**).
 
-Ricerca Sintattica: In parallelo alle query vettoriali, esegue una ricerca full-text lessicale basata sulle keyword estratte, sfruttando filtri logici MatchText su Qdrant per raccogliere corrispondenze esatte (codici, date, identificativi).
+* Durante la fase di recupero, il sistema interroga Qdrant per identificare i Child più affini, ma estrae dai payload i relativi `parent_id`. Successivamente esegue una query bulk su MySQL per caricare i testi Parent corrispondenti. In questo modo, l'LLM generatore riceve un contesto ampio, coerente e non frammentato.
 
-Lazy Loading del Reranker ONNX:
+### B. Query Transformation & Espansione tramite Dizionario Concettuale
 
-Per evitare conflitti di memoria e blocchi dei socket TCP causati dai fork di Celery nei sistemi operativi Unix-like, il Cross-Encoder locale viene istanziato esclusivamente in modalità "Lazy Load" all'interno del processo del worker (worker_process_init.connect).
+La query originale dell'utente, spesso ambigua o formulata in linguaggio naturale colloquiale, viene arricchita prima di toccare i database vettoriali:
 
-Il modello mmarco-mMiniLMv2-L12-H384-v1 esegue il riordinamento di tutti i candidati accumulati.
+1. **Query Rewriter**: Il modello `gemini-3.1-flash-lite` analizza lo storico della conversazione (fino a 20 elementi) e riformula la richiesta estraendone una query indipendente (`standalone_query`), un set di sotto-interrogazioni focalizzate (`search_queries`) e una lista di parole chiave fondamentali (`keywords`).
 
-Il sistema calcola il punteggio sigmoideo assecondando la formula del modello:
+2. **Semantic Concept Lookup**: La query standalone viene convertita in un vettore per affinità semantica e confrontata con una collezione Qdrant dedicata chiamata `conceptual_dictionary`.
 
+   * Se il punteggio supera la soglia (`QDRANT_CONCEPT_THRESHOLD`), significa che l'utente si sta riferendo ad una terminologia tecnica o ad un concetto normativo specifico che possiede sinonimi o alias noti nel sistema.
 
-$$P = \sigma(x) = \frac{1}{1 + e^{-x}}$$
+   * Gli alias individuati vengono fusi con la query standalone e usati per espandere le sotto-interrogazioni di ricerca in modo mirato (`expand_standalone_with_aliases`).
 
+### C. Algoritmo di Retrieval Ibrido e Reranking Locale (ONNX)
 
-I chunk con una probabilità inferiore a MIN_PROB_THRESHOLD (default 0.02) vengono immediatamente scartati dal pool dei risultati.
+Per catturare sia le sfumature di significato sia i riferimenti letterali (codici, date, codici identificativi), il sistema esegue una ricerca ibrida parallela:
 
-C. Algoritmo di Ripartizione delle Quote e Redistribuzione Attiva
+* **Ricerca Semantica**: Esegue ricerche vettoriali parallele in Qdrant (sfruttando un pool di thread concorrenti) per ciascuna sotto-query generata.
 
-In contesti multi-query, un problema tipico è la saturazione del contesto causata da una singola sotto-query molto loquace, a scapito di sotto-query con pochi documenti ma di vitale importanza. Questo sistema implementa un algoritmo proprietario per la gestione democratica del contesto:
+* **Ricerca Sintattica**: Se sono state estratte parole chiave, esegue una ricerca full-text asincrona (scansione tramite filtri logici `MatchText` su Qdrant) per catturare corrispondenze lessicali precise.
 
-Quota Garantita per Sotto-query: Ciascuna sotto-query ha diritto a una quota fissa di documenti Parent associati ai suoi migliori Child vettoriali, definita dal parametro PARENTS_PER_QUERY (default 4).
+* **Reranking Cross-Encoder Locale**: Tutti i frammenti candidati accumulati vengono de-duplicati e riordinati localmente tramite un modello di Reranking basato su ONNX Runtime (`mmarco-mMiniLMv2-L12-H384-v1`). L'operazione è altamente ottimizzata dal punto di vista computazionale (sfruttando il parallelismo a livello di thread della CPU) e converte i logit grezzi in probabilità reali tramite una funzione sigmoidea robusta. Solo i blocchi che superano la soglia di confidenza minima (`MIN_PROB_THRESHOLD`) vengono promossi.
 
-Allocazione Iniziale: Il sistema scorre la lista riordinata dei risultati e assegna a ciascuna query i suoi primi 4 documenti Parent univoci.
+### D. Ripartizione Dinamica delle Quote (Quota Allocation & Redistribution)
 
-Calcolo degli Slot Liberi (Redistribuzione):
+Uno dei problemi principali del RAG multi-query è che una query di ricerca potrebbe monopolizzare l'intero spazio di contesto disponibile, oscurando sotto-query meno loquaci ma ugualmente importanti. Per risolvere questo problema, il sistema implementa un algoritmo proprietario di ripartizione e redistribuzione delle risorse:
 
-Se alcune sotto-query non producono risultati (o ne producono meno della quota di 4), il sistema calcola la capacità residua non sfruttata:
+1. Ogni sotto-query ha una quota massima garantita di documenti Parent restituibili (`PARENTS_PER_QUERY`).
 
+2. Il sistema scansiona i risultati ordinati dal Reranker e assegna gli slot.
 
-$$\text{Slot Liberi} = (\text{PARENTS\_PER\_QUERY} \times N_{\text{queries}}) - N_{\text{selezionati}}$$
+3. Se una o più sotto-query non producono risultati sufficienti o non raggiungono la quota ideale (es. per carenza di documenti rilevanti sul database vettoriale), **gli slot rimanenti non vengono sprecati**.
 
-Questi slot rimasti liberi vengono ridistribuiti in modalità round-robin a favore delle sotto-query che possiedono una riserva di documenti validi scartati dall'allocazione iniziale.
+4. Gli slot liberi vengono ridistribuiti in modalità *round-robin* tra le sotto-query che possiedono una riserva di documenti candidati extra. Questo assicura che il budget del contesto passato all'LLM (regolato da `MAX_CONTEXT_CHARS`) sia sempre sfruttato al massimo della sua utilità.
 
-Questo meccanismo garantisce che il budget massimo di contesto impostato (MAX_CONTEXT_CHARS = 30000 caratteri) non venga mai sprecato, ottimizzando la densità informativa offerta al modello generatore.
+### E. Autovalutazione e Loop di Correzione (Self-Correction & Grader Loop)
 
-5. Generazione con Autovalutazione & Ciclo di Autocorrezione (Self-Correction Loop)
+Il sistema implementa un potente pattern ad agenti basato su un ciclo di auto-correzione prima di servire la risposta all'utente:
 
-Una volta ricomposto il contesto mediante il recupero bulk dei Parent Documents da MySQL, il sistema avvia un loop di generazione controllata e auto-correzione a più livelli:
 
-                  ┌──────────────────────────────┐
-                  │  Generazione in JSON Mode    │
-                  │   (is_found, answer, ecc.)   │
-                  └──────────────┬───────────────┘
-                                 │
-                                 ▼
-                     [ is_found == True? ]
-                     /                   \
-              (Sì)  /                     \ (No)
-                   ▼                       ▼
-       ┌────────────────────────┐    ┌────────────────────────┐
-       │   Grader LLM (CoT)     │    │   Incrementa Retry.    │
-       └───────────┬────────────┘    │  Inietta istruzioni    │
-                   │                 │  correttive in History │
-           [ Risposta Valida? ]      │   e rigenera Query     │
-           /                  \      └───────────┬────────────┘
-    (Sì)  /                    \ (No)            │
-         ▼                      ▼                │
-┌─────────────────┐    ┌─────────────────┐       │
-│ Salva in Cache  │    │ Forza Retry     │◄──────┘
-│ Ritorna Risposta│    │ (fino a max 2)  │
-└─────────────────┘    └────────┬────────┘
-                                │
-                                ▼ (Se esauriti i tentativi)
-                       ┌─────────────────┐
-                       │  Auto-Log DB    │
-                       │ (chat_feedback) │
-                       └─────────────────┘
 
 
-Generazione Strutturata (JSON Mode):
 
-Il modello gemini-3.5-flash genera la risposta finale basandosi sul template di prompt specifico del topic caricato dinamicamente da MySQL.
+       ┌────────────────────────┐
+       │ Generazione Risposta   │
+       │ (gemini-3.5-flash)     │
+       └───────────┬────────────┘
+                   │
+                   ▼
+        [ Il modello segnala? ]
+        /                     \
 
-L'output viene forzato in formato JSON contenente la chiave booleana is_found e la stringa testuale answer.
 
-Logica Fail-Fast:
 
-Se il modello imposta is_found = False (ammettendo esplicitamente che i documenti non contengono la risposta), il sistema salta il passaggio del Grader per risparmiare risorse e tempo di calcolo, indirizzando immediatamente il flusso verso il ciclo di retry.
+(is_found = False)                \ (is_found = True)
+▼                           ▼
+┌──────────────┐          ┌───────────────────┐
+│ Forza Fallito│          │ Valutazione con   │
+│ Senza Grader │          │ Grader LLM        │
+└──────┬───────┘          └─────────┬─────────┘
+│                            │
+│                    [ Risposta valida? ]
+│                    /                 
 
-Auditing tramite Grader LLM (Chain of Thought):
+│            (No)   /                   \ (Sì)
+▼                  ▼                     ▼
+┌───────────────────────────┐         ┌───────────────────┐
+│ Incrementa Tentativi.     │         │ Salva in Cache    │
+│ Inietta istruzione di     │         │ Ritorna Risposta  │
+│ ri-formulazione e ri-esegui│        └───────────────────┘
+│ pipeline di Retrieval     │
+└───────────────────────────┘
 
-Se is_found = True, il modello valutatore (gemini-3.1-flash-lite) esamina la query, la risposta generata e il testo completo dei contesti passati per determinare se la risposta è accurata e priva di allucinazioni.
 
-Ciclo di Retry Attivo e Riformulazione:
 
-Se il Grader boccia la risposta, il sistema avvia un secondo tentativo (MAX_MODEL_RETRIES = 2).
+1. **Generazione Strutturata**: L'LLM (`gemini-3.5-flash`) genera la risposta richiedendo esplicitamente un formato JSON strutturato contenente la chiave booleana `is_found`.
 
-Viene iniettato nella cronologia un messaggio fittizio utente che istruisce esplicitamente il query rewriter a cambiare angolazione semantica, allargare i filtri logici e utilizzare sinonimi differenti per estrarre nuovi documenti.
+2. **Logica Fail-Fast**: Se `is_found` è falsato (il modello dichiara esplicitamente di non disporre di materiale attendibile nei documenti), il Grader viene evitato per risparmiare tempo e risorse API, classificando immediatamente il tentativo come insoddisfacente.
 
-La pipeline riesegue il retrieval e produce una nuova risposta.
+3. **Il Grader**: Se la risposta è strutturalmente valida, un modello valutatore (`gemini-3.1-flash-lite`) esegue un controllo di fedeltà (CoT - Chain of Thought) incrociando la risposta con i testi dei contesti estratti per identificare eventuali allucinazioni.
 
-Caching Semantico e Auto-Logging delle Query Fallite:
+4. **Ciclo di Retry Attivo**: Se il Grader boccia la risposta (o se `is_found` è falso), il sistema avvia un nuovo tentativo (fino a `MAX_MODEL_RETRIES`):
 
-In caso di successo: La risposta viene salvata nella collezione semantic_cache di Qdrant. La chiave è sensibile e tiene traccia della query, dei sub-topic attivi e dei filtri applicati.
+   * Modifica la cronologia inserendo un'istruzione correttiva dinamica (esortando l'LLM ad allargare l'angolo semantico o a usare sinonimi alternativi).
 
-In caso di fallimento definitivo: Il sistema salva automaticamente la sessione nella tabella chat_feedback di MySQL con un voto di default pari a 0 e la dicitura "Auto-Log: Risposta non trovata o non soddisfacente". Questo permette agli amministratori di effettuare analisi offline e sessioni di fine-tuning dei prompt o della base documentale.
+   * Riesegue l'intera pipeline di query transformation, embedding vettoriali e retrieval per ottenere un set di contesti differente e più ampio.
 
-6. Schema del Database MySQL & Integrazione con il Codice
+5. **Auto-Logging degli Errori**: Se anche l'ultimo tentativo fallisce, la query originale viene salvata automaticamente nella tabella MySQL `chat_feedback` con un rating pari a `0` e un commento di auto-log. Questo consente agli amministratori del sistema di eseguire un'analisi offline dei fallimenti per migliorare i prompt o arricchire la base documentale.
 
-Di seguito viene mappata l'interazione tra lo schema logico del database MySQL (da mysql_schema.txt) e le funzioni della pipeline RAG:
+### F. Cache Semantica e Filtri Dinamici sui Metadati
 
-Tabella MySQL
+Per garantire tempi di risposta fulminei (sub-secondari) per quesiti ricorrenti, il sistema interroga una cache semantica memorizzata all'interno di Qdrant (`semantic_cache`):
 
-Ruolo nel RAG
+* La chiave di cache è incredibilmente sensibile e sicura: viene calcolata in base al vettore della query principale, alla combinazione ordinata dei sub-topic attivi e ad un hash crittografico MD5 che rappresenta fedelmente lo stato dei filtri dei metadati applicati.
 
-Modulo Interagente
+* Se la visualizzazione della query in cache supera la soglia dello `0.97`, la risposta salvata viene istantaneamente restituita, bypassando l'intero ciclo di recupero, riordinamento e chiamata all'LLM.
 
-Operazioni Chiave
+* Una routine periodica pianificata via Celery Beat (`prune_semantic_cache`) provvede ad eliminare i record di cache obsoleti (più vecchi di 24 ore) per evitare la persistenza di informazioni superate.
 
-parent_documents
+## 4. Analisi dei Punti di Forza dell'Architettura
 
-Memorizza il contesto strutturato esteso (Parent).
+* **Resilienza alle API Esterne**: L'uso combinato di code RabbitMQ per l'ingestione, la limitazione del rate tramite code asincrone (`AsyncLimiter`) e il fallback transizionale tra Gemini e Google Cloud Vision rendono la pipeline di digitalizzazione e ocrizzazione immune a blocchi improvvisi.
 
-ingest.py (Scrittura)
+* **Strutturazione del Codice per Processi Sicuri**: L'inizializzazione dei client di rete (`QdrantClient`, pool MySQL) avviene rigorosamente in modalità post-fork all'interno dell'evento Celery `@worker_process_init.connect`. Questo azzera i rischi di corruzione dei socket o errori di Broken Pipe legati alla gestione dei thread in ambienti Unix.
 
+* **Separazione dei Contesti (Topic/Sub-topic)**: La segmentazione logica dei dati su MySQL e Qdrant assicura che gli utenti o le interfacce API interroghino esclusivamente perimetri documentali coerenti, riducendo drasticamente il rumore informativo nel contesto.
 
+* **Filtrazione Flessibile e Tipizzata**: Il sistema mappa nativamente costrutti complessi sui filtri vettoriali di Qdrant (come ricerche full-text mirate, range temporali numerici, selezioni multiple tramite `MatchAny` o valori puntuali).
 
-worker.py (Lettura)
-
-executemany per inserimento massivo.
-
-
-
-SELECT WHERE id IN (...) per recupero.
-
-sub_topics
-
-Configurazione a runtime dei parametri di chunking per sub-topic.
-
-ingest.py (Lettura)
-
-
-
-app.py (Lettura)
-
-get_subtopic_config per recuperare i parametri di splitting prima dell'ingestion.
-
-topics
-
-Associazione dei macro-argomenti ai rispettivi prompt di sistema.
-
-worker.py (Lettura)
-
-get_topic_prompt per caricare dinamicamente il template del prompt.
-
-chat_feedback
-
-Raccolta feedback utente e tracciamento fallimenti del Grader.
-
-app.py (Scrittura)
-
-
-
-worker.py (Scrittura)
-
-log_automatic_negative_feedback per query insoddisfacenti con rating 0.
-
-system_logs
-
-Auditing centralizzato ed errori di esecuzione dei pod.
-
-ingest.py / Moduli RAG
-
-MySQLLogHandler cattura eccezioni e stack-trace salvandoli nel database.
-
-failed_queries
-
-Registro delle query non instradabili o prive di topic valido.
-
-app.py (Gateway)
-
-Tracciamento dei tentativi di accesso non autorizzati o query orfane.
-
-7. Manutenzione, Monitoraggio e Scheduled Task
-
-Logging Centralizzato (system_logs):
-Il logger utilizza un handler MySQL personalizzato (MySQLLogHandler). In caso di eccezioni critiche (es. arresto improvviso di un worker, errori di rete con RabbitMQ, ecc.), lo stack trace completo, il file di origine, il numero di riga e il nome del pod Kubernetes vengono registrati in modo strutturato a database, semplificando le attività di debugging in ambienti cloud.
-
-CronJob di Manutenzione della Cache:
-Per evitare la conservazione di risposte obsolete, Celery Beat esegue un task pianificato periodico (prune_semantic_cache) che viene attivato ogni ora (crontab(minute=0)):
-
-Esegue una query di cancellazione su Qdrant rimuovendo tutti i vettori di cache il cui timestamp di creazione è superiore a MAX_AGE_SECONDS (24 ore).
-
-8. Requisiti Software, Dipendenze e Configurazione
-
-Il sistema è pronto per essere eseguito in ambienti containerizzati e orchestrati (Docker, Kubernetes). Di seguito vengono definiti i requisiti software essenziali.
-
-Dipendenze di Sistema:
-
-Database Relazionale: MySQL 8.0+ (consigliato l'uso del motore InnoDB, charset utf8mb4).
-
-Database Vettoriale: Qdrant v1.7+ (con supporto per ricerche di affinità ed eliminazione asincrona).
-
-Message Broker: RabbitMQ v3.12+ (con supporto per code durevoli e messaggi persistenti).
-
-Distributed Task Queue & Backend di Stato: Redis v7.0+ (per Celery).
-
-Dipendenze Python Principali (requirements.txt):
-
-google-genai>=0.1.1
-google-cloud-vision>=3.4.0
-qdrant-client>=1.7.0
-langchain-text-splitters>=0.0.1
-pymupdf>=1.23.0
-pymupdf4llm>=0.0.12
-aio-pika>=9.0.0
-aiolimiter>=1.1.0
-celery>=5.3.0
-redis>=5.0.0
-Flask>=3.0.0
-Flask-CORS>=4.0.0
-mysql-connector-python>=8.2.0
-onnxruntime>=1.16.0
-tenacity>=8.2.0
-typeguard>=4.1.0
-
-
-Variabili d'Ambiente Fondamentali:
-
-# --- Autenticazione & API ---
-GOOGLE_API_KEY="your-gemini-and-embedding-key"
-API_SECRET_KEY="secure-bearer-token-for-flask"
-ALLOWED_ORIGINS="[https://your-frontend-domain.com](https://your-frontend-domain.com)"
-
-# --- Broker & Code ---
-BROKER_HOST="rabbitmq-service.rag.svc.cluster.local"
-BROKER_PORT=5672
-BROKER_USERNAME="guest"
-BROKER_PASSWORD="guest"
-REDIS_URL="redis://redis-service.rag.svc.cluster.local:6379/0"
-
-# --- Database ---
-MYSQL_SERVICE_HOST="mysql-service.rag.svc.cluster.local"
-MYSQL_SERVICE_PORT=3306
-MYSQL_USER="raguser"
-MYSQL_PASSWORD="your-secure-db-password"
-MYSQL_DATABASE="rag_db"
-
-QDRANT_HOST="qdrant-service.rag.svc.cluster.local"
-QDRANT_PORT=6333
-
-# --- Modelli & Reranking ---
-OCR_MODEL_NAME="gemini-3-flash-preview"
-QUERY_REWRITER_MODEL_NAME="gemini-3.1-flash-lite"
-ANSWER_GENERATOR_MODEL_NAME="gemini-3.5-flash"
-GRADER_MODEL_NAME="gemini-3.1-flash-lite"
-RERANKER_MODEL_PATH="./model_cache/mmarco-mMiniLMv2-L12-H384-v1"
-
-# --- Parametri Algoritmici ---
-LOG_LEVEL="INFO"
-ALLOW_GENERAL_KNOWLEDGE="true"
-ALLOW_SUBTOPIC_SELECTION="true"
-RERANK_SIZE=25
-MAX_CONTEXT_CHARS=30000
