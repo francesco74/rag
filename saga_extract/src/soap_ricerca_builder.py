@@ -15,15 +15,6 @@ import sys
 from ricerca_filtri import DeterminaFilter, DatiUtenteFilter, MetadataItem, RicercaFiltri
 
 # TOML: Python 3.11+ ha tomllib; fallback per versioni precedenti
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        #logging.FileHandler("app.log"), # Saves to a file
-        logging.StreamHandler()         # Prints to console
-    ]
-)
 log = logging.getLogger(__name__)
 
 # -----------------------------
@@ -101,7 +92,7 @@ class DocWSRicercheClient:
         self,
         endpoint_url: str,
         cid: Optional[str] = None,
-        timeout: Union[int, float] = 30,
+        timeout: Union[int, float] = 300,
         verify_tls: bool = True,
     ):
         self.endpoint_url = endpoint_url

@@ -10,3 +10,4 @@ aiolimiter>=1.1.0
 tenacity>=8.2.0
 python-dotenv
 aio_pika>=8.0.0
+mysql-connector-python==9.5.0

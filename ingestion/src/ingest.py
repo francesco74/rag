@@ -32,7 +32,7 @@ from tenacity import (
     retry_if_exception_type
 )
 
-from google.api_core.exceptions import ResourceExhausted, ServiceUnavailable
+from google.genai.errors import APIError
 
 from db_logger import MySQLLogHandler, get_db_connection, init_db_pool
 from dotenv import load_dotenv
@@ -80,6 +80,7 @@ log = logging.getLogger("IngestWorker")
 
 # Aggiunta handler su database
 db_handler = MySQLLogHandler()
+db_handler.setLevel(logging.WARNING)
 db_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s'))
 log.addHandler(db_handler)
 
@@ -104,7 +105,7 @@ qdrant_client = AsyncQdrantClient(
 
 # Concurrency & Limiting
 CONCURRENCY_LIMIT = asyncio.Semaphore(5)
-GEMINI_LIMITER = AsyncLimiter(max_rate=100, time_period=60)
+GEMINI_LIMITER = AsyncLimiter(max_rate=1000, time_period=60)
 
 headers_to_split_on = [("#", "Header 1"), ("##", "Header 2"), ("###", "Header 3"), ("####", "Header 4")]
 markdown_splitter = MarkdownHeaderTextSplitter(headers_to_split_on=headers_to_split_on, strip_headers=False)
@@ -127,8 +128,7 @@ def get_subtopic_config(topic_id, sub_topic_id):
     """Recupera i parametri di chunking dal DB."""
     conn = get_db_connection()
     if not conn: 
-        log.error("Connessione al DB fallita. Impossibile recuperare i config.")
-        return None
+        raise ConnectionError("Database temporaneamente non raggiungibile o pool non pronto.")
     try:
         with conn.cursor(dictionary=True) as cursor:
             cursor.execute(
@@ -153,7 +153,7 @@ def safe_move_file(src_path, dest_folder):
         log.error(f"File Move Error ({src_path}): {e}")
 
 @retry(
-    retry=retry_if_exception_type((ResourceExhausted, ServiceUnavailable)),
+    retry=retry_if_exception_type(APIError),
     wait=wait_random_exponential(multiplier=2, min=10, max=80),
     stop=stop_after_attempt(20)
 )
@@ -338,7 +338,10 @@ async def process_single_file_async(topic_id, sub_topic_id, json_path, root_fold
             log.info(f"Chunking: {len(parent_docs)} Parent Documents generati.")
 
             mysql_parents_data = []
-            all_child_points = []
+            
+            # --- MODIFICA STRUTTURALE: Liste piatte per tutto il documento ---
+            all_child_payloads_without_vectors = []
+            all_batch_texts = []
 
             def build_payload(base_dict, extra_meta):
                 payload = base_dict.copy()
@@ -351,50 +354,49 @@ async def process_single_file_async(topic_id, sub_topic_id, json_path, root_fold
         
             ingestion_id = str(uuid.uuid4())
 
+            # 1. Preparazione Dati Offline (Nessuna chiamata di rete qui)
             for p_idx, p_doc in enumerate(parent_docs):
                 parent_id = str(uuid.uuid4())
-                
                 merged_metadata = {**p_doc.metadata, **extra_metadata}
                 
                 mysql_parents_data.append((
-                    parent_id,
-                    topic_id,
-                    sub_topic_id,
-                    source_name,
-                    file_name,
-                    p_idx,
-                    p_doc.page_content,
-                    json.dumps(merged_metadata) # Salviamo i metadati come stringa JSON
+                    parent_id, topic_id, sub_topic_id, source_name, file_name, 
+                    p_idx, p_doc.page_content, json.dumps(merged_metadata)
                 ))
 
-                # PREPARAZIONE DATI PER QDRANT (Child Chunks)
                 child_docs = child_text_splitter.create_documents([p_doc.page_content])
-                batch_texts = [c.page_content for c in child_docs]
                 
-                if not batch_texts: continue
-
-                child_vectors = []
-                # Batch processing per superare i limiti API
-                for i in range(0, len(batch_texts), 250):
-                    child_vectors.extend(await async_embed_batch(batch_texts[i:i+250]))
-
-                for c_idx, vec in enumerate(child_vectors):
+                for c_idx, c_doc in enumerate(child_docs):
                     child_base_payload = {
-                        **child_docs[c_idx].metadata,
+                        **c_doc.metadata,
                         "parent_id": parent_id, 
                         "topic_id": topic_id, 
                         "sub_topic_id": sub_topic_id,
                         "source": source_name, 
                         "file_name": file_name, 
                         "child_index": c_idx, 
-                        "content": child_docs[c_idx].page_content,
+                        "content": c_doc.page_content,
                         "_ingestion_id": ingestion_id
                     }
-                    all_child_points.append(
-                        models.PointStruct(
-                            id=str(uuid.uuid4()), vector=vec, payload=build_payload(child_base_payload, extra_metadata)
-                        )
+                    all_child_payloads_without_vectors.append(child_base_payload)
+                    all_batch_texts.append(c_doc.page_content)
+
+            # 2. Esecuzione massiva degli Embeddings (Massima capienza batch = 250)
+            all_vectors = []
+            if all_batch_texts:
+                log.info(f"Avvio vectorizzazione per {len(all_batch_texts)} chunk totali del documento.")
+                for i in range(0, len(all_batch_texts), 100):
+                    batch = all_batch_texts[i:i+100]
+                    all_vectors.extend(await async_embed_batch(batch))
+
+            # 3. Riassemblaggio (Zippiamo vettori e payload pre-costruiti)
+            all_child_points = []
+            for vec, payload in zip(all_vectors, all_child_payloads_without_vectors):
+                all_child_points.append(
+                    models.PointStruct(
+                        id=str(uuid.uuid4()), vector=vec, payload=build_payload(payload, extra_metadata)
                     )
+                )
 
             # 1. Salvataggio su MySQL (Sincrono, spostato su thread separato)
             log.info(f"MySQL Upsert: {len(mysql_parents_data)} Parent Documents.")
@@ -549,8 +551,9 @@ async def main_worker():
         async with connection:
             channel = await connection.channel()
             
-            # QoS prefeth per bilanciare memoria e rate limits
-            await channel.set_qos(prefetch_count=3)
+            # FIX 1: Alziamo il prefetch a 20. RabbitMQ invia fino a 20 messaggi in anticipo 
+            # al worker, permettendo al semaforo (5) di lavorare a pieno regime senza tempi morti.
+            await channel.set_qos(prefetch_count=20)
 
             queue_in = await channel.get_queue("da-indicizzare") 
             
@@ -558,7 +561,9 @@ async def main_worker():
             
             async with queue_in.iterator() as queue_iter:
                 async for message in queue_iter:
-                    await on_message_received(message)
+                    # FIX 2: create_task avvia l'elaborazione in background SENZA bloccare il ciclo di ricezione.
+                    # Il ciclo preleverà istantaneamente i prossimi messaggi, scatenando la vera concorrenza.
+                    asyncio.create_task(on_message_received(message))
                     
     except Exception as e:
         log.error(f"Errore critico di connettività broker: {e}")

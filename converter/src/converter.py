@@ -6,6 +6,7 @@ import asyncio
 import io
 from pathlib import Path
 from PIL import Image
+from db_logger import MySQLLogHandler, init_db_pool
 
 import fitz          # PyMuPDF
 import pymupdf4llm   # Native PDF to Markdown
@@ -17,7 +18,8 @@ from google.genai import types
 from google.cloud import vision
 from aiolimiter import AsyncLimiter
 from tenacity import retry, stop_after_attempt, wait_random_exponential, retry_if_exception_type
-from google.api_core.exceptions import ResourceExhausted, ServiceUnavailable
+from google.genai import errors as genai_errors
+import concurrent.futures
 
 from dotenv import load_dotenv
 import html
@@ -25,9 +27,24 @@ import re
 
 load_dotenv()
 
+# --- DIRECTORY SYSTEM ---
+BASE_DIR = Path("./data")
+DATA_FOLDER = Path(os.environ.get("DATA_FOLDER", str(BASE_DIR)))
+STAGING_DIR = DATA_FOLDER / "staging"
+INGESTION_WATCH_DIR = DATA_FOLDER / "watch"
+ERROR_DIR = DATA_FOLDER / "converter" / "error"
+ARCHIVE_DIR = DATA_FOLDER / "converter" / "archive"
+
+DB_HOST = os.environ.get("MYSQL_SERVICE_HOST", "localhost")
+DB_PORT = int(os.environ.get("MYSQL_SERVICE_PORT", 3306))
+DB_USER = os.environ.get("MYSQL_USER", "raguser")
+DB_PASS = os.environ.get("MYSQL_PASSWORD", "")
+DB_NAME = os.environ.get("MYSQL_DATABASE", "rag_db")
+
 # ==============================================================================
 # 1. CONFIGURAZIONE E LOGGING
 # ==============================================================================
+init_db_pool(host=DB_HOST, port=DB_PORT, user=DB_USER, password=DB_PASS, database=DB_NAME)
 
 log_level_str = os.environ.get("LOG_LEVEL", "INFO").upper()
 log_level = getattr(logging, log_level_str, logging.INFO)
@@ -38,13 +55,10 @@ logging.basicConfig(
 )
 log = logging.getLogger("ConverterWorker")
 
-# --- DIRECTORY SYSTEM ---
-BASE_DIR = Path("./data")
-DATA_FOLDER = Path(os.environ.get("DATA_FOLDER", str(BASE_DIR)))
-STAGING_DIR = DATA_FOLDER / "staging"
-INGESTION_WATCH_DIR = DATA_FOLDER / "watch"
-ERROR_DIR = DATA_FOLDER / "converter" / "error"
-ARCHIVE_DIR = DATA_FOLDER / "converter" / "archive"
+db_handler = MySQLLogHandler()
+db_handler.setLevel(logging.WARNING) 
+db_handler.setFormatter(logging.Formatter('%(asctime)s - CONVERTER - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s'))
+log.addHandler(db_handler)
 
 # Assicuriamo che le directory esistano allo startup
 for d in [STAGING_DIR, INGESTION_WATCH_DIR, ERROR_DIR, ARCHIVE_DIR]:
@@ -67,6 +81,43 @@ GEMINI_LIMITER = AsyncLimiter(max_rate=10, time_period=60)
 api_key = os.environ.get("GOOGLE_API_KEY")
 client = genai.Client(api_key=api_key)
 vision_client = vision.ImageAnnotatorClient()
+
+def _cpu_heavy_pdf_extraction(file_path_str: str, file_bytes: bytes, crop_limit: int):
+    """
+    Funzione isolata per ProcessPoolExecutor.
+    Gira in un processo OS separato, bypassando totalmente il GIL.
+    """
+    import fitz
+    import pymupdf4llm
+    
+    extracted_pages = []
+    if file_bytes:
+        doc = fitz.open(stream=file_bytes, filetype="pdf")
+    else:
+        doc = fitz.open(file_path_str)
+
+    for p_num in range(len(doc)):
+        page = doc[p_num]
+        rect = page.rect
+        clip_rect = fitz.Rect(0, crop_limit, rect.width, rect.height - crop_limit) if rect.height > 200 else rect
+        text = page.get_text(sort=True, clip=clip_rect).strip()
+        
+        char_count = len(text)
+        if  char_count < 50:
+            # Estrazione immagine. Non possiamo passare oggetti PIL tra processi, passiamo i bytes.
+            log.debug(f"Pagina {p_num}: Rilevato testo nativo non sufficiente ({char_count} chars). Estrazione mediante OCR.")
+            
+            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False, clip=clip_rect)
+            extracted_pages.append({"type": "image", "content": pix.tobytes("png")})
+        else:
+            # Estrazione Markdown 
+            log.debug(f"Pagina {p_num}: Rilevato testo nativo sufficiente ({char_count} chars). Estrazione Markdown.")
+            page_md = pymupdf4llm.to_markdown(doc, pages=[p_num])
+            page_md = page_md.replace("<br>", "\n")
+            extracted_pages.append({"type": "markdown", "content": page_md})
+            
+    doc.close()
+    return extracted_pages
 
 
 def safe_move(src: Path, dest: Path):
@@ -95,7 +146,8 @@ def _cloud_vision_fallback(image: Image.Image) -> str:
     return response.full_text_annotation.text
 
 @retry(
-    retry=retry_if_exception_type((ResourceExhausted, ServiceUnavailable)),
+    # FIX: Cattura i Rate Limit (429) e gli Errori di Server (500/503) del nuovo SDK
+    retry=retry_if_exception_type((genai_errors.APIError, genai_errors.ServerError, genai_errors.ClientError)),
     wait=wait_random_exponential(multiplier=2, min=10, max=80),
     stop=stop_after_attempt(20)
 )
@@ -141,54 +193,38 @@ async def async_ocr_generate(image_input, as_markdown=False) -> str:
             raise ValueError(f"OCR Generation Failed: {e}")
 
 async def extract_hybrid_markdown_from_pdf_async(file_path: Path, file_bytes: bytes = None) -> str:
-    """Estrae il testo nativo dal PDF o innesca l'OCR per le pagine scansionate."""
+    """Estrae il testo nativo dal PDF o innesca l'OCR (Versione Multi-Processo Anti-Crash)."""
+    log.info(f"Avvio estrazione ibrida MULTI-PROCESSO per: {file_path.name}")
     md_pages = []
     
-    def evaluate_and_extract_page(doc, p_num):
-        page = doc[p_num]
-        rect = page.rect
-        clip_rect = fitz.Rect(0, CROP_OCR_LIMIT, rect.width, rect.height - CROP_OCR_LIMIT) if rect.height > 200 else rect
-        text = page.get_text(sort=True, clip=clip_rect).strip()
-        
-        char_count = len(text)
-        if char_count < 50:
-            log.debug(f"Pagina {p_num+1}: Rilevata bassa densità di testo ({char_count} chars). Tagging per elaborazione OCR.")
-            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False, clip=clip_rect)
-            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-            return {"type": "image", "content": img}
-        else:
-            log.debug(f"Pagina {p_num+1}: Rilevato testo nativo sufficiente ({char_count} chars). Estrazione Markdown.")
-            page_md = pymupdf4llm.to_markdown(doc, pages=[p_num])
-            page_md = page_md.replace("<br>", "\n")
-            
-            return {"type": "markdown", "content": page_md}
-
-    log.info(f"Avvio estrazione ibrida per: {file_path.name}")
-    
     try:
-        if file_bytes:
-            doc = fitz.open(stream=file_bytes, filetype="pdf")
-        else:
-            doc = fitz.open(file_path)
-            
-        total_pages = len(doc)
-        log.debug(f"Documento aperto. Pagine totali: {total_pages}")
+        loop = asyncio.get_running_loop()
+        
+        # 1. Avvia un processo OS separato. Il Worker Async principale rimane reattivo al 100%.
+        with concurrent.futures.ProcessPoolExecutor(max_workers=1) as pool:
+            pages_data = await loop.run_in_executor(
+                pool, 
+                _cpu_heavy_pdf_extraction, 
+                str(file_path), 
+                file_bytes, 
+                CROP_OCR_LIMIT
+            )
 
-        for page_num in range(total_pages):
-            page_data = await asyncio.to_thread(evaluate_and_extract_page, doc, page_num)
-            
+        # 2. Tornati nell'Event Loop Async, gestiamo le eventuali chiamate API di rete (OCR)
+        for page_data in pages_data:
             if page_data["type"] == "image":
-                gemini_md = await async_ocr_generate(page_data["content"], as_markdown=True)
+                # Ricostruiamo l'oggetto PIL dai bytes generati dal processo figlio
+                img = Image.open(io.BytesIO(page_data["content"]))
+                gemini_md = await async_ocr_generate(img, as_markdown=True)
                 md_pages.append(gemini_md)
             else:
                 md_pages.append(page_data["content"])
 
-        doc.close()
         log.info(f"Estrazione ibrida completata per {file_path.name}. Generati {len(md_pages)} blocchi.")
         return "\n\n---\n\n".join(md_pages)
         
     except Exception as e:
-        log.error(f"Fallimento durante l'apertura/lettura del PDF {file_path.name}", exc_info=True)
+        log.error(f"Fallimento durante l'estrazione multi-processo del PDF {file_path.name}", exc_info=True)
         raise
 
 # ==============================================================================

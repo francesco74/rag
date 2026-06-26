@@ -5,8 +5,13 @@ import pathlib
 from pathlib import Path
 from typing import Optional
 import pika
-
+import os
+from db_logger import MySQLLogHandler, init_db_pool
+from dotenv import load_dotenv
 from asn1crypto.cms import ContentInfo
+
+load_dotenv()
+
 
 from risultati_ricerca_parser import run_search
 from estrazione_documenti import build_client_from_env
@@ -18,7 +23,14 @@ from config import settings
 ESTENSIONI_CONSENTITE = {".pdf", ".p7m"}
 STAGING_ATTI_FOLDER = pathlib.Path(settings.data_folder) / "staging" / "attiprovincia"
 
-log = logging.getLogger("main_extractor")
+DB_HOST = os.environ.get("MYSQL_SERVICE_HOST", "localhost")
+DB_PORT = int(os.environ.get("MYSQL_SERVICE_PORT", 3306))
+DB_USER = os.environ.get("MYSQL_USER", "raguser")
+DB_PASS = os.environ.get("MYSQL_PASSWORD", "")
+DB_NAME = os.environ.get("MYSQL_DATABASE", "rag_db")
+
+log = None
+init_db_pool(host=DB_HOST, port=DB_PORT, user=DB_USER, password=DB_PASS, database=DB_NAME)
 
 def clean_iso_date(date_raw: str) -> Optional[str]:
     """Uniforma le date al formato YYYY-MM-DD, rimuovendo le componenti temporali (T)."""
@@ -61,15 +73,33 @@ def get_rabbitmq_channel():
         raise
 
 def main():
+    global log
+
     parser = argparse.ArgumentParser(description="Estrattore Massivo")
     parser.add_argument("--debug", action="store_true", help="Abilita log di livello DEBUG.")
     parser.add_argument("--dry", action="store_true", help="Simula la ricerca.")
     parser.add_argument("--json-filters", type=str, required=True, help="Filtri in JSON.")
     args = parser.parse_args()
 
+    init_db_pool(host=DB_HOST, port=DB_PORT, user=DB_USER, password=DB_PASS, database=DB_NAME)
+
     # Fallback sul debug richiesto via CLI, altrimenti usa config
     log_level = logging.DEBUG if args.debug else getattr(logging, settings.log_level, logging.INFO)
-    logging.basicConfig(level=log_level, format='%(asctime)s - ESTRATTORE - %(levelname)s - %(message)s', force=True)
+    
+    # Definisce il formato globale per tutta l'applicazione (niente più force=True)
+    logging.basicConfig(
+        level=log_level, 
+        format='%(asctime)s - ESTRATTORE - %(levelname)s - %(message)s'
+    )
+    
+    # Configura il DB Handler da agganciare al logger root (così cattura anche i file secondari)
+    root_logger = logging.getLogger()
+    db_handler = MySQLLogHandler()
+    db_handler.setLevel(logging.WARNING)
+    db_handler.setFormatter(logging.Formatter('%(asctime)s - ESTRATTORE - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s'))
+    root_logger.addHandler(db_handler)
+    
+    log = logging.getLogger("main_extractor")
     
     try:
         raw_json = json.loads(args.json_filters)
@@ -120,7 +150,7 @@ def main():
     
     try:
         repwss_client = build_client_from_env()
-        mq_conn, mq_channel = get_rabbitmq_channel()
+        #mq_conn, mq_channel = get_rabbitmq_channel()
     except Exception as e:
         log.error("Impossibile inizializzare il client WSAtti: %s", str(e))
         return
@@ -228,15 +258,20 @@ def main():
                 "rel_path": rel_path_to_json
             }
             
-            mq_channel.basic_publish(
-                exchange='',
-                routing_key='da-convertire',
-                body=json.dumps(payload).encode(),
-                properties=pika.BasicProperties(
-                    delivery_mode=pika.DeliveryMode.Persistent # Il messaggio sopravvive al riavvio del broker
+            mq_conn, mq_channel = get_rabbitmq_channel()
+            try:
+                mq_channel.basic_publish(
+                    exchange='',
+                    routing_key='da-convertire',
+                    body=json.dumps(payload).encode(),
+                    properties=pika.BasicProperties(
+                        delivery_mode=pika.DeliveryMode.Persistent
+                    )
                 )
-            )
-            log.debug(f"📨 Inviato evento a RabbitMQ per il file: {json_filename}")
+                log.debug(f"📨 Inviato evento a RabbitMQ per il file: {json_filename}")
+            finally:
+                # Garantisce la pulizia del socket in ogni caso
+                mq_conn.close()
 
         except Exception as e:
             log.error("✗ Errore elaborando UID %s: %s", str_uid, str(e), exc_info=True)
@@ -244,10 +279,6 @@ def main():
                 tmp_p.unlink(missing_ok=True)
             if tmp_json_path and tmp_json_path.exists():
                 tmp_json_path.unlink(missing_ok=True)
-
-    try:
-        mq_conn.close()
-    except: pass
 
     log.info("Completato (%d/%d estratti).", success_count, len(risultato_ricerca.ids))
 

@@ -39,7 +39,7 @@ def load_settings() -> Settings:
     # Es: se HTTP_TIMEOUT_SECONDS="", os.getenv() o 30 restituisce 30.
     
     return Settings(
-        http_timeout_seconds=int(os.getenv("HTTP_TIMEOUT_SECONDS") or 30),
+        http_timeout_seconds=int(os.getenv("HTTP_TIMEOUT_SECONDS") or 300),
         data_folder=os.getenv("DATA_FOLDER") or str(Path(__file__).parent.resolve()),
         log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
         

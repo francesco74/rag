@@ -26,7 +26,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # --- Copy Application Code ---
 # Copy the rest of the application code into the container
-COPY src/converter.py .
+COPY src/. .
 
 # --- Configure and Run ---
 # Make port 8080 available to the world outside this container

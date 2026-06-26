@@ -7,6 +7,7 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from typing import Tuple, Dict, Any, List
 import requests
+import re
 
 from config import settings
 
@@ -23,7 +24,7 @@ class WSAttiSoapClient:
     SOAPENV_NS = "http://schemas.xmlsoap.org/soap/envelope/"
     TEM_NS = "http://tempuri.org/"
 
-    def __init__(self, endpoint_url: str, credentials: WSAttiCredentials, timeout: int = 30, verify_tls: bool = True):
+    def __init__(self, endpoint_url: str, credentials: WSAttiCredentials, timeout: int = 300, verify_tls: bool = True):
         self.endpoint_url = endpoint_url
         self.credentials = credentials
         self.timeout = timeout
@@ -84,8 +85,14 @@ class WSAttiSoapClient:
             raise RuntimeError("Tag LeggiAttoPlusResult vuoto o non trovato nella risposta SOAP.")
 
         raw_inner = result_el.text.strip()
-        decoded_inner = html.unescape(raw_inner)
-        inner_tree = ET.fromstring(decoded_inner)
+
+        clean_inner = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', raw_inner)
+
+        try:
+            inner_tree = ET.fromstring(clean_inner)
+        except ET.ParseError as e:
+            log.error("XML interno malformato. Porzione incriminata: %s", clean_inner[max(0, e.position[1]-50) : e.position[1]+50])
+            raise RuntimeError(f"WSAttiSoap Errore Parsing XML interno: {str(e)}")
 
         errore = inner_tree.findtext(".//Errore")
         if errore and errore.strip():
