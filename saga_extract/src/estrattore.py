@@ -6,31 +6,25 @@ from pathlib import Path
 from typing import Optional
 import pika
 import os
-from db_logger import MySQLLogHandler, init_db_pool
+from common.db_logger import MySQLLogHandler, init_db_pool
 from dotenv import load_dotenv
 from asn1crypto.cms import ContentInfo
 
 load_dotenv()
 
 
-from risultati_ricerca_parser import run_search
-from estrazione_documenti import build_client_from_env
-from ricerca_filtri import RicercaFiltri, DeterminaFilter, DeliberaFilter, DecretoFilter
+from common.risultati_ricerca_parser import run_search
+from common.estrazione_documenti import build_client_from_env
+from common.ricerca_filtri import RicercaFiltri, DeterminaFilter, DeliberaFilter, DecretoFilter
 
 # Importa l'unica fonte di verità
-from config import settings
+from common.config import settings
 
 ESTENSIONI_CONSENTITE = {".pdf", ".p7m"}
 STAGING_ATTI_FOLDER = pathlib.Path(settings.data_folder) / "staging" / "attiprovincia"
 
-DB_HOST = os.environ.get("MYSQL_SERVICE_HOST", "localhost")
-DB_PORT = int(os.environ.get("MYSQL_SERVICE_PORT", 3306))
-DB_USER = os.environ.get("MYSQL_USER", "raguser")
-DB_PASS = os.environ.get("MYSQL_PASSWORD", "")
-DB_NAME = os.environ.get("MYSQL_DATABASE", "rag_db")
-
 log = None
-init_db_pool(host=DB_HOST, port=DB_PORT, user=DB_USER, password=DB_PASS, database=DB_NAME)
+init_db_pool()
 
 def clean_iso_date(date_raw: str) -> Optional[str]:
     """Uniforma le date al formato YYYY-MM-DD, rimuovendo le componenti temporali (T)."""
@@ -81,7 +75,7 @@ def main():
     parser.add_argument("--json-filters", type=str, required=True, help="Filtri in JSON.")
     args = parser.parse_args()
 
-    init_db_pool(host=DB_HOST, port=DB_PORT, user=DB_USER, password=DB_PASS, database=DB_NAME)
+    init_db_pool()
 
     # Fallback sul debug richiesto via CLI, altrimenti usa config
     log_level = logging.DEBUG if args.debug else getattr(logging, settings.log_level, logging.INFO)
