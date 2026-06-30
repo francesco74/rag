@@ -3,8 +3,8 @@ import asyncio
 import logging
 from dotenv import load_dotenv
 from qdrant_client import AsyncQdrantClient, models
-
-load_dotenv()
+from common.config import settings
+from common.db_logger import MySQLLogHandler, get_db_connection, init_db_pool
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 log = logging.getLogger("qdrant_setup")
@@ -39,8 +39,8 @@ async def safe_create_payload_index(client, collection_name, field_name, field_s
 async def setup_infrastructure():
     try:
         client = AsyncQdrantClient(
-            host=os.environ.get("QDRANT_HOST", "localhost"), 
-            port=int(os.environ.get("QDRANT_PORT", 6333)),
+            host=settings.qdrant_host, 
+            port=settings.qdrant_port,
             timeout=60.0
         )
         log.info("Connessione a Qdrant stabilita.")
@@ -60,6 +60,7 @@ async def setup_infrastructure():
             "parent_id": models.PayloadSchemaType.KEYWORD,
             "file_name": models.PayloadSchemaType.KEYWORD,
             "percorso_originale": models.PayloadSchemaType.TEXT,
+            "content_hash": models.PayloadSchemaType.KEYWORD,
             "content": models.TextIndexParams(
                 type="text", tokenizer=models.TokenizerType.WORD, min_token_len=2, max_token_len=20, lowercase=True
             ),
@@ -92,7 +93,8 @@ async def setup_infrastructure():
     except Exception as e:
         log.critical(f"Errore critico durante il setup di Qdrant: {e}")
     finally:
-        await client.close()
+        if client:
+            await client.close()
 
 if __name__ == "__main__":
     asyncio.run(setup_infrastructure())

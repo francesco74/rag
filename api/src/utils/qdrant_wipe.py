@@ -3,14 +3,16 @@ import os
 import argparse
 from dotenv import load_dotenv
 from qdrant_client import AsyncQdrantClient
+from common.config import settings
+from common.db_logger import MySQLLogHandler, get_db_connection, init_db_pool
 
 load_dotenv()
 
 async def wipe_qdrant_data(collections_to_delete):
     print(f"Connecting to Qdrant to wipe: {', '.join(collections_to_delete)}...")
     qdrant_client = AsyncQdrantClient(
-        host=os.environ.get("QDRANT_HOST", "localhost"), 
-        port=int(os.environ.get("QDRANT_PORT", 6333))
+        host=settings.qdrant_host, 
+        port=settings.qdrant_port
     )
     
     for collection in collections_to_delete:

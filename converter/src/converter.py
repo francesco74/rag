@@ -6,47 +6,43 @@ import asyncio
 import io
 from pathlib import Path
 from PIL import Image
-from db_logger import MySQLLogHandler, init_db_pool
+from common.db_logger import MySQLLogHandler, init_db_pool
 
 import fitz          # PyMuPDF
 import pymupdf4llm   # Native PDF to Markdown
 import aio_pika      # Asynchronous RabbitMQ client
 
 # --- Dipendenze AI importate ---
-from google import genai
-from google.genai import types
+
 from google.cloud import vision
 from aiolimiter import AsyncLimiter
 from tenacity import retry, stop_after_attempt, wait_random_exponential, retry_if_exception_type
+from google import genai
+from google.genai import types
 from google.genai import errors as genai_errors
 import concurrent.futures
 
 from dotenv import load_dotenv
+from common.config import settings
 import html
 import re
 
 load_dotenv()
 
 # --- DIRECTORY SYSTEM ---
-BASE_DIR = Path("./data")
-DATA_FOLDER = Path(os.environ.get("DATA_FOLDER", str(BASE_DIR)))
+DATA_FOLDER = settings.data_folder
 STAGING_DIR = DATA_FOLDER / "staging"
 INGESTION_WATCH_DIR = DATA_FOLDER / "watch"
 ERROR_DIR = DATA_FOLDER / "converter" / "error"
 ARCHIVE_DIR = DATA_FOLDER / "converter" / "archive"
 
-DB_HOST = os.environ.get("MYSQL_SERVICE_HOST", "localhost")
-DB_PORT = int(os.environ.get("MYSQL_SERVICE_PORT", 3306))
-DB_USER = os.environ.get("MYSQL_USER", "raguser")
-DB_PASS = os.environ.get("MYSQL_PASSWORD", "")
-DB_NAME = os.environ.get("MYSQL_DATABASE", "rag_db")
 
 # ==============================================================================
 # 1. CONFIGURAZIONE E LOGGING
 # ==============================================================================
-init_db_pool(host=DB_HOST, port=DB_PORT, user=DB_USER, password=DB_PASS, database=DB_NAME)
+init_db_pool()
 
-log_level_str = os.environ.get("LOG_LEVEL", "INFO").upper()
+log_level_str = settings.log_level
 log_level = getattr(logging, log_level_str, logging.INFO)
 
 logging.basicConfig(
@@ -65,21 +61,15 @@ for d in [STAGING_DIR, INGESTION_WATCH_DIR, ERROR_DIR, ARCHIVE_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
 CROP_OCR_LIMIT = 0
-OCR_MODEL_NAME = os.environ.get("OCR_MODEL_NAME", "gemini-3-flash-preview")
-
-BROKER_HOST = os.environ.get("BROKER_HOST", "rabbitmq-service.rag.svc.cluster.local")
-BROKER_PORT = int(os.environ.get("BROKER_PORT", 5672))
-BROKER_USERNAME = os.environ.get("BROKER_USERNAME", "guest")
-BROKER_PASSWORD = os.environ.get("BROKER_PASSWORD", "guest")
-
+OCR_MODEL_NAME = settings.ocr_model_name
 IMG_EXTENSIONS = [".png", ".jpg", ".jpeg"]
 
 # Limiter asincrono: gestisce internamente la concorrenza garantendo max 10 chiamate/minuto
 GEMINI_LIMITER = AsyncLimiter(max_rate=10, time_period=60)
 
 # Inizializzazione Client AI
-api_key = os.environ.get("GOOGLE_API_KEY")
-client = genai.Client(api_key=api_key)
+api_llm_key = settings.api_llm_key
+client = genai.Client(api_key=api_llm_key)
 vision_client = vision.ImageAnnotatorClient()
 
 def _cpu_heavy_pdf_extraction(file_path_str: str, file_bytes: bytes, crop_limit: int):
@@ -339,26 +329,35 @@ async def process_single_job(payload: dict, channel: aio_pika.Channel):
 
 async def on_message_received(message: aio_pika.IncomingMessage, channel: aio_pika.Channel):
     """Callback triggered all'arrivo di ogni messaggio da RabbitMQ."""
-    async with message.process(ignore_processed=True):  # ← non auto-ack
-        try:
-            payload = json.loads(message.body.decode())
-            log.debug(f"Payload RabbitMQ Ricevuto: {payload}")
-            await process_single_job(payload, channel)
+    try:
+        payload = json.loads(message.body.decode())
+        log.debug(f"Payload RabbitMQ Ricevuto: {payload}")
+        await process_single_job(payload, channel)
+        if not message.channel.is_closed:
             await message.ack()
-        except json.JSONDecodeError as e:
-            log.error(f"Impossibile decodificare il messaggio: {e}. Scartato in DLQ.")
+        else:
+            log.warning("Channel chiuso prima dell'ack — messaggio già processato con successo, nessun ack inviato.")
+    except json.JSONDecodeError as e:
+        log.error(f"Impossibile decodificare il messaggio: {e}. Scartato in DLQ.")
+        if not message.channel.is_closed:
             await message.reject(requeue=False)
-        except Exception as e:
-            log.error(f"Errore durante l'elaborazione: {e}", exc_info=True)
+    except Exception as e:
+        log.error(f"Errore durante l'elaborazione: {e}", exc_info=True)
+        if not message.channel.is_closed:
             await message.reject(requeue=False)
+        else:
+            log.warning("Channel chiuso — impossibile fare reject. RabbitMQ re-accoda automaticamente al reconnect.")
 
 async def main_worker():
     
     
-    log.info(f"Avvio Worker. Tentativo di connessione a RabbitMQ su {BROKER_HOST}...")
+    log.info(f"Avvio Worker. Tentativo di connessione a RabbitMQ su {settings.broker_host}...")
     
     try:
-        connection = await aio_pika.connect_robust(f"amqp://{BROKER_USERNAME}:{BROKER_PASSWORD}@{BROKER_HOST}:{BROKER_PORT}/")
+        connection = await aio_pika.connect_robust(
+            f"amqp://{settings.broker_username}:{settings.broker_password}@{settings.broker_host}:{settings.broker_port}/",
+            heartbeat=120,
+        )
         
         async with connection:
             channel = await connection.channel()

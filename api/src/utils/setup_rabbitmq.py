@@ -4,12 +4,8 @@ import sys
 import time
 import requests
 from requests.auth import HTTPBasicAuth
-
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass
+from common.config import settings
+from common.db_logger import MySQLLogHandler, get_db_connection, init_db_pool
 
 # ==============================================================================
 # CONFIGURAZIONE LOGGING
@@ -263,27 +259,20 @@ def verify_topology(client: RabbitMQClient) -> bool:
 # ==============================================================================
 
 def main():
-    # Lettura delle configurazioni esclusivamente da os.environ
-    host = os.environ.get("BROKER_HOST", "localhost")
-    port = int(os.environ.get("BROKER_MGMT_PORT", 15672))
-    user = os.environ.get("BROKER_USERNAME", "guest")
-    password = os.environ.get("BROKER_PASSWORD", "guest")
-    
-    
-    max_attempts = int(os.environ.get("RABBITMQ_MAX_ATTEMPTS", 30))
+    max_attempts = settings.broker_max_attemps
 
     log.info("======================================================")
     log.info(" RabbitMQ Topology Setup")
-    log.info(" Host   : %s:%d", host, port)
+    log.info(" Host   : %s:%d", settings.broker_host, settings.broker_port)
     log.info(" VHost  : /")
     log.info("======================================================")
 
     
     client = RabbitMQClient(
-        host=host,
-        port=port,
-        user=user,
-        password=password
+        host=settings.broker_host,
+        port=settings.broker_port,
+        user=settings.broker_username,
+        password=settings.broker_password
     )
 
     if not client.wait_until_ready(max_attempts=max_attempts):

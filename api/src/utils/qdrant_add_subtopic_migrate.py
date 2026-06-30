@@ -1,15 +1,10 @@
 import asyncio
 from qdrant_client import AsyncQdrantClient, models
-from dotenv import load_dotenv
-import os
-
-load_dotenv()
-
-QDRANT_HOST=os.environ.get("QDRANT_HOST", "localhost")
-QDRANT_PORT=int(os.environ.get("QDRANT_PORT", 6333))
+from common.config import settings
+from common.db_logger import MySQLLogHandler, get_db_connection, init_db_pool
 
 async def migrate_qdrant():
-    client = AsyncQdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
+    client = AsyncQdrantClient(host=settings.qdrant_host, port=settings.qdrant_port)
     collection = "document_chunks"
 
     print("Aggiornamento payload esistenti...")

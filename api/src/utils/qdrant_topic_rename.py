@@ -1,9 +1,7 @@
 import os
 from qdrant_client import QdrantClient, models
-
-# Configurazione
-QDRANT_HOST = os.environ.get("QDRANT_HOST", "localhost")
-QDRANT_PORT = int(os.environ.get("QDRANT_PORT", 6333))
+from common.config import settings
+from common.db_logger import MySQLLogHandler, get_db_connection, init_db_pool
 
 OLD_TOPIC = "greenlees-carteggio"
 NEW_TOPIC = "greenlees"
@@ -12,7 +10,7 @@ def rename_qdrant_topic():
     print(f"Inizio migrazione Qdrant da '{OLD_TOPIC}' a '{NEW_TOPIC}'...")
     
     try:
-        qdrant = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
+        qdrant = QdrantClient(host=settings.qdrant_host, port=settings.qdrant_port)
         
         # =========================================================
         # 1. AGGIORNA I CHUNK DEI DOCUMENTI (document_chunks)

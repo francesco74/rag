@@ -1,4 +1,3 @@
-import os
 import logging
 import uuid
 import time
@@ -6,20 +5,17 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from celery import Celery
 from celery.result import AsyncResult
-from mysql.connector import pooling
 import json
 
-from dotenv import load_dotenv
+from common.db_logger import MySQLLogHandler, get_db_connection, init_db_pool
 
-load_dotenv()
+from common.config import settings
 
 # ==============================================================================
 # CONFIGURATION & LOGGING
 # ==============================================================================
-LOG_LEVEL_STR = os.environ.get("LOG_LEVEL", "INFO").upper()
-LOG_LEVEL = getattr(logging, LOG_LEVEL_STR, logging.INFO)
 logging.basicConfig(
-    level=LOG_LEVEL,
+    level=settings.log_level,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[logging.StreamHandler()]
 )
@@ -27,44 +23,20 @@ log = logging.getLogger("api_gateway")
 
 app = Flask(__name__)
 
-ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS").split(",")
-#CORS(app, origins="*")
-CORS(app, origins=ALLOWED_ORIGINS)  # Enable CORS for frontend access
+CORS(app, origins=settings.allowed_origins)  # Enable CORS for frontend access
 
-DB_HOST = os.environ.get("MYSQL_SERVICE_HOST", "localhost")
-DB_USER = os.environ.get("MYSQL_USER", "root")
-DB_PORT = int(os.environ.get("MYSQL_SERVICE_PORT", 3306))
-DB_PASS = os.environ.get("MYSQL_PASSWORD", "password")
-DB_NAME = os.environ.get("MYSQL_DATABASE", "rag_system")
 
-ALLOW_SUBTOPIC_SELECTION = os.environ.get("ALLOW_SUBTOPIC_SELECTION", "true").lower() == "true"    
 
-API_SECRET_KEY = os.environ.get("API_SECRET_KEY")
-if not API_SECRET_KEY:
-    log.warning("API_SECRET_KEY is not set — setting default value. This is not secure for production!")
-    API_SECRET_KEY = "default_secret_key"
  
-MAX_HISTORY_ITEMS = int(os.environ.get("MAX_HISTORY_ITEMS", 20))
- 
-
-REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+redis_conn_string = f"redis://{settings.redis_host}:{settings.redis_port}/0"
 celery_client = Celery(
     'rag_queue', 
-    broker=REDIS_URL, 
-    backend=REDIS_URL
+    broker=redis_conn_string, 
+    backend=redis_conn_string
 )
 
 try:
-    db_pool = pooling.MySQLConnectionPool(
-            pool_name=f"worker_pool_{os.getpid()}",
-            pool_size=3,
-            pool_reset_session=True,
-            host=DB_HOST,
-            user=DB_USER,
-            port=DB_PORT,
-            password=DB_PASS,
-            database=DB_NAME
-        )
+    db_pool = init_db_pool()
 except Exception as e:
     log.critical(f"Failed to initialize API DB Pool: {e}")
     # Consider whether the app should crash here if the DB is critical
@@ -86,9 +58,9 @@ def start_timer_and_add_id():
 
     # --- Authentication ---
     # Skip auth for health checks and when no key is configured (dev mode).
-    if API_SECRET_KEY and request.path not in UNPROTECTED_ROUTES:
+    if settings.api_secret_key and request.path not in UNPROTECTED_ROUTES:
         auth_header = request.headers.get("Authorization", "")
-        if not auth_header.startswith("Bearer ") or auth_header[7:] != API_SECRET_KEY:
+        if not auth_header.startswith("Bearer ") or auth_header[7:] != settings.api_secret_key:
             log.warning(f"[{request.request_id}] Unauthorized request to {request.path}")
             return jsonify({"error": "Unauthorized"}), 401
 
@@ -109,7 +81,10 @@ def log_response(response):
 def health_check():
     try:
         # Quick check if DB pool is alive
-        conn = db_pool.get_connection()
+        conn = get_db_connection()
+        if not conn:
+            return jsonify({"status": "error", "message": "DB Pool not initialized"}), 503
+        
         conn.ping(reconnect=True)
         conn.close()
         return jsonify({"status": "ok", "database": "connected"}), 200
@@ -131,7 +106,9 @@ def get_config():
     cursor = None
 
     try:
-        conn = db_pool.get_connection()
+        conn = get_db_connection()  # <-- Modificato qui
+        if not conn:
+            return jsonify({"error": "Service Unavailable"}), 503
         cursor = conn.cursor(dictionary=True)
         
         cursor.execute("SELECT sub_topic_id, description FROM sub_topics WHERE topic_id = %s", (topic_id,))
@@ -143,7 +120,7 @@ def get_config():
         ]
 
         return jsonify({
-            "allow_subtopic_selection": ALLOW_SUBTOPIC_SELECTION,
+            "allow_subtopic_selection": settings.allow_subtopic_selection,
             "sub_topics": sub_topics_data 
         }), 200
     finally:
@@ -169,7 +146,7 @@ def chat_handler():
         if not isinstance(history, list):
             return jsonify({"error": "Bad Request", "message": "'history' must be a list"}), 400
         history = [
-            h for h in history[:MAX_HISTORY_ITEMS]
+            h for h in history[:settings.max_history_items]
             if isinstance(h, dict) and "role" in h and "text" in h
         ]
 
@@ -242,7 +219,11 @@ def feedback_handler():
         log.error("Feedback rejected: DB pool not initialized.")
         return jsonify({"error": "Service Unavailable", "message": "Database not available."}), 503
     
-    conn = None
+    conn = get_db_connection()  # <-- Ottieni subito la connessione
+    if not conn:
+        log.error("Feedback rejected: DB pool not initialized or exhausted.")
+        return jsonify({"error": "Service Unavailable", "message": "Database not available."}), 503
+    
     cursor = None
 
     try:
@@ -259,8 +240,6 @@ def feedback_handler():
             return jsonify({"error": "Missing fields"}), 400
         
         history_json = json.dumps(history)
-        
-        conn = db_pool.get_connection()
         cursor = conn.cursor()
 
         sql = "INSERT INTO chat_feedback (user_query, ai_response, topic_id, rating, chat_history, comment) VALUES (%s, %s, %s, %s, %s, %s)"

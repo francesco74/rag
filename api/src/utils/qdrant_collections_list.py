@@ -1,15 +1,16 @@
 import os
 from qdrant_client import QdrantClient
+from common.config import settings
+from common.db_logger import MySQLLogHandler, get_db_connection, init_db_pool
 
 # Configurazione
-QDRANT_HOST = os.environ.get("QDRANT_HOST", "localhost")
-QDRANT_PORT = int(os.environ.get("QDRANT_PORT", 6333))
+
 
 def list_qdrant_collections():
     print("Connessione a Qdrant in corso...\n")
     try:
         # Inizializzazione del client
-        qdrant = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
+        qdrant = QdrantClient(host=settings.qdrant_host, port=settings.qdrant_port)
         
         # Recupero nativo di tutte le collection
         response = qdrant.get_collections()

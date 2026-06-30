@@ -4,36 +4,22 @@ import logging
 from dotenv import load_dotenv
 from qdrant_client import QdrantClient
 import mysql.connector
+from common.config import settings
+from common.db_logger import MySQLLogHandler, get_db_connection, init_db_pool
 
 # Setup base
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 log = logging.getLogger("Migrazione")
 
-# Chiavi di sistema da NON salvare nel campo JSON "metadata" (copiate dal tuo ingest.py)
-PROTECTED_KEYS = {"topic_id", "sub_topic_id", "source", "parent_id", "content", 
-                  "parent_index", "child_index", "file_name", "_ingestion_error"}
-
-DB_HOST = os.environ.get("MYSQL_SERVICE_HOST", "localhost")
-DB_USER = os.environ.get("MYSQL_USER", "root")
-DB_PORT = int(os.environ.get("MYSQL_SERVICE_PORT", 3306))
-DB_PASS = os.environ.get("MYSQL_PASSWORD", "password")
-DB_NAME = os.environ.get("MYSQL_DATABASE", "rag_system")
-
 def migrate():
     # 1. Connessioni
     q_client = QdrantClient(
-        host=os.environ.get("QDRANT_HOST", "localhost"), 
-        port=int(os.environ.get("QDRANT_PORT", 6333))
+        host=settings.qdrant_host, 
+        port=settings.qdrant_port
     )
     
-    db_conn = mysql.connector.connect(
-        host=DB_HOST,
-            user=DB_USER,
-            port=DB_PORT,
-            password=DB_PASS,
-            database=DB_NAME
-    )
+    db_conn = init_db_pool
     cursor = db_conn.cursor()
 
     batch_size = 500
@@ -61,7 +47,7 @@ def migrate():
             payload = point.payload or {}
             
             # Ricostruiamo i metadati filtrando le chiavi di sistema
-            metadata_dict = {k: v for k, v in payload.items() if k not in PROTECTED_KEYS}
+            metadata_dict = {k: v for k, v in payload.items() if k not in settings.protected_keys}
 
             mysql_batch.append((
                 str(point.id),  # L'ID del point di Qdrant è il nostro parent_id

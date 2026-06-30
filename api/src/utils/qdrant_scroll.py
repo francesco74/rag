@@ -5,6 +5,8 @@ import argparse
 from typing import Optional
 from dotenv import load_dotenv
 from qdrant_client import AsyncQdrantClient, models
+from common.config import settings
+from common.db_logger import MySQLLogHandler, get_db_connection, init_db_pool
 
 load_dotenv()
 
@@ -14,8 +16,8 @@ async def inspect_collection_payloads(collection_name: str, limit: int = 5, file
     Se viene passato `file_name`, filtra i risultati per quel file specifico.
     """
     client = AsyncQdrantClient(
-        host=os.environ.get("QDRANT_HOST", "localhost"), 
-        port=int(os.environ.get("QDRANT_PORT", 6333)),
+        host=settings.qdrant_host, 
+        port=settings.qdrant_port,
         timeout=60.0
     )
     

@@ -8,13 +8,11 @@ from celery.signals import worker_process_init, worker_shutdown
 from celery.schedules import crontab
 from mysql.connector import pooling
 from qdrant_client import QdrantClient, models
-import google.generativeai as genai  # embedding only
+from google import genai  # embedding only
+from google.genai.errors import APIError
 import math
 import json, re
 import hashlib
-
-from dotenv import load_dotenv
-
 # Use the optimized reranker
 from reranker import ONNXReranker, RerankResult
 
@@ -28,73 +26,37 @@ from tenacity import (
     wait_random_exponential,
     retry_if_exception_type
 )
-from google.api_core.exceptions import ResourceExhausted, ServiceUnavailable
 
-load_dotenv()
+from common.config import settings
+from common.db_logger import MySQLLogHandler, get_db_connection, init_db_pool
+
+
 
 
 # ==============================================================================
 # 1. CONFIGURATION & LOGGING
 # ==============================================================================
 
-LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
-
 @setup_logging.connect
 def configure_worker_logging(*args, **kwargs):
     logging.basicConfig(
-        level=getattr(logging, LOG_LEVEL, logging.INFO),
+        level=getattr(logging, settings.log_level, logging.INFO),
         format='%(asctime)s - [WORKER-%(process)d] - %(levelname)s - %(message)s',
         force=True  # Svuota e sovrascrive gli handler precedentemente configurati da Celery
     )
 
 log = logging.getLogger("rag_queue")
 
-# Load Configuration
-REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
 PROMPTS_DIR = os.path.join(os.path.dirname(__file__), 'prompts')
-
-# Reranking Configuration (OPTIMIZED)
-RERANK_SIZE = int(os.environ.get("RERANK_SIZE", 25))
-RERANK_TRUNCATE = int(os.environ.get("RERANK_TRUNCATE", 1200))
-RERANK_BATCH_SIZE = int(os.environ.get("RERANK_BATCH_SIZE", 32))  
-RERANK_MAX_LENGTH = int(os.environ.get("RERANK_MAX_LENGTH", 512))
-CONCEPT_THRESHOLD = float(os.environ.get("QDRANT_CONCEPT_THRESHOLD", 0.80))
-ANSWER_MAX_TOKENS = int(os.environ.get("ANSWER_MAX_TOKENS", 4096))
-
-
-ALLOW_GENERAL_KNOWLEDGE = os.environ.get("ALLOW_GENERAL_KNOWLEDGE", "true").lower() == "true"
-
-ONNX_MODEL_CACHE_PATH = os.environ.get(
-    "RERANKER_MODEL_PATH", 
-    "./model_cache/mmarco-mMiniLMv2-L12-H384-v1"
-)
-
-QDRANT_SYNTACTIC_SIZE = int(os.environ.get("QDRANT_SYNTACTIC_SIZE", 20))
-QDRANT_SEMANTIC_SIZE = int(os.environ.get("QDRANT_SEMANTIC_SIZE", 30))
-QDRANT_THRESHOLD = float(os.environ.get("QDRANT_THRESHOLD", 0.60))
-MAX_CONTEXT_CHARS = int(os.environ.get("MAX_CONTEXT_CHARS", 30000)) 
-MAX_SUB_QUERIES=int(os.environ.get("MAX_SUB_QUERIES", 5)) 
-PARENT_BUDGET_RATIO=float(os.environ.get("PARENT_BUDGET_RATIO", 0.80))
-
-MIN_PROB_THRESHOLD = float(os.environ.get("MIN_PROB_THRESHOLD", 0.02))
-PARENTS_PER_QUERY = int(os.environ.get("PARENTS_PER_QUERY", 4))
-
-DB_HOST = os.environ.get("MYSQL_SERVICE_HOST", "localhost")
-DB_USER = os.environ.get("MYSQL_USER", "root")
-DB_PORT = int(os.environ.get("MYSQL_SERVICE_PORT", 3306))
-DB_PASS = os.environ.get("MYSQL_PASSWORD", "password")
-DB_NAME = os.environ.get("MYSQL_DATABASE", "rag_system")
-
-QDRANT_HOST = os.environ.get("QDRANT_HOST", "localhost")
-QDRANT_PORT = int(os.environ.get("QDRANT_PORT", 6333))
-
 
 MAX_AGE_SECONDS = 86400  # 24 hours
 MAX_MODEL_RETRIES = 2
+_RERANKER_POOL: list = []
+_POOL_SIZE = settings.reranker_pool_size
 
 # Embedding retry (Gemini only — embedding stays on Google)
 GEMINI_EMBEDDING_RETRY = retry(
-    retry=retry_if_exception_type((ResourceExhausted, ServiceUnavailable)),
+    retry=retry_if_exception_type((APIError,)),
     wait=wait_random_exponential(multiplier=2, min=4, max=60),
     stop=stop_after_attempt(6),
     before_sleep=lambda retry_state: log.warning(
@@ -112,7 +74,8 @@ CONCEPT_COLLECTION = "conceptual_dictionary"
 # ==============================================================================
 # 2. CELERY INITIALIZATION
 # =========================================", "rag_system")=====================================
-celery_app = Celery('rag_queue', broker=REDIS_URL, backend=REDIS_URL)
+redis_conn_string = f"redis://{settings.redis_host}:{settings.redis_port}/0"
+celery_app = Celery('rag_queue', broker=redis_conn_string, backend=redis_conn_string)
 celery_app.conf.update(
     result_expires=3600,
     worker_concurrency=1,
@@ -133,44 +96,17 @@ qdrant_client = None
 _RERANKER_INSTANCE = None
 
 EMBEDDING_MODEL = "gemini-embedding-001"
-QUERY_REWRITER_MODEL_NAME = None
-ANSWER_GENERATOR_MODEL_NAME = None
-GRADER_MODEL_NAME = None
 
 @worker_process_init.connect
 def init_worker_process(**kwargs):
-    """
-    Initializes network connections and models ONLY after Celery forks the process.
-    Prevents Socket Corruption and BrokenPipeErrors.
-    """
-    global db_pool, qdrant_client, QUERY_REWRITER_MODEL_NAME, ANSWER_GENERATOR_MODEL_NAME, GRADER_MODEL_NAME, DB_HOST, DB_USER, DB_PORT, DB_PASS, DB_NAME
+    global qdrant_client, embedding_client
     log.info("Initializing Worker Resources (Post-Fork)...")
 
     try:
-        db_pool = pooling.MySQLConnectionPool(
-            pool_name=f"worker_pool_{os.getpid()}",
-            pool_size=3,
-            pool_reset_session=True,
-            host=DB_HOST,
-            user=DB_USER,
-            port=DB_PORT,
-            password=DB_PASS,
-            database=DB_NAME
-        )
-        qdrant_client = QdrantClient(
-            host=QDRANT_HOST,
-            port=QDRANT_PORT
-        )
+        init_db_pool()  # Inizializza il pool globalmente
 
-        # Embedding rimane su Gemini — configura solo la chiave
-        genai.configure(api_key=os.environ.get("GOOGLE_API_KEY"))
-
-        # Model names (usati come stringhe, passati al provider)
-        QUERY_REWRITER_MODEL_NAME   = os.environ.get("QUERY_REWRITER_MODEL_NAME",   "gemini-3.1-flash-lite")
-        ANSWER_GENERATOR_MODEL_NAME = os.environ.get("ANSWER_GENERATOR_MODEL_NAME", "gemini-3.5-flash")
-        GRADER_MODEL_NAME           = os.environ.get("GRADER_MODEL_NAME",           "gemini-3.1-flash-lite")
-
-        # Inizializza il provider LLM (legge LLM_PROVIDER dall'env)
+        qdrant_client = QdrantClient(host=settings.qdrant_host, port=settings.qdrant_port)
+        embedding_client = genai.Client(api_key=settings.api_llm_key)
         init_llm_provider()
 
         log.info("✓ Resources successfully initialized for this process.")
@@ -247,21 +183,6 @@ def safe_sigmoid(x):
         return 0.0
     return 1 / (1 + math.exp(-x))
 
-def get_db_connection():
-    """Get a connection from the pool and ensure it is alive."""
-    if not db_pool:
-        log.error("DB pool not initialized!")
-        return None
-    try:
-        conn = db_pool.get_connection()
-        # FIX: Pragmatic check to re-establish dropped connections
-        conn.ping(reconnect=True, attempts=2, delay=1) 
-        return conn
-    except Exception as e:
-        log.error(f"Error getting connection from pool: {e}")
-        return None
-
-
 def load_prompt_template(filename):
     """Load a prompt template from the prompts directory."""
     try:
@@ -284,36 +205,35 @@ def load_prompt_template(filename):
 def embed_query(query):
     """Generate embedding for a single query (Gemini only)."""
     log.debug(f"Embedding query: '{query[:50]}...'")
-    result = genai.embed_content(
+    result = embedding_client.models.embed_content(
         model=EMBEDDING_MODEL,
-        content=query,
-        task_type="RETRIEVAL_QUERY",
-        output_dimensionality=768
+        contents=query,
+        config=dict(task_type="RETRIEVAL_QUERY", output_dimensionality=768)
     )
-    return result['embedding']
+    return result.embeddings[0].values
 
 
 @GEMINI_EMBEDDING_RETRY
 def embed_queries_batch(queries_list):
     """Generate embeddings for multiple queries in a single API call (Gemini only)."""
-    result = genai.embed_content(
+    result = embedding_client.models.embed_content(
         model=EMBEDDING_MODEL,
-        content=queries_list,
-        task_type="RETRIEVAL_QUERY",
-        output_dimensionality=768
+        contents=queries_list,
+        config=dict(task_type="RETRIEVAL_QUERY", output_dimensionality=768)
     )
-    return result['embedding'] if isinstance(queries_list, list) else [result['embedding']]
+    if isinstance(queries_list, str):
+        return [result.embeddings[0].values]
+    return [emb.values for emb in result.embeddings]
 
 @GEMINI_EMBEDDING_RETRY
 def embed_for_concept_lookup(query):
     """Embedding per confronto con il dizionario concettuale (task simmetrico)."""
-    result = genai.embed_content(
+    result = embedding_client.models.embed_content(
         model=EMBEDDING_MODEL,
-        content=query,
-        task_type="SEMANTIC_SIMILARITY",
-        output_dimensionality=768
+        contents=query,
+        config=dict(task_type="SEMANTIC_SIMILARITY", output_dimensionality=768)
     )
-    return result['embedding']
+    return result.embeddings[0].values
 
 def expand_standalone_with_aliases(standalone_query, aliases, task_id="UNKNOWN"):
     aliases_str = ", ".join(aliases)
@@ -321,11 +241,11 @@ def expand_standalone_with_aliases(standalone_query, aliases, task_id="UNKNOWN")
     prompt = load_prompt_template("expand_with_alias").format(
         aliases_str=aliases_str,
         standalone_query=standalone_query,
-        max_sub_queries=MAX_SUB_QUERIES
+        max_sub_queries=settings.max_sub_queries
     )
     
     try:
-        raw = get_llm_provider().generate_json(QUERY_REWRITER_MODEL_NAME, prompt, temperature=0.2, max_tokens=ANSWER_MAX_TOKENS)
+        raw = get_llm_provider().generate_json(settings.query_rewriter_model_name, prompt, temperature=0.2, max_tokens=settings.answer_max_tokens)
         data = safe_json_parse(raw, task_id)
         return data.get("search_queries", [standalone_query])
     except Exception as e:
@@ -349,13 +269,13 @@ def transform_query(history, query, task_id="UNKNOWN"):
     prompt = load_prompt_template("query_rewriter").format(
         history_str=history_str,
         query=query,
-        max_sub_queries=MAX_SUB_QUERIES
+        max_sub_queries=settings.max_sub_queries
     )
 
     try:
         log.debug(f"[{task_id}] [REWRITER] Chiamata al provider LLM in corso...")
         raw = get_llm_provider().generate_json(
-            QUERY_REWRITER_MODEL_NAME, prompt, temperature=0.1
+            settings.query_rewriter_model_name, prompt, temperature=0.1
         )
         log.debug(f"[{task_id}] [REWRITER] Risposta grezza:\n{raw}")
 
@@ -390,9 +310,9 @@ def generate_answer(query, rich_context, topic_id):
     if n_parents == 0:
         context_str = ""
     else:
-        theoretical_budget_per_parent = MAX_CONTEXT_CHARS // (PARENTS_PER_QUERY * MAX_SUB_QUERIES)
-        cap_per_parent = int(theoretical_budget_per_parent / PARENT_BUDGET_RATIO)
-        budget_per_parent = min(MAX_CONTEXT_CHARS // n_parents, cap_per_parent)
+        theoretical_budget_per_parent = settings.max_context_chars // (settings.parents_per_query * settings.max_sub_queries)
+        cap_per_parent = int(theoretical_budget_per_parent / settings.parent_budget_ratio)
+        budget_per_parent = min(settings.max_context_chars // n_parents, cap_per_parent)
 
         log.debug(
             f"Budget per parent: {budget_per_parent} chars "
@@ -408,9 +328,9 @@ def generate_answer(query, rich_context, topic_id):
 
             chunk = f"[Source: {item['source']}]\n{content}\n\n"
 
-            if curr_len + len(chunk) > MAX_CONTEXT_CHARS:
+            if curr_len + len(chunk) > settings.max_context_chars:
                 log.warning(
-                    f"Budget complessivo raggiunto ({curr_len}/{MAX_CONTEXT_CHARS} chars). "
+                    f"Budget complessivo raggiunto ({curr_len}/{settings.max_context_chars} chars). "
                     f"{n_parents - len(formatted_chunks)} parent scartati."
                 )
                 break
@@ -422,7 +342,7 @@ def generate_answer(query, rich_context, topic_id):
 
     log.info(
         f"Contesto finale: {len(formatted_chunks)}/{n_parents} parent, "
-        f"{curr_len}/{MAX_CONTEXT_CHARS} chars utilizzati."
+        f"{curr_len}/{settings.max_context_chars} chars utilizzati."
     )
 
     prompt_file  = get_topic_prompt(topic_id)
@@ -432,7 +352,7 @@ def generate_answer(query, rich_context, topic_id):
     log.info(f"Generating structured answer for topic '{topic_id}'")
     log.debug(f"Context size: {len(context_str)} chars")
 
-    raw = get_llm_provider().generate_json(ANSWER_GENERATOR_MODEL_NAME, prompt, max_tokens=ANSWER_MAX_TOKENS)
+    raw = get_llm_provider().generate_json(settings.answer_generator_model_name, prompt, max_tokens=settings.answer_max_tokens, thinking_level=settings.answer_thinking_level )
     log.debug(f"Raw response:\n{raw[:500]}...")
 
     try:
@@ -455,7 +375,7 @@ def grade_answer(query, context_snippet, answer):
         answer=answer
     )
     raw = get_llm_provider().generate_text(
-        GRADER_MODEL_NAME, grader_prompt, temperature=0.0, max_tokens=5
+        settings.grader_model_name, grader_prompt, temperature=0.0, max_tokens=5
     )
     result = raw.strip().upper()
     log.info(f"Grader response: '{result}'")
@@ -645,15 +565,18 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
         # ==========================================================
         def safe_vector_search(vector, idx):
             try:
-                res = qdrant_client.query_points(
+                res = qdrant_client.query_points_groups(
                     collection_name=QDRANT_COLLECTION,
-                    query=vector, 
-                    limit=QDRANT_SEMANTIC_SIZE,
-                    score_threshold=QDRANT_THRESHOLD,
+                    query=vector,
+                    group_by="content_hash",
+                    group_size=1,
+                    limit=settings.qdrant_semantic_size,
+                    score_threshold=settings.qdrant_semantic_threshold,
                     query_filter=models.Filter(must=must_conditions)
                 )
-                log.debug(f"Vector search #{idx} returned {len(res.points)} hits.")
-                return res.points
+                points = [group.hits[0] for group in res.groups if group.hits]
+                log.debug(f"Vector search #{idx} returned {len(points)} grouped hits.")
+                return points
             except Exception as e:
                 log.error(f"Vector search #{idx} failed: {e}")
                 return []
@@ -661,19 +584,46 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
         def safe_keyword_search():
             if not keywords: return []
             try:
-                # Normalizzazione rigorosa delle keyword
                 clean_kw = [w.lower().strip() for w in keywords if len(w.strip()) > 2]
                 if not clean_kw: return []
-                
+
                 should_cond = [models.FieldCondition(key="content", match=models.MatchText(text=w)) for w in clean_kw]
-                res = qdrant_client.scroll(
-                    collection_name=QDRANT_COLLECTION,
-                    scroll_filter=models.Filter(must=must_conditions + [models.Filter(should=should_cond)]),
-                    limit=QDRANT_SYNTACTIC_SIZE * 2,
-                    with_payload=True
-                )
-                log.debug(f"Keyword search returned {len(res[0])} hits.")
-                return res[0]
+                target_size = settings.qdrant_syntactic_size
+
+                seen_hashes: set = set()
+                unique_hits = []
+                next_offset = None
+                max_scroll_iterations = 5  # safety: evita loop infiniti se il corpus è quasi tutto duplicato
+                iterations = 0
+
+                while len(unique_hits) < target_size and iterations < max_scroll_iterations:
+                    log.debug(f"Scroll {iterations} di {max_scroll_iterations}")
+
+                    res, next_offset = qdrant_client.scroll(
+                        collection_name=QDRANT_COLLECTION,
+                        scroll_filter=models.Filter(must=must_conditions + [models.Filter(should=should_cond)]),
+                        limit=target_size * 2,  # batch ampio per compensare i duplicati scartati
+                        offset=next_offset,
+                        with_payload=True
+                    )
+                    iterations += 1
+
+                    if not res:
+                        break
+
+                    for point in res:
+                        h = point.payload.get("content_hash") if point.payload else None
+                        if h and h not in seen_hashes:
+                            seen_hashes.add(h)
+                            unique_hits.append(point)
+                            if len(unique_hits) >= target_size:
+                                break
+
+                    if next_offset is None:
+                        break  # esauriti i punti nella collection per questo filtro
+
+                log.debug(f"Keyword search returned {len(unique_hits)} unique hits (deduped, {iterations} scroll iterations).")
+                return unique_hits
             except Exception as e:
                 log.error(f"Keyword search failed: {e}")
                 return []
@@ -706,47 +656,77 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
         # ==========================================================
         reranker = get_reranker()
         n_queries = len(search_queries)
-        top_chunks_per_query: list[list] = []
- 
-        for q_idx, (query_str, candidates) in enumerate(zip(search_queries, hits_per_query)):
+        top_chunks_per_query: list[list] = [[] for _ in range(n_queries)]
+
+        def process_single_rerank(q_idx, query_str, candidates):
             if not candidates:
                 log.debug(f"Sottoquery #{q_idx} '{query_str[:40]}': nessun candidato.")
-                top_chunks_per_query.append([])
-                continue
- 
-            # De-duplica i chunk per id
-            seen_chunk_ids: dict = {}
-            for c in candidates:
-                if c.id not in seen_chunk_ids:
-                    seen_chunk_ids[c.id] = c
+                return []
+            
+            # De-duplica i chunk per id in modo più efficiente
+            seen_chunk_ids = {c.id: c for c in candidates}
             unique_candidates = list(seen_chunk_ids.values())
- 
-            # Rerank con la query specifica di questa sottoquery
+
+            # De-duplica cross duplicati
+            n_before_content_dedup = len(unique_candidates)
+            seen_content_hashes = {}
+            deduped_candidates = []
+            for c in unique_candidates:
+                h = c.payload.get("content_hash") if c.payload else None
+                if not h:
+                    content = (c.payload.get("content", "") if c.payload else "")
+                    h = hashlib.md5(" ".join(content.lower().split()).encode()).hexdigest()
+                if h not in seen_content_hashes:
+                    seen_content_hashes[h] = True
+                    deduped_candidates.append(c)
+            unique_candidates = deduped_candidates
+
+            if len(unique_candidates) < n_before_content_dedup:
+                log.debug(
+                    f"Sottoquery #{q_idx} '{query_str[:40]}': "
+                    f"{n_before_content_dedup} → {len(unique_candidates)} candidati "
+                    f"(rimossi {n_before_content_dedup - len(unique_candidates)} duplicati)."
+                )
+
+            # Rerank effettivo
             if reranker:
                 docs_content = [
-                    c.payload.get("content", "")[:RERANK_TRUNCATE]
+                    c.payload.get("content", "")[:settings.rerank_truncate]
                     for c in unique_candidates
                 ]
                 try:
                     reranked = reranker.rerank(query_str, docs_content)
                     reranked.sort(key=lambda x: x.score, reverse=True)
                     top_chunks = []
-                    for res in reranked[:RERANK_SIZE]:
+                    for res in reranked[:settings.rerank_size]:
                         prob = safe_sigmoid(res.score)
-                        if prob >= MIN_PROB_THRESHOLD or len(top_chunks) < 2:
+                        if prob >= settings.min_prob_threshold or len(top_chunks) < 2:
                             top_chunks.append(unique_candidates[res.index])
                         else:
                             break
+                    return top_chunks
                 except Exception as e:
                     log.error(f"Reranker failed for query #{q_idx}: {e}. Fallback.")
-                    unique_candidates.sort(key=lambda x: getattr(x, 'score', 0), reverse=True)
-                    top_chunks = unique_candidates[:RERANK_SIZE]
-            else:
-                unique_candidates.sort(key=lambda x: getattr(x, 'score', 0), reverse=True)
-                top_chunks = unique_candidates[:RERANK_SIZE]
- 
-            top_chunks_per_query.append(top_chunks)
-            log.debug(f"Sottoquery #{q_idx} '{query_str[:40]}': {len(unique_candidates)} candidati → {len(top_chunks)} chunk dopo rerank.")
+                    
+            unique_candidates.sort(key=lambda x: getattr(x, 'score', 0), reverse=True)
+            return unique_candidates[:settings.rerank_size]
+        
+        max_workers = min(n_queries, settings.max_reranker_thread)
+        
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_idx = {
+                executor.submit(process_single_rerank, q_idx, q_str, cands): q_idx
+                for q_idx, (q_str, cands) in enumerate(zip(search_queries, hits_per_query))
+            }
+            
+            for future in as_completed(future_to_idx):
+                q_idx = future_to_idx[future]
+                try:
+                    top_chunks_per_query[q_idx] = future.result()
+                    log.debug(f"Sottoquery #{q_idx}: rerank completato con {len(top_chunks_per_query[q_idx])} chunk finali.")
+                except Exception as e:
+                    log.error(f"Errore critico nel thread di rerank per la query #{q_idx}: {e}", exc_info=True)
+                    top_chunks_per_query[q_idx] = []
 
 
         # ==========================================================
@@ -773,7 +753,7 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
                 if pid not in already_selected:
                     already_selected.add(pid)
                     selected_for_query.append(pid)
-                    if len(selected_for_query) >= PARENTS_PER_QUERY:
+                    if len(selected_for_query) >= settings.parents_per_query:
                         break
  
             quota_per_query.append(selected_for_query)
@@ -791,7 +771,7 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
         # Questo evita di sprecare budget quando, ad esempio, 4 comuni
         # su 5 non hanno documenti e uno solo ha molti risultati.
         # ==========================================================
-        total_budget = PARENTS_PER_QUERY * n_queries
+        total_budget = settings.parents_per_query * n_queries
         slots_free = total_budget - len(already_selected)
  
         if slots_free > 0:
@@ -850,7 +830,7 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
  
         log.info(
             f"Pool finale: {len(final_parent_ids_ordered)} parent distinti "
-            f"(budget={PARENTS_PER_QUERY}×{n_queries}={total_budget})."
+            f"(budget={settings.parents_per_query}×{n_queries}={total_budget})."
         )
  
  
@@ -914,6 +894,26 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
         log.critical(f"Errore critico nel Retrieval: {e}", exc_info=True)
         return [], []
 
+def get_reranker_pool():
+    global _RERANKER_POOL
+    if not _RERANKER_POOL:
+        for i in range(_POOL_SIZE):
+            log.info(f"Initializing ONNX Reranker pool instance {i+1}/{_POOL_SIZE}...")
+            instance = ONNXReranker(
+                model_folder=settings.onnx_model_cache_path,
+                batch_size=settings.rerank_batch_size,
+                max_length=settings.rerank_max_length,
+                num_threads=2
+            )
+            _RERANKER_POOL.append(instance)
+    return _RERANKER_POOL
+
+def rerank_subquery(args):
+    pool_idx, query_str, docs_content = args
+    pool = get_reranker_pool()
+    reranker_instance = pool[pool_idx % len(pool)]
+    return reranker_instance.rerank(query_str, docs_content)
+
 
 def get_reranker():
     """
@@ -924,12 +924,13 @@ def get_reranker():
     if _RERANKER_INSTANCE is None:
         try:
             log.info("Initializing ONNX Reranker (Lazy Load)...")
-            num_threads = os.cpu_count() or 4
+            num_threads = min(os.cpu_count() or 2, settings.max_reranker_thread) 
+            log.info(f"Using {num_threads} threads...")
 
             _RERANKER_INSTANCE = ONNXReranker(
-                model_folder=ONNX_MODEL_CACHE_PATH,
-                batch_size=RERANK_BATCH_SIZE,
-                max_length=RERANK_MAX_LENGTH,
+                model_folder=settings.onnx_model_cache_path,
+                batch_size=settings.rerank_batch_size,
+                max_length=settings.rerank_max_length,
                 num_threads=num_threads
             )
             log.info("✓ Reranker initialized successfully.")
@@ -958,7 +959,7 @@ def get_all_sub_topics(topic_id):
     finally:
         conn.close()
 
-def get_aliases_by_concept(query_vector, threshold=CONCEPT_THRESHOLD):
+def get_aliases_by_concept(query_vector, threshold=settings.qdrant_concept_threshold):
     """
     Cerca nella collezione Qdrant se la query esprime un concetto 
     mappato nel nostro dizionario semantico.
@@ -1165,7 +1166,7 @@ def process_rag_query(self, query, history, topic_id, selected_sub_topics=None, 
             is_satisfactory = False
 
         elif gen_result.get("is_general_knowledge"):
-            if ALLOW_GENERAL_KNOWLEDGE:
+            if settings.allow_general_knowledge:
                 log.info(f"[{task_id}] Answer based on general knowledge (allowed). Skipping Grader.")
                 is_satisfactory = True
             else:

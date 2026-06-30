@@ -1,11 +1,10 @@
 # trigger_recover.py
 import os
 import requests
+from common.config import settings
+from common.db_logger import MySQLLogHandler, get_db_connection, init_db_pool
 
-# Configurazione endpoint Qdrant
-QDRANT_HOST = os.environ.get("QDRANT_HOST", "qdrant.rag.svc.cluster.local")
-QDRANT_PORT = int(os.environ.get("QDRANT_PORT", 6333))
-QDRANT_HTTP_URL = f"http://{QDRANT_HOST}:{QDRANT_PORT}"
+QDRANT_HTTP_URL = f"http://{settings.qdrant_host}:{settings.qdrant_port}"
 
 COLLECTIONS = ["document_chunks", "parent_documents"]
 

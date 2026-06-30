@@ -1,14 +1,12 @@
 import os
 from qdrant_client import QdrantClient
-
-# Configurazione
-QDRANT_HOST = os.environ.get("QDRANT_HOST", "localhost")
-QDRANT_PORT = int(os.environ.get("QDRANT_PORT", 6333))
+from common.config import settings
+from common.db_logger import MySQLLogHandler, get_db_connection, init_db_pool
 
 def list_qdrant_topics():
     print("Scansione di Qdrant in corso...\n")
     try:
-        qdrant = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
+        qdrant = QdrantClient(host=settings.qdrant_host, port=settings.qdrant_port)
         
         unique_topics = set()
         offset = None

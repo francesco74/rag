@@ -18,7 +18,7 @@ RUN apt-get update && \
 
 # --- Install Python Dependencies ---
 # Copy the requirements file first to leverage Docker cache
-COPY requirements.txt .
+COPY converter/requirements.txt .
 
 # Install any needed packages specified in requirements.txt
 # --no-cache-dir is used to keep the image size down
@@ -26,13 +26,13 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # --- Copy Application Code ---
 # Copy the rest of the application code into the container
-COPY src/. .
+COPY converter/src/. .
+COPY common/ ./common/
 
 # --- Configure and Run ---
 # Make port 8080 available to the world outside this container
 
 # Define the environment variable for the API key (to be set at runtime)
-ENV GOOGLE_API_KEY=""
 ENV LOG_LEVEL=""
 ENV DB_HOST=""
 ENV DB_USER=""

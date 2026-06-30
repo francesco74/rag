@@ -7,15 +7,13 @@ import uuid
 from pathlib import Path
 
 import aio_pika
-from dotenv import load_dotenv
-
-load_dotenv()
+from common.config import settings
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - WRAPPER - %(levelname)s - %(message)s')
 log = logging.getLogger("WrapperDiretti")
 
 BASE_DIR = Path("./data")
-DATA_FOLDER = Path(os.environ.get("DATA_FOLDER", str(BASE_DIR)))
+DATA_FOLDER = settings.data_folder
 INPUT_DIR = DATA_FOLDER / "direct"  # Cartella dove l'utente/sistema carica i file crudi
 STAGING_DIR = DATA_FOLDER / "staging"
 
@@ -95,10 +93,10 @@ async def scan_and_wrap(channel: aio_pika.Channel):
             log.error(f"Errore durante il wrapping del file {original_filename}: {e}")
 
 async def main_run():
-    rabbitmq_host = os.environ.get("BROKER_HOST", "rabbitmq-service.rag.svc.cluster.local")
-    
+    conn_string = f"amqp://{settings.broker_username}:{settings.broker_password}@{settings.broker_host}:{settings.broker_port}/"
+
     log.info("Avvio Wrapper Diretti (Modalità One-Shot CronJob)...")
-    connection = await aio_pika.connect_robust(f"amqp://{rabbitmq_host}/")
+    connection = await aio_pika.connect_robust(conn_string)
     
     async with connection:
         channel = await connection.channel()

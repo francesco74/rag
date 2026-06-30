@@ -2,22 +2,18 @@ import os
 import sys
 import argparse
 from qdrant_client import QdrantClient, models
-from dotenv import load_dotenv
-
-load_dotenv()
+from common.config import settings
+from common.db_logger import MySQLLogHandler, get_db_connection, init_db_pool
 
 def delete_points_by_scope(topic_id: str, sub_topic_id: str):
     """
     Elimina da Qdrant tutti i chunk che corrispondono sia al topic_id che al sub_topic_id specificati.
     """
     # Configurazione connessione
-    host = os.environ.get("QDRANT_HOST", "localhost")
-    port = int(os.environ.get("QDRANT_PORT", 6333))
-    
-    client = QdrantClient(host=host, port=port)
+    client = QdrantClient(host=settings.qdrant_host, port=settings.qdrant_port)
     collection_name = "document_chunks" 
 
-    print(f"Connesso a Qdrant su {host}:{port}")
+    print(f"Connesso a Qdrant su {settings.qdrant_host}:{settings.qdrant_port}")
     print(f"Avvio eliminazione mirata in '{collection_name}':")
     print(f"  ↳ topic_id     = '{topic_id}'")
     print(f"  ↳ sub_topic_id = '{sub_topic_id}'")

@@ -1,11 +1,12 @@
-import os
 import uuid
 import logging
+import os
 from dotenv import load_dotenv
 from qdrant_client import QdrantClient, models
-import google.generativeai as genai
+import genai
+from common.config import settings
+from common.db_logger import MySQLLogHandler, get_db_connection, init_db_pool
 
-load_dotenv()
 
 # Configurazione Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -19,15 +20,13 @@ EMBEDDING_MODEL = "gemini-embedding-001"
 def init_services():
     """Inizializza le connessioni a Qdrant e Gemini."""
     # Configura Gemini
-    api_key = os.environ.get("GOOGLE_API_KEY")
-    if not api_key:
-        raise ValueError("GOOGLE_API_KEY non trovata nelle variabili d'ambiente!")
-    genai.configure(api_key=api_key)
+    api_llm_key = settings.api_llm_key
+    if not api_llm_key:
+        raise ValueError("API_LLM_KEY non trovata nelle variabili d'ambiente!")
+    genai.configure(api_key=api_llm_key)
 
     # Configura Qdrant
-    host = os.environ.get("QDRANT_HOST", "localhost")
-    port = int(os.environ.get("QDRANT_PORT", 6333))
-    return QdrantClient(host=host, port=port)
+    return QdrantClient(host=settings.qdrant_host, port=settings.qdrant_port)
 
 def parse_and_clean_file(file_path):
     """Legge il file di testo, ignora commenti/righe vuote e pulisce i dati."""

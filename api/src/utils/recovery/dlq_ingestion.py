@@ -7,19 +7,18 @@ import logging
 import pika
 import shutil
 from pathlib import Path
+from common.config import settings
+from common.db_logger import MySQLLogHandler, get_db_connection, init_db_pool
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - DLQ INGESTION - %(levelname)s - %(message)s')
 
-BROKER_HOST = os.environ.get("BROKER_HOST", "rabbitmq-service.rag.svc.cluster.local")
-BROKER_PORT = int(os.environ.get("BROKER_PORT", 5672))
-BROKER_USERNAME = os.environ.get("BROKER_USERNAME", "guest")
-BROKER_PASSWORD = os.environ.get("BROKER_PASSWORD", "guest")
+logging.basicConfig(level=settings.log_level, format='%(asctime)s - DLQ INGESTION - %(levelname)s - %(message)s')
 
-DLQ_NAME = os.environ.get("INGESTION_DLQ_NAME", "da-indicizzare-dlq")
+
+
+DLQ_NAME = "da-indicizzare.dlq"
 TARGET_QUEUE = "da-indicizzare"
 
-BASE_DIR = Path("./data")
-DATA_FOLDER = Path(os.environ.get("DATA_FOLDER", str(BASE_DIR)))
+DATA_FOLDER = settings.data_folder
 WATCH_DIR = DATA_FOLDER / "watch"
 ERROR_DIR = DATA_FOLDER / "ingestion" / "error"
 
@@ -33,8 +32,8 @@ def safe_move(src: Path, dest: Path):
 def main():
     logging.info(f"Avvio elaborazione DLQ: {DLQ_NAME}")
     try:
-        credentials = pika.PlainCredentials(BROKER_USERNAME, BROKER_PASSWORD)
-        connection = pika.BlockingConnection(pika.ConnectionParameters(host=BROKER_HOST, port=BROKER_PORT, credentials=credentials))
+        credentials = pika.PlainCredentials(settings.broker_username, settings.broker_password)
+        connection = pika.BlockingConnection(pika.ConnectionParameters(host=settings.broker_host, port=settings.broker_password, credentials=credentials))
         channel = connection.channel()
     except Exception as e:
         logging.error(f"Connessione fallita: {e}")

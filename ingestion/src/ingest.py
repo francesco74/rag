@@ -5,6 +5,7 @@ import uuid
 import pathlib
 import asyncio
 import json
+import hashlib
 
 # --- NUOVO SDK GOOGLE GENAI ---
 from google import genai
@@ -34,11 +35,8 @@ from tenacity import (
 
 from google.genai.errors import APIError
 
-from db_logger import MySQLLogHandler, get_db_connection, init_db_pool
-from dotenv import load_dotenv
-
-load_dotenv()
-
+from common.db_logger import MySQLLogHandler, get_db_connection, init_db_pool
+from common.config import settings
 
 # ==============================================================================
 # 1. CONFIGURATION & LOGGING SETUP
@@ -47,33 +45,14 @@ load_dotenv()
 BASE_DIR = pathlib.Path(__file__).parent.resolve()
 
 QDRANT_COLLECTION = "document_chunks"
-BROKER_HOST = os.environ.get("BROKER_HOST", "rabbitmq-service.rag.svc.cluster.local")
-BROKER_PORT = int(os.environ.get("BROKER_PORT", 5672))
-BROKER_USERNAME = os.environ.get("BROKER_USERNAME", "guest")
-BROKER_PASSWORD = os.environ.get("BROKER_PASSWORD", "guest")
 
-# --- DATABASE CONFIGURATION ---
-DB_HOST = os.environ.get("MYSQL_SERVICE_HOST", "localhost")
-DB_PORT = int(os.environ.get("MYSQL_SERVICE_PORT", 3306))
-DB_USER = os.environ.get("MYSQL_USER", "raguser")
-DB_PASS = os.environ.get("MYSQL_PASSWORD", "")
-DB_NAME = os.environ.get("MYSQL_DATABASE", "rag_db")
-
-init_db_pool(
-    host=DB_HOST, 
-    port=DB_PORT, 
-    user=DB_USER, 
-    password=DB_PASS, 
-    database=DB_NAME
-)
+init_db_pool()
     
 
-PROTECTED_KEYS = {"topic_id", "sub_topic_id", "source", "parent_id", "content",
-                  "parent_index", "child_index", "file_name", "_ingestion_error", "_ingestion_id"}
 
-log_level_str = os.environ.get("LOG_LEVEL", "INFO").upper() 
+
 logging.basicConfig(
-    level=getattr(logging, log_level_str, logging.INFO),
+    level=getattr(logging, settings.log_level, logging.INFO),
     format='%(asctime)s - INGESTION - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s'
 )
 log = logging.getLogger("IngestWorker")
@@ -85,22 +64,23 @@ db_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - [%(file
 log.addHandler(db_handler)
 
 # --- DIRECTORY LOGIC ---
-DATA_FOLDER = pathlib.Path(os.environ.get("DATA_FOLDER", str(BASE_DIR)))
+DATA_FOLDER = settings.data_folder
 WATCH_FOLDER = DATA_FOLDER / "watch"
-PROCESSED_FOLDER = DATA_FOLDER / "ingestion" / "processed"
+PROCESSED_FOLDER = DATA_FOLDER / "processed"
 ERROR_FOLDER = DATA_FOLDER / "ingestion" / "error"
 
 for folder in [DATA_FOLDER, WATCH_FOLDER, PROCESSED_FOLDER, ERROR_FOLDER]:
     folder.mkdir(parents=True, exist_ok=True)
 
 # --- AI & DB Init ---
-ai_client = genai.Client(api_key=os.environ.get("GOOGLE_API_KEY"))
+ai_client = genai.Client(api_key=settings.api_llm_key)
 EMBEDDING_MODEL_NAME = "gemini-embedding-001"
 
 qdrant_client = AsyncQdrantClient(
-    host=os.environ.get("QDRANT_HOST", "localhost"), 
-    port=int(os.environ.get("QDRANT_PORT", 6333)),
-    timeout=60.0
+    host=settings.qdrant_host,
+    port=settings.qdrant_port,
+    # Alza il timeout complessivo a 2 minuti e configura httpx in modo specifico
+    timeout=120.0
 )
 
 # Concurrency & Limiting
@@ -251,6 +231,27 @@ def sync_upsert_parents_mysql(source_name, topic_id, sub_topic_id, parents_data)
 # 3. PIPELINE ORCHESTRATION (DOCUMENT PROCESSING)
 # ==============================================================================
 
+# Funzione di isolamento protetta da retry per gestire i ReadError/Timeout di Qdrant
+# ==============================================================================
+# Funzione retry Qdrant estratta a livello di modulo (non più ridefinita ad ogni chiamata)
+# ==============================================================================
+
+@retry(
+    retry=retry_if_exception_type(Exception),
+    wait=wait_exponential(multiplier=2, min=4, max=30),
+    stop=stop_after_attempt(5),
+    reraise=True
+)
+async def _qdrant_upsert_with_retry(points_batch):
+    await qdrant_client.upsert(
+        collection_name=QDRANT_COLLECTION,
+        points=points_batch
+    )
+
+# ==============================================================================
+# 3. PIPELINE ORCHESTRATION (DOCUMENT PROCESSING)
+# ==============================================================================
+
 async def process_single_file_async(topic_id, sub_topic_id, json_path, root_folder, chunk_size, chunk_overlap, parent_chunk_size, use_markdown_splitter=True):
     async with CONCURRENCY_LIMIT:
         json_path = pathlib.Path(json_path)
@@ -259,20 +260,21 @@ async def process_single_file_async(topic_id, sub_topic_id, json_path, root_fold
 
         text_file_path = json_path.with_suffix(".md")
         is_markdown = True
-        
+
         if not text_file_path.exists():
             text_file_path = json_path.with_suffix(".txt")
             is_markdown = False
-            
+
         if not text_file_path.exists():
             log.error(f"HARD STOP: File di testo mancante per {json_path.name}.")
             await finalize_file_move(json_path, root_folder, topic_id, sub_topic_id, error_msg="File di testo nativo (.md/.txt) mancante.")
             return False
 
+        # --- Parsing del manifest JSON ---
         try:
             with open(json_path, 'r', encoding='utf-8') as f:
                 raw_json = json.load(f)
-            
+
             source_name = raw_json.get("source")
             if not source_name or not source_name.strip():
                 log.error(f"HARD STOP: Chiave 'source' mancante o vuota nel manifest {json_path.name}.")
@@ -286,14 +288,14 @@ async def process_single_file_async(topic_id, sub_topic_id, json_path, root_fold
                 await finalize_file_move(json_path, root_folder, topic_id, sub_topic_id, error_msg="Array 'files' mancante o vuoto nel manifest.")
                 await finalize_file_move(text_file_path, root_folder, topic_id, sub_topic_id, error_msg="Array 'files' mancante o vuoto nel manifest.")
                 return False
-                
+
             file_name = str(files_array[0])
 
             extra_metadata = raw_json.get("metadati", {})
             if not isinstance(extra_metadata, dict):
                 extra_metadata = {}
 
-            conflicting_keys = set(extra_metadata.keys()) & PROTECTED_KEYS
+            conflicting_keys = set(extra_metadata.keys()) & settings.protected_keys
             if conflicting_keys:
                 err = f"Chiavi riservate trovate nei metadati extra: {conflicting_keys}. Ingestione bloccata."
                 log.error(f"HARD STOP: {err}")
@@ -301,135 +303,163 @@ async def process_single_file_async(topic_id, sub_topic_id, json_path, root_fold
                 await finalize_file_move(text_file_path, root_folder, topic_id, sub_topic_id, error_msg=err)
                 return False
 
-            if not isinstance(extra_metadata, dict): extra_metadata = {}
-                
         except Exception as e:
             log.error(f"Errore critico nel parsing JSON {json_path.name}: {e}")
             await finalize_file_move(json_path, root_folder, topic_id, sub_topic_id, error_msg=f"JSON Parsing Error: {str(e)}")
-            await finalize_file_move(text_file_path, root_folder, topic_id, sub_topic_id, error_msg=f"JSON Parsing Error")
+            await finalize_file_move(text_file_path, root_folder, topic_id, sub_topic_id, error_msg="JSON Parsing Error")
             return False
 
+        # --- Pipeline di indicizzazione ---
         try:
+            # Lettura del testo — necessaria tutta in RAM per lo splitting
             full_text = await asyncio.to_thread(text_file_path.read_text, encoding='utf-8')
-            if not full_text.strip(): 
+            if not full_text.strip():
                 log.warning(f"Contenuto file vuoto per '{text_file_path.name}'. Scartato.")
                 await finalize_file_move(json_path, root_folder, topic_id, sub_topic_id, error_msg="Contenuto file vuoto.")
                 await finalize_file_move(text_file_path, root_folder, topic_id, sub_topic_id, error_msg="Contenuto file vuoto.")
                 return False
-            
+
             parent_text_splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
-                encoding_name="cl100k_base", chunk_size=parent_chunk_size, chunk_overlap=0, separators=["\n\n", "\n", ". ", " "]
+                encoding_name="cl100k_base", chunk_size=parent_chunk_size, chunk_overlap=0,
+                separators=["\n\n", "\n", ". ", " "]
             )
             child_text_splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
-                encoding_name="cl100k_base", chunk_size=chunk_size, chunk_overlap=chunk_overlap, separators=["\n\n", "\n", ". ", " ", ""]
+                encoding_name="cl100k_base", chunk_size=chunk_size, chunk_overlap=chunk_overlap,
+                separators=["\n\n", "\n", ". ", " ", ""]
             )
 
-            if is_markdown:
-                if use_markdown_splitter:
-                    log.info("Applico MarkdownHeaderTextSplitter come da configurazione DB.")
-                    md_header_splits = markdown_splitter.split_text(full_text)
-                    parent_docs = parent_text_splitter.split_documents(md_header_splits)
-                else:
-                    log.info("Markdown Splitter disabilitato da DB. Tratto il file come blocco unico.")
-                    parent_docs = parent_text_splitter.create_documents([full_text])
+            if is_markdown and use_markdown_splitter:
+                log.info("Applico MarkdownHeaderTextSplitter come da configurazione DB.")
+                md_header_splits = markdown_splitter.split_text(full_text)
+                parent_docs = parent_text_splitter.split_documents(md_header_splits)
+                del md_header_splits
+            elif is_markdown:
+                log.info("Markdown Splitter disabilitato da DB. Tratto il file come blocco unico.")
+                parent_docs = parent_text_splitter.create_documents([full_text])
             else:
                 parent_docs = parent_text_splitter.create_documents([full_text])
-            
-            log.info(f"Chunking: {len(parent_docs)} Parent Documents generati.")
 
-            mysql_parents_data = []
-            
-            # --- MODIFICA STRUTTURALE: Liste piatte per tutto il documento ---
-            all_child_payloads_without_vectors = []
-            all_batch_texts = []
+            # Libera subito la stringa originale: non serve più
+            del full_text
+
+            log.info(f"Chunking: {len(parent_docs)} Parent Documents generati.")
 
             def build_payload(base_dict, extra_meta):
                 payload = base_dict.copy()
                 for key, value in extra_meta.items():
-                    if key in PROTECTED_KEYS:
+                    if key in settings.protected_keys:
                         log.warning(f"Metadato '{key}' nel JSON ignorato: chiave di sistema riservata.")
                         continue
                     payload[key] = value
                 return payload
-        
+
             ingestion_id = str(uuid.uuid4())
 
-            # 1. Preparazione Dati Offline (Nessuna chiamata di rete qui)
-            for p_idx, p_doc in enumerate(parent_docs):
-                parent_id = str(uuid.uuid4())
-                merged_metadata = {**p_doc.metadata, **extra_metadata}
-                
-                mysql_parents_data.append((
-                    parent_id, topic_id, sub_topic_id, source_name, file_name, 
-                    p_idx, p_doc.page_content, json.dumps(merged_metadata)
-                ))
+            # ---------------------------------------------------------------
+            # FIX MEMORIA: Processing per batch di parent
+            # Invece di accumulare tutto il documento in RAM, embeddiamo e
+            # scarichiamo su Qdrant ogni PARENT_BATCH_SIZE parent, poi buttiamo via.
+            # I mysql_parents_data sono leggeri (no vettori) e li teniamo tutti.
+            # ---------------------------------------------------------------
+            PARENT_BATCH_SIZE = 50
 
-                child_docs = child_text_splitter.create_documents([p_doc.page_content])
-                
-                for c_idx, c_doc in enumerate(child_docs):
-                    child_base_payload = {
-                        **c_doc.metadata,
-                        "parent_id": parent_id, 
-                        "topic_id": topic_id, 
-                        "sub_topic_id": sub_topic_id,
-                        "source": source_name, 
-                        "file_name": file_name, 
-                        "child_index": c_idx, 
-                        "content": c_doc.page_content,
-                        "_ingestion_id": ingestion_id
-                    }
-                    all_child_payloads_without_vectors.append(child_base_payload)
-                    all_batch_texts.append(c_doc.page_content)
+            mysql_parents_data = []
+            pending_child_points = []  # Buffer per flush intermedi su Qdrant
 
-            # 2. Esecuzione massiva degli Embeddings (Massima capienza batch = 250)
-            all_vectors = []
-            if all_batch_texts:
-                log.info(f"Avvio vectorizzazione per {len(all_batch_texts)} chunk totali del documento.")
-                for i in range(0, len(all_batch_texts), 100):
-                    batch = all_batch_texts[i:i+100]
-                    all_vectors.extend(await async_embed_batch(batch))
+            for batch_start in range(0, len(parent_docs), PARENT_BATCH_SIZE):
+                batch_parents = parent_docs[batch_start:batch_start + PARENT_BATCH_SIZE]
+                batch_child_payloads = []
+                batch_texts = []
 
-            # 3. Riassemblaggio (Zippiamo vettori e payload pre-costruiti)
-            all_child_points = []
-            for vec, payload in zip(all_vectors, all_child_payloads_without_vectors):
-                all_child_points.append(
-                    models.PointStruct(
-                        id=str(uuid.uuid4()), vector=vec, payload=build_payload(payload, extra_metadata)
+                for p_idx_offset, p_doc in enumerate(batch_parents):
+                    p_idx = batch_start + p_idx_offset
+                    parent_id = str(uuid.uuid4())
+                    merged_metadata = {**p_doc.metadata, **extra_metadata}
+
+                    mysql_parents_data.append((
+                        parent_id, topic_id, sub_topic_id, source_name, file_name,
+                        p_idx, p_doc.page_content, json.dumps(merged_metadata)
+                    ))
+
+                    child_docs = child_text_splitter.create_documents([p_doc.page_content])
+                    for c_idx, c_doc in enumerate(child_docs):
+                        content_norm = " ".join(c_doc.page_content.lower().split())
+                        content_hash = hashlib.md5(content_norm.encode()).hexdigest()
+
+                        batch_child_payloads.append({
+                            **c_doc.metadata,
+                            "parent_id": parent_id,
+                            "topic_id": topic_id,
+                            "sub_topic_id": sub_topic_id,
+                            "source": source_name,
+                            "file_name": file_name,
+                            "child_index": c_idx,
+                            "content": c_doc.page_content,
+                            "content_hash": content_hash, 
+                            "_ingestion_id": ingestion_id
+                        })
+                        batch_texts.append(c_doc.page_content)
+
+                # Embedding per questo batch
+                batch_vectors = []
+                if batch_texts:
+                    for i in range(0, len(batch_texts), 100):
+                        sub_batch = batch_texts[i:i + 100]
+                        batch_vectors.extend(await async_embed_batch(sub_batch))
+
+                # Assembla PointStruct e accoda al buffer
+                for vec, payload in zip(batch_vectors, batch_child_payloads):
+                    pending_child_points.append(
+                        models.PointStruct(
+                            id=str(uuid.uuid4()),
+                            vector=vec,
+                            payload=build_payload(payload, extra_metadata)
+                        )
                     )
-                )
 
-            # 1. Salvataggio su MySQL (Sincrono, spostato su thread separato)
+                # Flush intermedio su Qdrant: scarica e libera RAM
+                if len(pending_child_points) >= 500:
+                    log.info(f"Qdrant flush intermedio: {len(pending_child_points)} punti (batch parent {batch_start}).")
+                    for i in range(0, len(pending_child_points), 100):
+                        await _qdrant_upsert_with_retry(pending_child_points[i:i + 100])
+                    pending_child_points.clear()
+
+                # Libera il batch corrente prima di passare al prossimo
+                del batch_parents, batch_child_payloads, batch_texts, batch_vectors
+                log.debug(f"Batch parent [{batch_start}:{batch_start + PARENT_BATCH_SIZE}] completato.")
+
+            # Libera i parent_docs ora che abbiamo finito il loop
+            total_parents = len(parent_docs)
+            del parent_docs
+
+            # --- Flush finale dei punti rimasti nel buffer ---
+            if pending_child_points:
+                log.info(f"Qdrant flush finale: {len(pending_child_points)} punti.")
+                for i in range(0, len(pending_child_points), 100):
+                    await _qdrant_upsert_with_retry(pending_child_points[i:i + 100])
+                pending_child_points.clear()
+
+            # --- Salvataggio Parent su MySQL ---
             log.info(f"MySQL Upsert: {len(mysql_parents_data)} Parent Documents.")
             await asyncio.to_thread(sync_upsert_parents_mysql, source_name, topic_id, sub_topic_id, mysql_parents_data)
 
-            # 2. Upsert su DB Vettoriale Qdrant (Solo Child)
-            log.info(f"Qdrant Upsert: {len(all_child_points)} Child Chunks.")
-            
-            # 1. UPSERT prima (i nuovi punti hanno ingestion_id fresco)
-            if all_child_points:
-                for i in range(0, len(all_child_points), 100):
-                    await qdrant_client.upsert(
-                        collection_name=QDRANT_COLLECTION,
-                        points=all_child_points[i:i + 100]
-                    )
-
-            # 2. Solo se l'upsert è andato a buon fine, cancella i punti VECCHI
-            #    cioè quelli con lo stesso source/topic/subtopic ma ingestion_id diverso
+            # --- Cleanup vecchi punti Qdrant (idempotenza) ---
+            # Elimina i punti con stesso source/topic/subtopic ma ingestion_id diverso
             cleanup_filter = models.FilterSelector(
                 filter=models.Filter(
                     must=[
-                        models.FieldCondition(key="source",        match=models.MatchValue(value=source_name)),
-                        models.FieldCondition(key="topic_id",      match=models.MatchValue(value=topic_id)),
-                        models.FieldCondition(key="sub_topic_id",  match=models.MatchValue(value=sub_topic_id)),
+                        models.FieldCondition(key="source",       match=models.MatchValue(value=source_name)),
+                        models.FieldCondition(key="topic_id",     match=models.MatchValue(value=topic_id)),
+                        models.FieldCondition(key="sub_topic_id", match=models.MatchValue(value=sub_topic_id)),
                     ],
                     must_not=[
-                        models.FieldCondition(key="_ingestion_id",  match=models.MatchValue(value=ingestion_id)),
+                        models.FieldCondition(key="_ingestion_id", match=models.MatchValue(value=ingestion_id)),
                     ]
                 )
             )
             await qdrant_client.delete(collection_name=QDRANT_COLLECTION, points_selector=cleanup_filter)
 
-            log.info(f"SUCCESS: Indicizzazione completata per source '{source_name}'.")
+            log.info(f"SUCCESS: Indicizzazione completata per source '{source_name}' — {total_parents} parent, ingestion_id={ingestion_id}.")
             await finalize_file_move(json_path, root_folder, topic_id, sub_topic_id)
             await finalize_file_move(text_file_path, root_folder, topic_id, sub_topic_id)
             return True
@@ -543,10 +573,10 @@ async def on_message_received(message: aio_pika.IncomingMessage):
 
 async def main_worker():
     """Worker principale per RabbitMQ."""
-    log.info(f"Tentativo di connessione a RabbitMQ su {BROKER_HOST}...")
+    log.info(f"Tentativo di connessione a RabbitMQ su {settings.broker_host}...")
     
     try:
-        connection = await aio_pika.connect_robust(f"amqp://{BROKER_USERNAME}:{BROKER_PASSWORD}@{BROKER_HOST}:{BROKER_PORT}/")
+        connection = await aio_pika.connect_robust(f"amqp://{settings.broker_username}:{settings.broker_password}@{settings.broker_host}:{settings.broker_port}/")
         
         async with connection:
             channel = await connection.channel()

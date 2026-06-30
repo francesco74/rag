@@ -1,11 +1,12 @@
 # import_qdrant.py
 import os
 import requests
+from common.config import settings
+from common.db_logger import MySQLLogHandler, get_db_connection, init_db_pool
+
 
 # Configurazione dinamica tramite variabili d'ambiente
-QDRANT_HOST = os.environ.get("QDRANT_HOST", "localhost")
-QDRANT_PORT = int(os.environ.get("QDRANT_PORT", 6333))
-QDRANT_HTTP_URL = f"http://{QDRANT_HOST}:{QDRANT_PORT}"
+QDRANT_HTTP_URL = f"http://{settings.qdrant_host}:{settings.qdrant_port}"
 
 # Cartella in cui hai depositato i file .snapshot (es. la cartella qdrant_snapshots creata prima)
 SNAPSHOT_DIR = "./"  
@@ -23,7 +24,7 @@ def import_snapshots():
         print("[*] Ricordati di spostare i file recuperati con 'kubectl cp' dentro questa cartella.")
         return
 
-    print(f"[*] Inizio ripristino sul nuovo database Qdrant ({QDRANT_HOST}:{QDRANT_PORT})...")
+    print(f"[*] Inizio ripristino sul nuovo database Qdrant ({settings.qdrant_host}:{settings.qdrant_port})...")
     
     for file in files:
         # Estrae il nome della collection dal nome del file (es. document_chunks.snapshot -> document_chunks)

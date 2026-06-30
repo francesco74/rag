@@ -4,7 +4,8 @@ import json
 import asyncio
 import logging
 from qdrant_client import AsyncQdrantClient
-import mysql.connector
+from common.config import settings
+from common.db_logger import MySQLLogHandler, get_db_connection, init_db_pool
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - REIMPORT - %(levelname)s - %(message)s')
 log = logging.getLogger("ReloadParents")
@@ -12,23 +13,14 @@ log = logging.getLogger("ReloadParents")
 # ==============================================================================
 # CONFIGURAZIONE AMBIENTE
 # ==============================================================================
-QDRANT_HOST = os.environ.get("QDRANT_HOST", "qdrant.rag.svc.cluster.local")
-QDRANT_PORT = int(os.environ.get("QDRANT_PORT", 6333))
 OLD_COLLECTION_NAME = "parent_documents"
 
-DB_HOST = os.environ.get("MYSQL_SERVICE_HOST", "localhost")
-DB_PORT = int(os.environ.get("MYSQL_SERVICE_PORT", 3306))
-DB_USER = os.environ.get("MYSQL_USER", "raguser")
-DB_PASS = os.environ.get("MYSQL_PASSWORD", "")
-DB_NAME = os.environ.get("MYSQL_DATABASE", "rag_db")
-
-
 async def reload_parents_with_correct_source():
-    log.info(f"Connessione a Qdrant su {QDRANT_HOST}:{QDRANT_PORT}...")
+    log.info(f"Connessione a Qdrant su {settings.qdrant_host}:{settings.qdrant_port}...")
     qdrant_client = None
     
     try:
-        qdrant_client = AsyncQdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
+        qdrant_client = AsyncQdrantClient(host=settings.qdrant_host, port=settings.qdrant_port)
         
         if not await qdrant_client.collection_exists(OLD_COLLECTION_NAME):
             log.error(f"× La collection '{OLD_COLLECTION_NAME}' non esiste in Qdrant. Impossibile ricaricare.")
@@ -53,9 +45,7 @@ async def reload_parents_with_correct_source():
         log.info(f"Scaricate {total_found} entry da Qdrant. Connessione a MySQL...")
         
         try:
-            conn = mysql.connector.connect(
-                host=DB_HOST, port=DB_PORT, user=DB_USER, password=DB_PASS, database=DB_NAME
-            )
+            conn = init_db_pool
         except Exception as conn_err:
             log.error(f"× Connessione a MySQL fallita: {conn_err}")
             return

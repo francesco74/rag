@@ -19,6 +19,7 @@ import os
 import logging
 import time
 from abc import ABC, abstractmethod
+from common.config import settings
 
 log = logging.getLogger("rag_queue")
 
@@ -62,12 +63,12 @@ class LLMProvider(ABC):
 
     @abstractmethod
     def generate_json(self, model_name: str, prompt: str,
-                      temperature: float = 0.1, max_tokens: int = 2048) -> str:
+                      temperature: float = 0.1, max_tokens: int = 2048, thinking_level: bool = None) -> str:
         """Call the model asking for a JSON response. Returns the raw JSON string."""
 
     @abstractmethod
     def generate_text(self, model_name: str, prompt: str,
-                      temperature: float = 0.0, max_tokens: int = 16) -> str:
+                      temperature: float = 0.0, max_tokens: int = 16, thinking_level: bool = None) -> str:
         """Call the model asking for a plain-text response. Returns the text string."""
 
 
@@ -78,40 +79,63 @@ class GeminiProvider(LLMProvider):
 
     def __init__(self):
         try:
-            import google.generativeai as genai
-            from google.api_core.exceptions import ResourceExhausted, ServiceUnavailable
-            genai.configure(api_key=os.environ.get("GOOGLE_API_KEY"))
-            self._genai = genai
-            self._rate_limit_exceptions = (ResourceExhausted, ServiceUnavailable)
-            log.info("✓ GeminiProvider initialized.")
+            # Nuovo import pulito come desideravi
+            from google import genai
+            from google.genai.errors import APIError
+            
+            # Il nuovo SDK centralizza tutto in un oggetto Client.
+            # Viene istanziato una sola volta usando la chiave dei tuoi settings.
+            self._client = genai.Client(api_key=settings.api_llm_key)
+            self._rate_limit_exceptions = (APIError,)
+            
+            log.info("✓ GeminiProvider initialized with new google-genai SDK.")
         except ImportError:
-            raise RuntimeError("google-generativeai package not installed.")
+            raise RuntimeError(
+                "google-genai package not installed. "
+            )
 
-    def _call(self, model_name, prompt, temperature, max_tokens, json_mode=False):
-        import google.generativeai as genai
+    def _call(self, model_name: str, prompt: str, temperature: float, max_tokens: int, json_mode: bool = False, thinking_level: bool = None) -> str:
+        from google.genai import types
 
-        config_kwargs = dict(temperature=temperature, max_output_tokens=max_tokens)
+        # Nel nuovo SDK le configurazioni di generazione passano da GenerateContentConfig
+        config_kwargs = {
+            "temperature": temperature,
+            "max_output_tokens": max_tokens,
+        }
         if json_mode:
             config_kwargs["response_mime_type"] = "application/json"
 
-        model = self._genai.GenerativeModel(model_name)
+        if thinking_level:
+            config_kwargs["thinking_config"] = types.ThinkingConfig(
+                thinking_level=thinking_level
+            )
+            
+        config = types.GenerateContentConfig(**config_kwargs)
 
         def _attempt():
             try:
-                return model.generate_content(
-                    prompt,
-                    generation_config=self._genai.types.GenerationConfig(**config_kwargs)
-                ).text
+                # La chiamata passa attraverso il gestore dei modelli del client
+                response = self._client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config=config
+                )
+                return response.text
             except self._rate_limit_exceptions as e:
-                raise LLMRateLimitError(str(e)) from e
+                # Il nuovo APIError espone l'attributo 'code' (lo status HTTP).
+                # Intercettiamo i codici 429 (Rate Limit) e 503 (Servizio Non Disponibile/Overload).
+                status_code = getattr(e, "code", None)
+                if status_code in (429, 503):
+                    raise LLMRateLimitError(str(e)) from e
+                raise
 
         return _retry_with_backoff(_attempt)
 
-    def generate_json(self, model_name, prompt, temperature=0.1, max_tokens=2048):
-        return self._call(model_name, prompt, temperature, max_tokens, json_mode=True)
+    def generate_json(self, model_name: str, prompt: str, temperature: float = 0.1, max_tokens: int = 2048, thinking_level: bool = None) -> str:
+        return self._call(model_name, prompt, temperature, max_tokens, json_mode=True, thinking_level=thinking_level)
 
-    def generate_text(self, model_name, prompt, temperature=0.0, max_tokens=16):
-        return self._call(model_name, prompt, temperature, max_tokens, json_mode=False)
+    def generate_text(self, model_name: str, prompt: str, temperature: float = 0.0, max_tokens: int = 16, thinking_level: bool = None) -> str:
+        return self._call(model_name, prompt, temperature, max_tokens, json_mode=False, thinking_level=thinking_level)
 
 
 # ==============================================================================
@@ -122,14 +146,17 @@ class OpenAIProvider(LLMProvider):
     def __init__(self):
         try:
             from openai import OpenAI, RateLimitError, APIStatusError
-            self._client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+            self._client = OpenAI(api_key=settings.api_llm_key)
             self._RateLimitError = RateLimitError
             self._APIStatusError = APIStatusError
             log.info("✓ OpenAIProvider initialized.")
         except ImportError:
             raise RuntimeError("openai package not installed.")
 
-    def _call(self, model_name, prompt, temperature, max_tokens, json_mode=False):
+    def _call(self, model_name, prompt, temperature, max_tokens, json_mode=False, thinking_level: bool = None):
+        if thinking_level:
+            log.warning ("OpenAIProvider thinking level not used")
+
         kwargs = dict(
             model=model_name,
             messages=[{"role": "user", "content": prompt}],
@@ -152,11 +179,11 @@ class OpenAIProvider(LLMProvider):
 
         return _retry_with_backoff(_attempt)
 
-    def generate_json(self, model_name, prompt, temperature=0.1, max_tokens=2048):
-        return self._call(model_name, prompt, temperature, max_tokens, json_mode=True)
+    def generate_json(self, model_name, prompt, temperature=0.1, max_tokens=2048, thinking_level: bool = None):
+        return self._call(model_name, prompt, temperature, max_tokens, json_mode=True, thinking_level = thinking_level)
 
-    def generate_text(self, model_name, prompt, temperature=0.0, max_tokens=16):
-        return self._call(model_name, prompt, temperature, max_tokens, json_mode=False)
+    def generate_text(self, model_name, prompt, temperature=0.0, max_tokens=16, thinking_level: bool = None):
+        return self._call(model_name, prompt, temperature, max_tokens, json_mode=False, thinking_level = thinking_level)
 
 
 # ==============================================================================
@@ -172,14 +199,17 @@ class AnthropicProvider(LLMProvider):
     def __init__(self):
         try:
             import anthropic
-            self._client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+            self._client = anthropic.Anthropic(api_key=settings.api_llm_key)
             self._RateLimitError = anthropic.RateLimitError
             self._APIStatusError = anthropic.APIStatusError
             log.info("✓ AnthropicProvider initialized.")
         except ImportError:
             raise RuntimeError("anthropic package not installed.")
 
-    def _call(self, model_name, prompt, temperature, max_tokens, json_mode=False):
+    def _call(self, model_name, prompt, temperature, max_tokens, json_mode=False, thinking_level: bool = None):
+        if thinking_level:
+            log.warning ("AnthropicProvider thinking level not used")
+
         system = (
             "You must reply with valid JSON only. No explanation, no markdown fences."
             if json_mode else None
@@ -206,11 +236,11 @@ class AnthropicProvider(LLMProvider):
 
         return _retry_with_backoff(_attempt)
 
-    def generate_json(self, model_name, prompt, temperature=0.1, max_tokens=2048):
-        return self._call(model_name, prompt, temperature, max_tokens, json_mode=True)
+    def generate_json(self, model_name, prompt, temperature=0.1, max_tokens=2048, thinking_level: bool = None):
+        return self._call(model_name, prompt, temperature, max_tokens, json_mode=True, thinking_level=thinking_level)
 
-    def generate_text(self, model_name, prompt, temperature=0.0, max_tokens=16):
-        return self._call(model_name, prompt, temperature, max_tokens, json_mode=False)
+    def generate_text(self, model_name, prompt, temperature=0.0, max_tokens=16, thinking_level: bool = None):
+        return self._call(model_name, prompt, temperature, max_tokens, json_mode=False, thinking_level=thinking_level)
 
 
 # ==============================================================================
@@ -223,23 +253,21 @@ def init_llm_provider() -> LLMProvider:
     Returns the provider instance and also stores it in the module-level singleton.
     """
     global _PROVIDER_INSTANCE
-    provider_name = os.environ.get("LLM_PROVIDER", "gemini").lower()
-
     providers = {
         "gemini":    GeminiProvider,
         "openai":    OpenAIProvider,
         "anthropic": AnthropicProvider,
     }
 
-    cls = providers.get(provider_name)
+    cls = providers.get(settings.llm_provider)
     if cls is None:
         raise ValueError(
-            f"Unknown LLM_PROVIDER='{provider_name}'. "
+            f"Unknown LLM_PROVIDER='{settings.llm_provider}'. "
             f"Valid options: {list(providers.keys())}"
         )
 
     _PROVIDER_INSTANCE = cls()
-    log.info(f"LLM provider set to: {provider_name}")
+    log.info(f"LLM provider set to: {settings.llm_provider}")
     return _PROVIDER_INSTANCE
 
 

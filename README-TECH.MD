@@ -353,7 +353,7 @@ typeguard>=4.1.0
 
 ```bash
 # --- Autenticazione & API ---
-GOOGLE_API_KEY="your-gemini-and-embedding-key"
+API_LLM_KEY="your-gemini-and-embedding-key"
 API_SECRET_KEY="secure-bearer-token-for-flask"
 ALLOWED_ORIGINS="[https://your-frontend-domain.com](https://your-frontend-domain.com)"
 

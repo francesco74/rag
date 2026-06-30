@@ -1,10 +1,12 @@
 import os
 from qdrant_client import QdrantClient
+from common.config import settings
+from common.db_logger import MySQLLogHandler, get_db_connection, init_db_pool
 
 def count_qdrant_metrics():
     client = QdrantClient(
-        host=os.environ.get("QDRANT_HOST", "localhost"),
-        port=int(os.environ.get("QDRANT_PORT", 6333))
+        host=settings.qdrant_host,
+        port=settings.qdrant_port
     )
     
     collection_name = "document_chunks"

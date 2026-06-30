@@ -2,15 +2,13 @@ import os
 import argparse
 from qdrant_client import QdrantClient
 from qdrant_client.http.exceptions import UnexpectedResponse
-
-# Configurazione
-QDRANT_HOST = os.environ.get("QDRANT_HOST", "localhost")
-QDRANT_PORT = int(os.environ.get("QDRANT_PORT", 6333))
+from common.config import settings
+from common.db_logger import MySQLLogHandler, get_db_connection, init_db_pool
 
 def delete_qdrant_collection(collection_name, force=False):
-    print(f"Connessione a Qdrant ({QDRANT_HOST}:{QDRANT_PORT}) in corso...\n")
+    print(f"Connessione a Qdrant ({settings.qdrant_host}:{settings.qdrant_port}) in corso...\n")
     try:
-        qdrant = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
+        qdrant = QdrantClient(host=settings.qdrant_host, port=settings.qdrant_port)
         
         # 1. Verifica se la collection esiste
         try:

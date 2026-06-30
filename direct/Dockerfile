@@ -18,7 +18,7 @@ RUN apt-get update && \
 
 # --- Install Python Dependencies ---
 # Copy the requirements file first to leverage Docker cache
-COPY requirements.txt .
+COPY direct/requirements.txt .
 
 # Install any needed packages specified in requirements.txt
 # --no-cache-dir is used to keep the image size down
@@ -26,7 +26,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # --- Copy Application Code ---
 # Copy the rest of the application code into the container
-COPY src/direct.py .
+COPY direct/src/direct.py .
+COPY common/ ./common/
 
 # --- Configure and Run ---
 # Make port 8080 available to the world outside this container

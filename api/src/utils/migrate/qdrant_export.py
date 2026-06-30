@@ -3,23 +3,22 @@ import os
 import asyncio
 import requests
 from qdrant_client import AsyncQdrantClient
+from common.config import settings
+from common.db_logger import MySQLLogHandler, get_db_connection, init_db_pool
 
-# Configurazione dinamica tramite variabili d'ambiente
-QDRANT_HOST = os.environ.get("QDRANT_HOST", "localhost")
-QDRANT_PORT = int(os.environ.get("QDRANT_PORT", 6333))
-QDRANT_HTTP_URL = f"http://{QDRANT_HOST}:{QDRANT_PORT}"
+QDRANT_HTTP_URL = f"http://{settings.qdrant_host}:{settings.qdrant_port}"
 
 # Inserisci qui le collection che vuoi esportare dal vecchio server
 COLLECTIONS = ["document_chunks", "parent_documents"]
 
 async def export_snapshots():
-    print(f"Connessione a Qdrant su {QDRANT_HOST}:{QDRANT_PORT}...")
+    print(f"Connessione a Qdrant su {settings.qdrant_host}:{settings.qdrant_port}...")
     
     # Inizializziamo a None per evitare UnboundLocalError nel blocco finally
     client = None
     try:
         # Inizializzazione vecchio stile, compatibile con tutte le versioni dell'SDK
-        client = AsyncQdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
+        client = AsyncQdrantClient(host=settings.qdrant_host, port=settings.qdrant_port)
         
         for col in COLLECTIONS:
             try:

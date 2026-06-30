@@ -1,14 +1,13 @@
 import os
 from qdrant_client import QdrantClient
-from dotenv import load_dotenv
-
-load_dotenv()
+from common.config import settings
+from common.db_logger import MySQLLogHandler, get_db_connection, init_db_pool
 
 def list_topics_from_qdrant():
     # Connessione a Qdrant usando le variabili d'ambiente o i default
     client = QdrantClient(
-        host=os.environ.get("QDRANT_HOST", "localhost"),
-        port=int(os.environ.get("QDRANT_PORT", 6333))
+        host=settings.qdrant_host,
+        port=settings.qdrant_port
     )
     
     collection_name = "document_chunks"

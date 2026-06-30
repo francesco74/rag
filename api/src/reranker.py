@@ -11,6 +11,7 @@ from typing import List, Tuple, Optional
 from dataclasses import dataclass
 import logging
 
+
 # Only load heavy dependencies when needed
 try:
     import onnxruntime as ort
@@ -20,6 +21,9 @@ except ImportError:
     DEPENDENCIES_AVAILABLE = False
 
 log = logging.getLogger(__name__)
+
+
+
 
 
 @dataclass
@@ -174,7 +178,7 @@ class ONNXReranker:
             return []
         
         num_docs = len(documents)
-        log.info(f"Reranking {num_docs} documents against query: '{query[:30]}...'")
+        log.info(f"Reranking {num_docs} documents against query: '{query[:60]}...'")
         
         all_scores = np.zeros(num_docs, dtype=np.float32)
         total_start = time.time()
