@@ -281,7 +281,7 @@ La configurazione centralizzata raccoglie e convalida le variabili d'ambiente. D
 | `broker_host` | `BROKER_HOST` | `str` | `"rabbitmq-service.rag.svc.cluster.local"` | Endpoint dell'istanza RabbitMQ per la comunicazione asincrona. |
 | `broker_port` | `BROKER_PORT` | `int` | `5672` | Porta del broker RabbitMQ. |
 || `broker_username` / `broker_password` | `BROKER_USERNAME` / `BROKER_PASSWORD` | `str` / `str` | `"guest"` / `"guest"` | Credenziali di accesso per la pubblicazione e consumo degli eventi. |
-| `broker_max_attemps` | `BROKER_MAX_ATTEMPTS` | `int` | `30` | Tentativi massimi di connessione asincrona tollerati all'avvio dei pod prima del crash. |
+| `broker_max_attempts` | `BROKER_MAX_ATTEMPTS` | `int` | `30` | Tentativi massimi di connessione asincrona tollerati all'avvio dei pod prima del crash. |
 | `docws_ricerca_endpoint` | `DOCWS_RICERCA_ENDPOINT` | `str` | **Obbligatoria** | URL SOAP di Sicr@Web per la federazione delle ricerche atti (`estrattore.py`). |
 | `docws_atti_endpoint` | `DOCWS_ATTI_ENDPOINT` | `str` | **Obbligatoria** | URL SOAP di Sicr@Web per l'estrazione binaria degli atti (`estrattore.py`). |
 | `docws_codice_amministrazione` / `docws_codice_aoo` | `DOCWS_CODICE_AMMINISTRAZIONE` / `DOCWS_CODICE_AOO` | `str` | **Obbligatoria** | Metadati di instradamento giuridico e classificazione dell'Ente Locale. |

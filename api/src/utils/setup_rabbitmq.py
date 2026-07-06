@@ -259,7 +259,7 @@ def verify_topology(client: RabbitMQClient) -> bool:
 # ==============================================================================
 
 def main():
-    max_attempts = settings.broker_max_attemps
+    max_attempts = settings.broker_max_attempts
 
     log.info("======================================================")
     log.info(" RabbitMQ Topology Setup")

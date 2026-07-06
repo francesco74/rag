@@ -163,6 +163,12 @@ def main():
 
         try:
             lista_allegati_raw, attributi_plus = repwss_client.leggi_atto_plus(str_uid)
+            # FIX: leggi_atto_plus() restituisce un generatore (estrai_allegati() usa yield).
+            # Va materializzato in una lista PRIMA di essere consumato più volte,
+            # altrimenti dopo il primo giro (nomi_file_presenti) risulta esaurito
+            # e il ciclo successivo non produce più alcun allegato.
+            lista_allegati_raw = list(lista_allegati_raw)
+
             meta_atto = risultato_ricerca.documenti_metadata.get(str_uid, {})
 
             log.debug(f"Metadati estratti per UID {str_uid}: {meta_atto}")
@@ -200,8 +206,19 @@ def main():
                 log.warning("Nessun allegato valido rimasto per UID %s. Salto.", str_uid)
                 continue
 
+            nomi_visti = set() # Traccia i nomi assegnati per questo documento
+            
             for file_bytes, file_name in lista_allegati_filtrata:
-                safe_name = f"doc_{str_uid}_{file_name}"
+                base_name = f"doc_{str_uid}_{file_name}"
+                safe_name = base_name
+                counter = 1
+
+                while safe_name in nomi_visti:
+                    p = pathlib.Path(base_name)
+                    safe_name = f"{p.stem}_{counter}{p.suffix}"
+                    counter += 1
+                    
+                nomi_visti.add(safe_name)
                 
                 tmp_path = staging_json_dir / f"{safe_name}.tmp"
                 final_path = staging_json_dir / safe_name
