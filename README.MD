@@ -34,7 +34,7 @@ Il nostro sistema avanzato supera questo limite comportandosi come un istruttore
 
 ## 2. Il Viaggio dei Documenti: Caricamento e Archiviazione (Ingestion)
 
-Prima di poter rispondere alle domande dei funzionari, il sistema deve "studiare" ed elaborare i file (PDF, relazioni, immagini, scansioni) attraverso un processo automatico suddiviso in tre passaggi chiave:
+Prima di poter rispondere alle domande, il sistema deve "studiare" ed elaborare i file (PDF, relazioni, immagini, scansioni) attraverso un processo automatico suddiviso in tre passaggi chiave:
 
 ### Passo 1: Caricamento Veloce ed Elaborazione in Background
 
@@ -80,7 +80,7 @@ Per preservare la massima velocità di ricerca senza smarrire il filo logico a c
 
 In un contesto regolato in modo stringente dal diritto amministrativo, la sicurezza e la precisione sono requisiti tassativi. L'architettura offre capacità verticali e sicure:
 
-**Citazione rigorosa delle fonti:** Il sistema indica con assoluta precisione gli estremi del documento da cui ha tratto l'informazione (es. *"Determina Dirigenziale n. 145 del 12/04/2024"*), permettendo al funzionario una verifica immediata sull'atto ufficiale.
+**Citazione rigorosa delle fonti:** Il sistema indica con assoluta precisione gli estremi del documento da cui ha tratto l'informazione (es. *"Determina Dirigenziale n. 145 del 12/04/2024"*), permettendo una verifica immediata sull'atto ufficiale.
 
 **Comprensione del linguaggio settoriale:** Sfruttando la ricerca semantica, l'assistente comprende nativamente sinonimi, concetti affini e costrutti tipici della Pubblica Amministrazione.
  
@@ -113,7 +113,7 @@ Un'architettura RAG convenzionale è progettata solo per recuperare frammenti is
 
 ## 4. L'Architettura Avanzata: Come Risponde alle Domande? (Il Cervello del Sistema)
 
-Quando un funzionario inserisce una domanda all'interno della chat (es. *"Ci sono sconti e agevolazioni per l'acquisto di vetture?"*), l'assistente si comporta come un "agente intelligente" attivo e attiva una catena di controllo qualità strutturata:
+Quando viene inserita una domanda all'interno della chat (es. *"Ci sono sconti e agevolazioni per l'acquisto di vetture?"*), l'assistente si comporta come un "agente intelligente" attivo e attiva una catena di controllo qualità strutturata:
 
 ```
               [ Domanda ]
@@ -154,7 +154,7 @@ Quando un funzionario inserisce una domanda all'interno della chat (es. *"Ci son
 
 
 
-## 5. L'Interfaccia Utente: La Scrivania Digitale del Funzionario
+## 5. L'Interfaccia Utente
 
 Il frontend dell'applicazione è stato interamente sviluppato per offrire ai dipendenti dell'Ente il massimo livello di controllo, accessibilità visiva e trasparenza operativa:
 
@@ -174,7 +174,7 @@ Il frontend dell'applicazione è stato interamente sviluppato per offrire ai dip
 
 **Il Filtro dei Sotto-Argomenti:** Un pulsante dedicato consente di aprire una lista di controllo con cui circoscrivere la ricerca, includendo o escludendo specifiche categorie, uffici o annualità di documenti (es. analizzare solo i contratti del 2026 o i regolamenti tecnici).
 
-**Trasparenza nei Tempi di Attesa:** Durante l'elaborazione, l'interfaccia mostra un indicatore visivo animato. Se l'analisi di una domanda particolarmente complessa supera i 20 secondi, l'app mostra un messaggio di cortesia automatico per confermare al funzionario che il sistema è regolarmente operativo dietro le quinte.
+**Trasparenza nei Tempi di Attesa:** Durante l'elaborazione, l'interfaccia mostra un indicatore visivo animato. Se l'analisi di una domanda particolarmente complessa supera i 20 secondi, l'app mostra un messaggio di cortesia automatico per confermare che il sistema è regolarmente operativo dietro le quinte.
 
 **Fonti Cliccabili e Verificabili:** Al di sotto di ogni risposta compare un menu a tendina espandibile con l'elenco delle fonti impiegate. L'utente può cliccare sui comodi pulsanti (*chip*) recanti i nomi dei file originali per scaricare o aprire direttamente il documento sorgente nel punto esatto da cui è stato estratto il testo.
 
@@ -187,7 +187,7 @@ L'architettura software è governata da logiche ingegneristiche avanzate che ott
 
 **Ottimizzazione per Disparità Documentale (Redistribuzione Flessibile):** Se un'interrogazione coinvolge più uffici e si rileva che la maggior parte di essi non ha prodotto atti su quel tema specifico nell'ultimo anno, il sistema non restituisce una risposta povera e non disperde potenza di calcolo. La capacità di analisi viene ridiretta in automatico per esaminare in massima profondità l'unico settore che possiede abbondante documentazione sul tema, garantendo risposte dettagliate.
 
-**Sostenibilità dei Costi di Calcolo (Cache Semantica Composta):** Per ridurre drasticamente i costi operativi legati all'uso degli LLM, la piattaforma introduce una memoria intelligente. Se due funzionari eseguono la stessa domanda (o quesiti semanticamente affini) applicando i medesimi filtri di visibilità, il sistema riconosce la richiesta e attinge in un lampo alla risposta già convalidata, abbattendone i tempi di rilascio da secondi a millisecondi.
+**Sostenibilità dei Costi di Calcolo (Cache Semantica Composta):** Per ridurre drasticamente i costi operativi legati all'uso degli LLM, la piattaforma introduce una memoria intelligente. Se due utenti eseguono la stessa domanda (o quesiti semanticamente affini) applicando i medesimi filtri di visibilità, il sistema riconosce la richiesta e attinge in un lampo alla risposta già convalidata, abbattendone i tempi di rilascio da secondi a millisecondi.
 
 **Ancoraggio a Filtri Amministrativi (Hybrid Search):** Al fine di evitare anacronismi o scambi tra atti storici e correnti, l'architettura permette di blindare i confini di ricerca applicando filtri amministrativi certi (intervalli temporali rigidi o tipologie d'atto tassative) entro i quali l'IA è obbligata a muoversi, azzerando gli errori procedurali.
 
@@ -196,7 +196,7 @@ L'architettura software è governata da logiche ingegneristiche avanzate che ott
 
 ## 7. Cicli di Feedback e Ottimizzazione Semantica Continua
 
-Il motore semantico applicato al contesto pubblico non è statico, ma si evolve dinamicamente assimilando l'uso quotidiano dei funzionari attraverso canali di monitoraggio attivo e automatico:
+Il motore semantico applicato al contesto pubblico non è statico, ma si evolve dinamicamente assimilando l'uso quotidiano attraverso canali di monitoraggio attivo e automatico:
 
 **Gestione dei Feedback Utente (Circuiti Attivi):** Le segnalazioni e i commenti inseriti manualmente dal personale permettono di intercettare minuziose sfumature procedurali o dettagli normativi strettamente locali che potrebbero sfuggire agli algoritmi di base.
 
