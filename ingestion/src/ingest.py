@@ -25,6 +25,7 @@ from langchain_text_splitters import (
 # --- ASYNC, RESILIENCE & MESSAGING ---
 import aio_pika
 from aiolimiter import AsyncLimiter
+import aiormq
 from tenacity import (
     retry,
     stop_after_attempt,
@@ -330,14 +331,13 @@ async def process_single_file_async(topic_id, sub_topic_id, json_path, root_fold
 
             if is_markdown and use_markdown_splitter:
                 log.info("Applico MarkdownHeaderTextSplitter come da configurazione DB.")
-                md_header_splits = markdown_splitter.split_text(full_text)
-                parent_docs = parent_text_splitter.split_documents(md_header_splits)
+                md_header_splits = await asyncio.to_thread(markdown_splitter.split_text, full_text)
+                parent_docs = await asyncio.to_thread(parent_text_splitter.split_documents, md_header_splits)
                 del md_header_splits
             elif is_markdown:
-                log.info("Markdown Splitter disabilitato da DB. Tratto il file come blocco unico.")
-                parent_docs = parent_text_splitter.create_documents([full_text])
+                parent_docs = await asyncio.to_thread(parent_text_splitter.create_documents, [full_text])
             else:
-                parent_docs = parent_text_splitter.create_documents([full_text])
+                parent_docs = await asyncio.to_thread(parent_text_splitter.create_documents, [full_text])
 
             # Libera subito la stringa originale: non serve più
             del full_text
@@ -381,7 +381,7 @@ async def process_single_file_async(topic_id, sub_topic_id, json_path, root_fold
                         p_idx, p_doc.page_content, json.dumps(merged_metadata)
                     ))
 
-                    child_docs = child_text_splitter.create_documents([p_doc.page_content])
+                    child_docs = await asyncio.to_thread(child_text_splitter.create_documents, [p_doc.page_content])
                     for c_idx, c_doc in enumerate(child_docs):
                         content_norm = " ".join(c_doc.page_content.lower().split())
                         content_hash = hashlib.md5(content_norm.encode()).hexdigest()
@@ -548,7 +548,12 @@ async def on_message_received(message: aio_pika.IncomingMessage):
         except json.JSONDecodeError as e:
             log.error(f"Decode JSON Fallito: {e}. Payload irrecuperabile, invio a DLQ.")
             await message.reject(requeue=False)
-            
+
+        except (aiormq.exceptions.ChannelInvalidStateError, aiormq.exceptions.AMQPConnectionError) as e:
+            # Il canale è morto: RabbitMQ farà il redeliver da solo quando il canale/connessione
+            # si chiude senza ack. Non tentare ack/reject, logga soltanto.
+            log.warning(f"Canale invalido durante il processing di un messaggio: {e}. "
+                        f"Il broker farà redeliver automaticamente.")
         except Exception as e:
             # Se siamo qui, tutti i 5 tentativi di Tenacity sono falliti.
             log.error(f"Fallimento definitivo dopo i retry. Spostamento in DLQ (rag_dlx). Errore: {e}", exc_info=True)
@@ -576,8 +581,10 @@ async def main_worker():
     log.info(f"Tentativo di connessione a RabbitMQ su {settings.broker_host}...")
     
     try:
-        connection = await aio_pika.connect_robust(f"amqp://{settings.broker_username}:{settings.broker_password}@{settings.broker_host}:{settings.broker_port}/")
-        
+        connection = await aio_pika.connect_robust(
+            f"amqp://{settings.broker_username}:{settings.broker_password}@{settings.broker_host}:{settings.broker_port}/",
+            heartbeat=120  
+        )
         async with connection:
             channel = await connection.channel()
             
@@ -593,8 +600,11 @@ async def main_worker():
                 async for message in queue_iter:
                     # FIX 2: create_task avvia l'elaborazione in background SENZA bloccare il ciclo di ricezione.
                     # Il ciclo preleverà istantaneamente i prossimi messaggi, scatenando la vera concorrenza.
-                    asyncio.create_task(on_message_received(message))
+                    background_tasks = set()
                     
+                    task = asyncio.create_task(on_message_received(message))
+                    background_tasks.add(task)
+                    task.add_done_callback(background_tasks.discard)
     except Exception as e:
         log.error(f"Errore critico di connettività broker: {e}")
         raise

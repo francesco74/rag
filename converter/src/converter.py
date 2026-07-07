@@ -217,7 +217,12 @@ IMG_EXTENSIONS = [".png", ".jpg", ".jpeg"]
 
 EXTRACTION_TIMEOUT = 1200.0        # 20 minuti - estrazione ibrida (testo/vettori + OCR mirato)
 FALLBACK_RENDER_TIMEOUT = 300.0    # 5 minuti - estrazione di fallback per-pagina (senza get_drawings, deve essere più rapida)
-MAX_CHARS_FOR_AI_LAYOUT = 200_000  # oltre questa soglia una pagina è quasi certamente una planimetria/disegno tecnico, non testo normale: si salta il layout AI (ONNX) e si usa il testo grezzo
+MAX_CHARS_FOR_AI_LAYOUT = 70_000   # oltre questa soglia una pagina è quasi certamente una planimetria/disegno tecnico, non testo normale: si salta il layout AI (ONNX) e si usa il testo grezzo
+                                    # NB: soglia abbassata da 200_000 a 70_000 dopo aver osservato hang di pymupdf4llm.to_markdown()
+                                    # (layout AI/ONNX) già a ~139k caratteri su una singola pagina (planimetrie CAD dense di etichette/quote).
+VECTOR_COUNT_LAYOUT_SKIP = 500     # soglia secondaria: molti tracciati vettoriali + testo già cospicuo è un altro segnale forte
+                                    # di disegno tecnico, indipendentemente dal superamento di MAX_CHARS_FOR_AI_LAYOUT.
+VECTOR_COUNT_MIN_CHARS_SKIP = 50_000
 
 # Limiter asincrono: gestisce internamente la concorrenza garantendo max 10 chiamate/minuto
 GEMINI_LIMITER = AsyncLimiter(max_rate=10, time_period=60)
@@ -253,6 +258,11 @@ def _cpu_heavy_pdf_extraction(file_path_str: str, file_bytes: bytes, crop_limit:
 
     extracted_pages = []
     print(f"[CHILD PROCESS] Estrazione PDF iniziata per {file_path_str} ({len(doc)} pagine).")
+    # Teniamo traccia dello stato corrente di pymupdf4llm.use_layout() per evitare
+    # toggle ridondanti: riattivare il layout AI richiama pymupdf.layout.activate(),
+    # che ha un costo di inizializzazione non banale, quindi lo facciamo solo quando
+    # lo stato desiderato cambia rispetto a quello corrente.
+    layout_ai_active = True  # pymupdf4llm ha il layout AI attivo di default all'import
     for p_num in range(len(doc)):
         page_t0 = time.time()
         page = doc[p_num]
@@ -275,19 +285,37 @@ def _cpu_heavy_pdf_extraction(file_path_str: str, file_bytes: bytes, crop_limit:
             print(f"[CHILD PROCESS] Pagina {p_num}: COMPLETATA (rasterizzazione per OCR) in {time.time() - page_t0:.1f}s.")
         else:
             # Estrazione Markdown
-            if char_count > MAX_CHARS_FOR_AI_LAYOUT:
-                # Quantità di testo assurda per una singola pagina (tipico di
-                # planimetrie/disegni tecnici con migliaia di etichette di
-                # quote/coordinate, non un documento "normale"). Il modello
-                # di layout AI (ONNX/GNN) non scala su input di questa
-                # dimensione e può restare bloccato per ore (confermato via
-                # faulthandler). Saltiamo l'AI e usiamo il testo grezzo.
-                print(f"[CHILD PROCESS] Pagina {p_num}: Quantità di testo abnorme ({char_count} chars) — probabile planimetria/disegno tecnico. Salto il layout AI, uso testo grezzo.")
-                extracted_pages.append({"type": "markdown", "content": text})
-                print(f"[CHILD PROCESS] Pagina {p_num}: COMPLETATA (testo grezzo, no layout AI) in {time.time() - page_t0:.1f}s.")
+            skip_ai_layout = (
+                char_count > MAX_CHARS_FOR_AI_LAYOUT
+                or (vector_count > VECTOR_COUNT_LAYOUT_SKIP and char_count > VECTOR_COUNT_MIN_CHARS_SKIP)
+            )
+            if skip_ai_layout:
+                # Quantità di testo abnorme e/o presenza massiccia di elementi
+                # vettoriali (tipico di planimetrie/disegni tecnici con migliaia
+                # di etichette di quote/coordinate, non un documento "normale").
+                # Il modello di layout AI (ONNX/GNN) non scala su input di questo
+                # tipo e può restare bloccato a lungo (confermato via faulthandler,
+                # osservato hang già a ~139k caratteri su una singola pagina).
+                #
+                # Invece di usare testo grezzo (perdendo ogni struttura), usiamo
+                # pymupdf4llm in "legacy mode" (use_layout(False)): produce comunque
+                # vero Markdown (titoli via euristica su dimensione font, tabelle via
+                # tabulate) ma SENZA invocare onnxruntime/pymupdf_layout, quindi
+                # senza rischio di hang.
+                print(f"[CHILD PROCESS] Pagina {p_num}: Quantità di testo abnorme e/o troppi vettori ({char_count} chars / {vector_count} vettori) — probabile planimetria/disegno tecnico. Salto il layout AI (legacy mode), uso pymupdf4llm senza ONNX.")
+                if layout_ai_active:
+                    pymupdf4llm.use_layout(False)
+                    layout_ai_active = False
+                page_md = pymupdf4llm.to_markdown(doc, pages=[p_num])
+                page_md = page_md.replace("<br>", "\n")
+                extracted_pages.append({"type": "markdown", "content": page_md})
+                print(f"[CHILD PROCESS] Pagina {p_num}: COMPLETATA (legacy mode, no layout AI) in {time.time() - page_t0:.1f}s.")
             else:
                 #log.debug(f"Pagina {p_num}: Rilevato testo nativo sufficiente ({char_count} chars). Estrazione Markdown.")
                 print(f"[CHILD PROCESS] Pagina {p_num}: Testo sufficiente ({char_count} chars). Estrazione Markdown...")
+                if not layout_ai_active:
+                    pymupdf4llm.use_layout(True)
+                    layout_ai_active = True
                 page_md = pymupdf4llm.to_markdown(doc, pages=[p_num])
                 page_md = page_md.replace("<br>", "\n")
                 extracted_pages.append({"type": "markdown", "content": page_md})
