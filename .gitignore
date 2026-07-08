@@ -4,6 +4,7 @@
 !saga_extract/
 !common/
 !api/
+!web/
 !web/greenlees/
 !web/greenlees/src/
 !web/greenlees/src/lib/
