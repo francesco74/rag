@@ -29,28 +29,28 @@ logging.basicConfig(
 )
 log = logging.getLogger("Verifier")
 
-def parse_filters(json_filters_str: str) -> tuple[List[RicercaFiltri], str, Optional[str], Optional[str]]:
+def parse_filters(json_filters_str: str) -> tuple[List[RicercaFiltri], str, Optional[str]]:
     """
-    Restituisce (lista_filtri, tipo_atto, anno_atto_richiesto, registro_atteso).
+    Restituisce (lista_filtri, tipo_atto, anno_atto_richiesto).
     Con decreto/delibera + range di più giorni, la lista contiene un filtro per
     ciascun giorno (vedi RicercaSemplice.to_filtri_list), dato che
     DeliberaFilter/DecretoFilter non hanno un campo range confermato nel WSDL.
 
     anno_atto_richiesto viene restituito a parte perché per il DECRETO il WSDL
-    non ha nessun campo "Anno" (vedi <Documento> nel template WSDL: solo
-    Numero/Data/Tipo/Oggetto) — quindi l'anno, se richiesto, va poi applicato
-    come FILTRO LATO CLIENT sui risultati già estratti (vedi verify_pipeline),
-    usando l'anno del registro definitivo che il parser estrae comunque.
+    non ha nessun campo "Anno" nella richiesta di ricerca (vedi <Documento> nel
+    template WSDL: solo Numero/Data/Tipo/Oggetto) — quindi l'anno, se
+    richiesto, va applicato come FILTRO LATO CLIENT sui risultati già estratti
+    (vedi verify_pipeline), confrontandolo con l'anno_atto restituito da
+    LeggiAttoPlus per ciascun candidato.
 
-    registro_atteso (es. "DEC_VBDD") serve a filtrare lato client anche il
-    SOTTO-TIPO di decreto/delibera (deliberativo vs presidenziale, organo).
-    CONFERMATO da log reale: <Tipo>DEC</Tipo> nella richiesta NON distingue
-    deliberativo da presidenziale — una ricerca per decreti deliberativi ha
-    restituito un decreto il cui unico registro è "Registro Verbale
-    (DEC_VBMP)" (presidenziale). Il sotto-tipo va quindi verificato dopo la
-    ricerca, confrontando il registro realmente trovato con quello atteso.
-    Per questo non esiste più un parametro "tipo_decreto": il sotto-tipo è
-    parte del tipo_atto stesso ("decreto_deliberativo"/"decreto_presidenziale").
+    NOTA: il sotto-tipo di decreto/delibera (deliberativo vs presidenziale)
+    NON viene più determinato qui né tramite il registro Verbale della
+    risposta di ricerca (RicercaDocumentiString): quel registro può mancare
+    del tutto per un atto reale (CONFERMATO: decreto presidenziale 1/2024,
+    UID 2119188). Il discriminante ora è id_tipo_iter, ottenuto da
+    LeggiAttoPlus per ogni candidato in verify_pipeline (vedi
+    ID_TIPO_ITER_ATTESO), quindi semplice.registro_definitivo_atteso() non
+    viene più chiamato/usato qui.
 
     Formato JSON atteso:
        {"tipo_atto": "determina", "numero_atto": "4", "anno_atto": "2025"}
@@ -61,27 +61,21 @@ def parse_filters(json_filters_str: str) -> tuple[List[RicercaFiltri], str, Opti
     """
     raw_json = json.loads(json_filters_str)
     semplice = RicercaSemplice(**raw_json)
-    return semplice.to_filtri_list(), semplice.tipo_atto, semplice.anno_atto, semplice.registro_definitivo_atteso()
+    return semplice.to_filtri_list(), semplice.tipo_atto, semplice.anno_atto
 
-def get_expected_files_from_sicraweb(repwss_client, uid: str) -> list:
-    try:
-        lista_allegati_raw, _ = repwss_client.leggi_atto_plus(uid)
-        # FIX: leggi_atto_plus() restituisce un generatore (yield in estrai_allegati()).
-        # Va materializzato in lista PRIMA di essere iterato due volte, altrimenti dopo
-        # la comprehension seguente risulta esaurito e il ciclo for successivo non
-        # produce più alcun allegato (falso "NESSUN ALLEGATO VALIDO TROVATO").
-        lista_allegati_raw = list(lista_allegati_raw)
-    except Exception as e:
-        log.error(f"Errore durante la leggi_atto_plus per UID {uid}: {e}")
-        return None
-
+def get_expected_files_from_lista_allegati(uid: str, lista_allegati_raw: list) -> list:
+    """
+    Stessa logica di filtro/dedup di prima, ma ora prende in input la lista
+    allegati GIA' MATERIALIZZATA (proveniente da get_dati_atto_da_leggi_atto_plus),
+    invece di richiamare leggi_atto_plus() una seconda volta per lo stesso UID.
+    """
     nomi_file_presenti = {f_name.lower() for _, f_name in lista_allegati_raw}
     expected_files = []
-    
+
     for _, file_name in lista_allegati_raw:
         nome_lower = file_name.lower()
         estensione = Path(nome_lower).suffix
-        
+
         if estensione not in ESTENSIONI_CONSENTITE:
             continue
 
@@ -89,12 +83,72 @@ def get_expected_files_from_sicraweb(repwss_client, uid: str) -> list:
             nome_atteso_decifrato = nome_lower[:-4]
             if nome_atteso_decifrato in nomi_file_presenti:
                 continue
-            file_name = file_name[:-4] 
+            file_name = file_name[:-4]
 
         safe_name = f"doc_{uid}_{file_name}"
         expected_files.append(safe_name)
-        
+
     return expected_files
+
+# Valori di id_tipo_iter CONFERMATI dal cliente (campo dentro
+# Determina/Workflow/Attributi/Attributo con Nome="id_tipo_iter" nella
+# risposta di LeggiAttoPlus — vedi estrazione_documenti.py). E' il segnale
+# affidabile per il sotto-tipo del decreto: 8 = decreto del Presidente,
+# 9/19 = decreto deliberativo. Sostituisce interamente il vecchio approccio
+# basato sul parsing del registro Verbale nella risposta di ricerca
+# (RicercaDocumentiString), che per alcuni atti reali può mancare del tutto
+# (CONFERMATO: decreto presidenziale 1/2024, UID 2119188, aveva solo un
+# registro "PR" generico nella ricerca pur essendo un decreto vero).
+ID_TIPO_ITER_ATTESO = {
+    "decreto_presidenziale": {"8"},
+    "decreto_deliberativo": {"9", "19"},
+}
+
+
+def get_dati_atto_da_leggi_atto_plus(repwss_client, uid: str) -> Optional[dict]:
+    """
+    Chiama leggi_atto_plus(uid) UNA SOLA VOLTA per UID e restituisce sia gli
+    allegati (già materializzati) sia gli attributi discriminanti
+    (numero_atto, anno_atto, id_tipo_iter, oggetto), così lo stesso risultato
+    viene riusato più avanti sia per la verifica sotto-tipo/anno/definitività
+    sia per il calcolo dei file attesi, invece di richiamare leggi_atto_plus
+    due volte per lo stesso UID (comportamento precedente).
+
+    numero_atto: "0" (con data_atto sentinella "0001-01-01...") indica una
+    mera proposta non ancora protocollata; qualunque altro valore indica un
+    atto realmente protocollato (CONFERMATO su UID 2119188: numero_atto="1").
+
+    Restituisce None in caso di errore nella chiamata (loggato).
+    """
+    try:
+        lista_allegati_raw, attributi_plus = repwss_client.leggi_atto_plus(uid)
+        # FIX: leggi_atto_plus() restituisce un generatore (yield in estrai_allegati()).
+        # Va materializzato in lista PRIMA di essere iterato più volte.
+        lista_allegati_raw = list(lista_allegati_raw)
+    except Exception as e:
+        log.error(f"Errore durante leggi_atto_plus per UID {uid}: {e}")
+        return None
+
+    attributi_plus = attributi_plus or {}
+    if isinstance(attributi_plus, dict):
+        numero_atto = attributi_plus.get("numero_atto")
+        anno_atto = attributi_plus.get("anno_atto")
+        id_tipo_iter = attributi_plus.get("id_tipo_iter")
+        oggetto = attributi_plus.get("oggetto")
+    else:
+        numero_atto = getattr(attributi_plus, "numero_atto", None)
+        anno_atto = getattr(attributi_plus, "anno_atto", None)
+        id_tipo_iter = getattr(attributi_plus, "id_tipo_iter", None)
+        oggetto = getattr(attributi_plus, "oggetto", None)
+
+    return {
+        "allegati": lista_allegati_raw,
+        "numero_atto": str(numero_atto).strip() if numero_atto is not None else None,
+        "anno_atto": str(anno_atto).strip() if anno_atto else None,
+        "id_tipo_iter": str(id_tipo_iter).strip() if id_tipo_iter is not None else None,
+        "oggetto": oggetto,
+    }
+
 
 def check_mysql_file_presence(source: str, file_name: str) -> int:
     conn = get_db_connection()
@@ -155,7 +209,7 @@ async def retrigger_extraction(uid: str, tipo_atto: str, meta_atto: dict):
 
 async def verify_pipeline(json_filters_str: str, auto_recover: bool):
     init_db_pool()
-    filtri_list, tipo_atto, anno_atto_richiesto, registro_atteso = parse_filters(json_filters_str)
+    filtri_list, tipo_atto, anno_atto_richiesto = parse_filters(json_filters_str)
 
     log.info(f"Esecuzione di {len(filtri_list)} query di ricerca su Sicr@Web...")
 
@@ -185,77 +239,66 @@ async def verify_pipeline(json_filters_str: str, auto_recover: bool):
         log.warning(f"Nessun atto restituito dalla ricerca. Ultimo errore: {ultimo_errore}")
         return
 
-    # FILTRO REGISTRO/SOTTOTIPO LATO CLIENT: necessario perché <Tipo> nella
-    # richiesta SOAP filtra solo decreto/delibera/determina in generale, NON
-    # il sotto-tipo. CONFERMATO da log reale: una ricerca decreto con
-    # tipo_decreto="deliberativo" (quindi <Tipo>DEC</Tipo>) ha restituito un
-    # decreto il cui unico registro definitivo è "Registro Verbale (DEC_VBMP)"
-    # (presidenziale). Verifichiamo quindi qui che il registro EFFETTIVAMENTE
-    # trovato per ogni documento corrisponda a quello atteso per il
-    # tipo_atto/sotto-tipo richiesto (registro_atteso, es. "DEC_VBDD").
-    # Non si applica a tipo_atto="qualsiasi" (registro_atteso è None lì).
-    if registro_atteso:
-        uids_prima = list(ids_totali)
-        ids_totali = []
-        for uid_str in uids_prima:
-            codice_trovato = documenti_metadata.get(uid_str, {}).get("registro_definitivo_codice")
-            if codice_trovato == registro_atteso:
-                ids_totali.append(uid_str)
-            else:
-                log.debug(f"UID {uid_str}: escluso, registro trovato '{codice_trovato}' != atteso '{registro_atteso}' (sotto-tipo diverso).")
-
-        n_esclusi = len(uids_prima) - len(ids_totali)
-        if n_esclusi:
-            log.info(f"Filtro registro={registro_atteso}: esclusi {n_esclusi}/{len(uids_prima)} atti di sotto-tipo/registro diverso.")
-
-        if not ids_totali:
-            log.warning(f"Nessun atto con registro definitivo {registro_atteso} tra i {len(uids_prima)} risultati trovati.")
-            return
-
-    # FILTRO ANNO LATO CLIENT: necessario perché il WSDL non espone un campo
-    # "Anno" per il decreto (solo Numero/Data/Tipo/Oggetto in <Documento>).
-    # Sfruttiamo l'anno che il parser estrae comunque dal registro definitivo
-    # (vedi risultati_ricerca_parser.py) per scartare qui i falsi positivi.
-    #
-    # IMPORTANTE (scoperto empiricamente): <Documento><Numero> nel WSDL NON
-    # cerca sul registro Verbale/definitivo, ma su un registro generico "PR"
-    # presente storicamente su quasi ogni atto (di qualunque tipo e anno).
-    # Una ricerca decreto per solo Numero=1 restituisce quindi documenti dal
-    # 2010 al 2026, quasi tutti privi di un registro DEC_VBDD/DEC_VBMP vero e
-    # proprio. Se un documento NON ha nessun registro definitivo del tipo
-    # cercato, è quasi certamente un falso positivo su questo campo "PR"
-    # legacy, non l'atto realmente cercato: per questo lo ESCLUDIAMO, invece
-    # di tenerlo "per prudenza" (scelta precedente, che produceva decine di
-    # falsi "MISSING ENTIRELY" fuorvianti).
-    if anno_atto_richiesto:
-        uids_prima = list(ids_totali)
-        ids_totali = []
-        for uid_str in uids_prima:
-            anno_trovato = documenti_metadata.get(uid_str, {}).get("anno")
-            if anno_trovato is None:
-                log.debug(f"UID {uid_str}: escluso, nessun registro definitivo del tipo cercato (probabile falso positivo sul registro 'PR' generico).")
-            elif str(anno_trovato).strip() == str(anno_atto_richiesto).strip():
-                ids_totali.append(uid_str)
-            else:
-                log.debug(f"UID {uid_str}: escluso, anno {anno_trovato} != {anno_atto_richiesto} richiesto.")
-
-        n_esclusi = len(uids_prima) - len(ids_totali)
-        if n_esclusi:
-            log.info(f"Filtro anno={anno_atto_richiesto}: esclusi {n_esclusi}/{len(uids_prima)} atti (anno diverso o nessun registro definitivo trovato).")
-
-        if not ids_totali:
-            log.warning(f"Nessun atto con anno {anno_atto_richiesto} tra i {len(uids_prima)} risultati trovati.")
-            return
-
-
-    uids = ids_totali
-    log.info(f"Trovati {len(uids)} atti su Sicr@Web (dopo aver unito {len(filtri_list)} ricerche). Inizializzazione controlli puntuali allegati...")
-
+    # VERIFICA SOTTO-TIPO/ANNO/DEFINITIVITA' VIA LeggiAttoPlus: sostituisce
+    # interamente il vecchio doppio filtro (registro Verbale dalla risposta
+    # di ricerca + anno dal registro definitivo), perché quel registro può
+    # mancare del tutto per un atto reale (CONFERMATO: decreto presidenziale
+    # 1/2024, UID 2119188, ha solo un registro "PR" generico nella ricerca
+    # pur essendo un decreto vero). Il discriminante ora è LeggiAttoPlus:
+    #   - numero_atto: "0"/assente = mera proposta non protocollata, esclusa;
+    #   - id_tipo_iter: 8 = decreto presidenziale, 9/19 = decreto deliberativo
+    #     (vedi ID_TIPO_ITER_ATTESO) — non si applica a tipo_atto senza
+    #     sotto-tipo (es. "determina", "qualsiasi");
+    #   - anno_atto: confrontato con anno_atto_richiesto, se presente.
+    # Chiamiamo leggi_atto_plus() qui UNA SOLA VOLTA per candidato e ne
+    # riusiamo il risultato più avanti anche per il calcolo dei file attesi,
+    # invece di richiamarlo una seconda volta per lo stesso UID.
     try:
         repwss_client = build_client_from_env()
     except Exception as e:
         log.error(f"Impossibile istanziare il client Sicr@Web: {e}")
         return
+
+    id_tipo_iter_attesi = ID_TIPO_ITER_ATTESO.get(tipo_atto)  # None per tipo_atto senza sotto-tipo (determina/qualsiasi/...)
+
+    uids_prima = list(ids_totali)
+    ids_totali = []
+    dati_atti: dict = {}
+
+    for uid_str in uids_prima:
+        dati = get_dati_atto_da_leggi_atto_plus(repwss_client, uid_str)
+        if dati is None:
+            log.warning(f"UID {uid_str}: escluso, errore durante leggi_atto_plus.")
+            continue
+
+        numero_atto_reale = dati.get("numero_atto")
+        if not numero_atto_reale or numero_atto_reale == "0":
+            log.debug(f"UID {uid_str}: escluso, è una proposta non ancora protocollata (numero_atto={numero_atto_reale!r}).")
+            continue
+
+        if id_tipo_iter_attesi and dati.get("id_tipo_iter") not in id_tipo_iter_attesi:
+            log.debug(f"UID {uid_str}: escluso, id_tipo_iter={dati.get('id_tipo_iter')!r} non compatibile con {tipo_atto} (attesi: {id_tipo_iter_attesi}).")
+            continue
+
+        if anno_atto_richiesto:
+            anno_reale = dati.get("anno_atto")
+            if str(anno_reale).strip() != str(anno_atto_richiesto).strip():
+                log.debug(f"UID {uid_str}: escluso, anno {anno_reale} != {anno_atto_richiesto} richiesto.")
+                continue
+
+        dati_atti[uid_str] = dati
+        ids_totali.append(uid_str)
+
+    n_esclusi = len(uids_prima) - len(ids_totali)
+    if n_esclusi:
+        log.info(f"Verifica LeggiAttoPlus: esclusi {n_esclusi}/{len(uids_prima)} atti (sotto-tipo diverso, proposte non definitive, o anno diverso).")
+
+    if not ids_totali:
+        log.warning(f"Nessun atto valido tra i {len(uids_prima)} risultati trovati dopo la verifica via LeggiAttoPlus.")
+        return
+
+    uids = ids_totali
+    log.info(f"Trovati {len(uids)} atti su Sicr@Web (dopo aver unito {len(filtri_list)} ricerche e verificato via LeggiAttoPlus). Inizio controlli puntuali allegati...")
 
     qdrant_client = AsyncQdrantClient(host=settings.qdrant_host, port=settings.qdrant_port, timeout=20.0)
 
@@ -264,17 +307,13 @@ async def verify_pipeline(json_filters_str: str, auto_recover: bool):
     print("="*128)
 
     for uid in uids:
-        meta_atto = documenti_metadata.get(uid, {})
-        num_atto = meta_atto.get("numero", "N/A")
-        anno_atto = meta_atto.get("anno", "")
-        display_num = f"{num_atto}/{anno_atto}" if anno_atto else str(num_atto)
+        dati = dati_atti[uid]
+        num_atto = dati.get("numero_atto", "N/A")
+        anno_atto_val = dati.get("anno_atto", "")
+        display_num = f"{num_atto}/{anno_atto_val}" if anno_atto_val else str(num_atto)
 
-        expected_files = get_expected_files_from_sicraweb(repwss_client, uid)
-        
-        if expected_files is None:
-            print(f"{uid:<10} | {display_num:<10} | {'RECOVERY ERROR (SICRAWEB FAILURE)':<48} | {'0':<15} | {'0':<15} | ERROR")
-            continue
-            
+        expected_files = get_expected_files_from_lista_allegati(uid, dati["allegati"])
+
         if not expected_files:
             print(f"{uid:<10} | {display_num:<10} | {'NESSUN ALLEGATO VALIDO TROVATO (SKIP)':<48} | {'0':<15} | {'0':<15} | SKIPPED")
             continue
@@ -311,10 +350,16 @@ async def verify_pipeline(json_filters_str: str, auto_recover: bool):
 
             display_name = safe_name if len(safe_name) <= 46 else f"...{safe_name[-43:]}"
             print(f"{uid:<10} | {display_num:<10} | {display_name:<48} | {mysql_count:<15} | {qdrant_count:<15} | {stato}")
-            
+
         if needs_recovery:
             if auto_recover:
-                await retrigger_extraction(uid, tipo_atto, meta_atto)
+                meta_atto_recovery = {
+                    "numero": dati.get("numero_atto"),
+                    "anno": dati.get("anno_atto"),
+                    "oggetto": dati.get("oggetto"),
+                    "id_tipo_iter": dati.get("id_tipo_iter"),
+                }
+                await retrigger_extraction(uid, tipo_atto, meta_atto_recovery)
             else:
                 print(f"    [!] Recovery disabilitato. Utilizzare flag --recover per forzare l'inserimento.")
             

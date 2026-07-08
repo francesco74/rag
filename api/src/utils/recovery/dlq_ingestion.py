@@ -33,7 +33,7 @@ def main():
     logging.info(f"Avvio elaborazione DLQ: {DLQ_NAME}")
     try:
         credentials = pika.PlainCredentials(settings.broker_username, settings.broker_password)
-        connection = pika.BlockingConnection(pika.ConnectionParameters(host=settings.broker_host, port=settings.broker_password, credentials=credentials))
+        connection = pika.BlockingConnection(pika.ConnectionParameters(host=settings.broker_host, port=settings.broker_port, credentials=credentials))
         channel = connection.channel()
     except Exception as e:
         logging.error(f"Connessione fallita: {e}")

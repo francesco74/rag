@@ -196,7 +196,7 @@ async def finalize_file_move(file_path, root_folder, topic_id, sub_topic_id, err
 
 def sync_upsert_parents_mysql(source_name, topic_id, sub_topic_id, parents_data):
     """
-    Cancella i vecchi parent per idempotenza e inserisce i nuovi in batch.
+    Cancella i vecchi parent per idempotenza e inserisce i nuovi in batch frazionati.
     parents_data è una lista di tuple: (id, topic_id, sub_topic_id, source, file_name, parent_index, content, metadata_json)
     """
     conn = get_db_connection()
@@ -212,21 +212,37 @@ def sync_upsert_parents_mysql(source_name, topic_id, sub_topic_id, parents_data)
             """
             cursor.execute(delete_query, (source_name, topic_id, sub_topic_id))
             
-            # 2. Inserimento massivo dei nuovi parent
+            # 2. Inserimento massivo dei nuovi parent suddiviso in chunk (Evita max_allowed_packet)
             if parents_data:
                 insert_query = """
                     INSERT INTO parent_documents 
                     (id, topic_id, sub_topic_id, source, file_name, parent_index, content, metadata)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 """
-                cursor.executemany(insert_query, parents_data)
+                
+                # Sotto-chunk conservativi (es. 200 righe alla volta) poiché il campo 'content' può essere pesante
+                MYSQL_BATCH_SIZE = 200 
+                for i in range(0, len(parents_data), MYSQL_BATCH_SIZE):
+                    chunk = parents_data[i:i + MYSQL_BATCH_SIZE]
+                    cursor.executemany(insert_query, chunk)
         
         conn.commit()
     except Exception as e:
-        conn.rollback()
+        log.error(f"Errore durante l'upsert dei parent in MySQL: {e}")
+        # Gestione resiliente del rollback: evita di crashare se la connessione è già caduta
+        try:
+            if conn and conn.is_connected():
+                conn.rollback()
+        except Exception as rollback_err:
+            log.warning(f"Impossibile eseguire il rollback (connessione persa): {rollback_err}")
         raise e
     finally:
-        conn.close()
+        # Chiusura sicura senza far arrabbiare il session reset del pooler
+        try:
+            if conn and conn.is_connected():
+                conn.close()
+        except Exception as close_err:
+            log.warning(f"Errore durante la chiusura della connessione MySQL: {close_err}")
 
 # ==============================================================================
 # 3. PIPELINE ORCHESTRATION (DOCUMENT PROCESSING)

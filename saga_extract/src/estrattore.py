@@ -39,20 +39,101 @@ TIPI_SUPPORTATI = {
 log = None
 init_db_pool()
 
+# Valori di id_tipo_iter CONFERMATI dal cliente (campo dentro
+# Determina/Workflow/Attributi/Attributo con Nome="id_tipo_iter" nella
+# risposta di LeggiAttoPlus — vedi estrazione_documenti.py). E' il segnale
+# affidabile per il sotto-tipo del decreto: 8 = decreto del Presidente,
+# 9/19 = decreto deliberativo. Sostituisce il vecchio approccio basato sul
+# parsing del registro Verbale nella risposta di ricerca
+# (RicercaDocumentiString), che per alcuni atti reali può mancare del tutto
+# (CONFERMATO: decreto presidenziale 1/2024, UID 2119188, aveva solo un
+# registro "PR" generico nella ricerca pur essendo un decreto vero). Stessa
+# mappa usata in verifica.py.
+ID_TIPO_ITER_ATTESO = {
+    "decreto_presidenziale": {"8"},
+    "decreto_deliberativo": {"9", "19"},
+}
+
+
+def get_dati_atto_da_leggi_atto_plus(repwss_client, uid: str):
+    """
+    Chiama leggi_atto_plus(uid) UNA SOLA VOLTA e restituisce sia gli
+    allegati (già materializzati) sia gli attributi discriminanti
+    (numero_atto, anno_atto, id_tipo_iter, oggetto). Lo stesso risultato
+    viene poi passato a elabora_atto (parametro lista_allegati_raw) per
+    evitare una seconda chiamata di rete per lo stesso UID.
+
+    Restituisce None in caso di errore nella chiamata (loggato).
+    """
+    try:
+        lista_allegati_raw, attributi_plus = repwss_client.leggi_atto_plus(uid)
+        lista_allegati_raw = list(lista_allegati_raw)
+    except Exception as e:
+        log.error("Errore durante leggi_atto_plus per UID %s: %s", uid, str(e))
+        return None
+
+    attributi_plus = attributi_plus or {}
+    if isinstance(attributi_plus, dict):
+        numero_atto = attributi_plus.get("numero_atto")
+        anno_atto = attributi_plus.get("anno_atto")
+        id_tipo_iter = attributi_plus.get("id_tipo_iter")
+        oggetto = attributi_plus.get("oggetto")
+    else:
+        numero_atto = getattr(attributi_plus, "numero_atto", None)
+        anno_atto = getattr(attributi_plus, "anno_atto", None)
+        id_tipo_iter = getattr(attributi_plus, "id_tipo_iter", None)
+        oggetto = getattr(attributi_plus, "oggetto", None)
+
+    return {
+        "allegati": lista_allegati_raw,
+        "numero_atto": str(numero_atto).strip() if numero_atto is not None else None,
+        "anno_atto": str(anno_atto).strip() if anno_atto else None,
+        "id_tipo_iter": str(id_tipo_iter).strip() if id_tipo_iter is not None else None,
+        "oggetto": oggetto,
+    }
+
 def clean_iso_date(date_raw: str) -> Optional[str]:
     """Uniforma le date al formato YYYY-MM-DD, rimuovendo le componenti temporali (T)."""
     if not date_raw: 
         return None
     return date_raw.split("T")[0] if "T" in date_raw else date_raw.strip()
 
-def extract_file_from_p7m(p7m_bytes: bytes, filename: str) -> bytes:
-    """Decodifica busta CAdES ed estrae il file originale in RAM."""
+def try_extract_pdf_from_pkcs7(file_bytes: bytes, filename: str = "") -> Optional[bytes]:
+    """
+    Tenta di interpretare file_bytes come busta di firma PKCS7/CMS (CAdES) e,
+    se lo è, ne estrae il contenuto incapsulato (il PDF originale).
+
+    NON si basa sul nome del file (Sicr@Web può restituire allegati con
+    estensione ".pdf" il cui contenuto è in realtà ancora una busta CAdES non
+    sbustata — mislabeling a monte, confermato su file reali) né su euristiche
+    sui byte grezzi: usiamo asn1crypto per un parsing ASN.1 vero, controllando
+    semanticamente il campo content_type.
+
+    Restituisce:
+    - None se file_bytes NON è una struttura PKCS7 valida (caso normale: PDF
+      nativo già in chiaro) — il chiamante deve procedere con file_bytes
+      originali, nessun errore da segnalare.
+    - i bytes del PDF estratto, se file_bytes è una busta PKCS7 di tipo
+      signed_data e l'estrazione riesce.
+
+    Solleva ValueError SOLO se la struttura è riconosciuta come PKCS7
+    signed_data ma l'estrazione del contenuto incapsulato fallisce
+    (caso anomalo/da indagare, distinto da "non era affatto una busta").
+    """
     try:
-        content_info = ContentInfo.load(p7m_bytes)
-        compressed_content = content_info['content']
-        encap_content_info = compressed_content['encap_content_info']
+        content_info = ContentInfo.load(file_bytes)
+    except Exception:
+        # Non è (o non è un valido) ASN.1: quasi certamente un PDF nativo normale.
+        return None
+
+    if content_info['content_type'].native != 'signed_data':
+        # E' una struttura ASN.1 valida ma non una busta di firma: non il nostro caso.
+        return None
+
+    try:
+        signed_data = content_info['content']
+        encap_content_info = signed_data['encap_content_info']
         raw_content = encap_content_info['content'].native
-        
         extracted_bytes = raw_content if isinstance(raw_content, bytes) else encap_content_info['content'].chosen.contents
         log.debug("Sbustamento completato per %s", filename)
         return extracted_bytes
@@ -80,18 +161,26 @@ def get_rabbitmq_channel():
         raise
 
 
-def elabora_atto(str_uid: str, meta_atto: dict, tipo_atto: str, tipo_cartella_statica: Optional[str], repwss_client) -> bool:
+def elabora_atto(str_uid: str, meta_atto: dict, tipo_atto: str, tipo_cartella_statica: Optional[str], repwss_client, lista_allegati_raw: Optional[list] = None) -> bool:
     """
     Estrae gli allegati di UN SINGOLO atto (UID) da Sicr@Web, li filtra,
     li scrive su disco, produce il sidecar JSON e pubblica l'evento su
     RabbitMQ. Restituisce True se completato con successo, False altrimenti
     (l'errore è già stato loggato).
 
-    meta_atto è il dizionario di metadati (oggetto, anno, numero,
-    registro_definitivo_codice, ...) — può provenire da una ricerca appena
-    fatta (modalità ricerca) oppure essere passato già pronto da chi chiama
-    questo script (modalità diretta, usata da verifica.py --recover: evita
-    di rifare da capo la ricerca su Sicr@Web per un atto già identificato).
+    meta_atto è il dizionario di metadati (oggetto, anno, numero, ...) — può
+    provenire da una ricerca appena fatta (modalità ricerca) oppure essere
+    passato già pronto da chi chiama questo script (modalità diretta, usata
+    da verifica.py --recover: evita di rifare da capo la ricerca su Sicr@Web
+    per un atto già identificato).
+
+    lista_allegati_raw: se già disponibile (perché il chiamante ha già
+    interrogato leggi_atto_plus per verificare sotto-tipo/anno/definitività
+    via get_dati_atto_da_leggi_atto_plus, vedi MODALITA' RICERCA in main()),
+    viene riusata qui invece di richiamare leggi_atto_plus una seconda volta
+    per lo stesso UID. Se None (comportamento storico, usato in MODALITA'
+    DIRETTA dove non c'è nessuna verifica preventiva da fare), viene
+    recuperata qui.
     """
     json_filename = f"doc_{str_uid}.json"
     log.info("Elaborazione UID: %s", str_uid)
@@ -101,12 +190,13 @@ def elabora_atto(str_uid: str, meta_atto: dict, tipo_atto: str, tipo_cartella_st
     tmp_json_path = None
 
     try:
-        lista_allegati_raw, _attributi_plus = repwss_client.leggi_atto_plus(str_uid)
-        # FIX: leggi_atto_plus() restituisce un generatore (estrai_allegati() usa yield).
-        # Va materializzato in una lista PRIMA di essere consumato più volte,
-        # altrimenti dopo il primo giro (nomi_file_presenti) risulta esaurito
-        # e il ciclo successivo non produce più alcun allegato.
-        lista_allegati_raw = list(lista_allegati_raw)
+        if lista_allegati_raw is None:
+            lista_allegati_raw, _attributi_plus = repwss_client.leggi_atto_plus(str_uid)
+            # FIX: leggi_atto_plus() restituisce un generatore (estrai_allegati() usa yield).
+            # Va materializzato in una lista PRIMA di essere consumato più volte,
+            # altrimenti dopo il primo giro (nomi_file_presenti) risulta esaurito
+            # e il ciclo successivo non produce più alcun allegato.
+            lista_allegati_raw = list(lista_allegati_raw)
 
         log.debug(f"Metadati per UID {str_uid}: {meta_atto}")
 
@@ -124,21 +214,30 @@ def elabora_atto(str_uid: str, meta_atto: dict, tipo_atto: str, tipo_cartella_st
             if estensione not in ESTENSIONI_CONSENTITE:
                 continue
 
-            # B. Filtro deduplica
+            # B. Filtro deduplica (si applica solo quando il file è DICHIARATO come
+            # .p7m: qui il nome ci dice che dovrebbe esisterne una versione nativa
+            # gemella già presente nell'elenco, da preferire).
             if nome_lower.endswith('.p7m'):
                 nome_atteso_decifrato = nome_lower[:-4]  # Rimuove '.p7m'
                 if nome_atteso_decifrato in nomi_file_presenti:
                     log.debug("Scartato '%s': file nativo già presente.", file_name)
                     continue
 
-                # C. ESTRAZIONE P7M IN RAM
-                try:
-                    log.info("Decodifica firma P7M per il file: %s", file_name)
-                    file_bytes = extract_file_from_p7m(file_bytes, file_name)
-                    # Rimuoviamo il ".p7m" dal nome del file per salvarlo col formato originale (es. .pdf)
+            # C. ESTRAZIONE P7M IN RAM — basata sul CONTENUTO (via asn1crypto),
+            # non sul nome file dichiarato (vedi try_extract_pdf_from_pkcs7).
+            try:
+                extracted = try_extract_pdf_from_pkcs7(file_bytes, file_name)
+            except ValueError as e:
+                log.warning("Impossibile decodificare %s, procedo con salvataggio originale. Errore: %s", file_name, e)
+                extracted = None
+
+            if extracted is not None:
+                file_bytes = extracted
+                if nome_lower.endswith('.p7m'):
+                    # Rimuoviamo il ".p7m" dal nome per salvarlo col formato originale (es. .pdf).
+                    # Se invece il file era già dichiarato ".pdf" (mislabeling a monte), il nome
+                    # resta invariato: era già corretto, mancava solo lo sbustamento del contenuto.
                     file_name = file_name[:-4]
-                except Exception as e:
-                    log.warning("Impossibile decodificare %s, procedo con salvataggio originale. Errore: %s", file_name, e)
 
             lista_allegati_filtrata.append((file_bytes, file_name))
 
@@ -185,20 +284,13 @@ def elabora_atto(str_uid: str, meta_atto: dict, tipo_atto: str, tipo_cartella_st
                 "data_esecutivita": clean_iso_date(meta_atto.get("data_esecutivita")),
                 "data_pubblicazione": clean_iso_date(meta_atto.get("data_pubblicazione")),
                 "giorni_pubblicazione": meta_atto.get("giorni_pubblicazione"),
-                # Codice del registro effettivamente riconosciuto come "definitivo"
-                # (es. "DEC_VBDD"/"DEC_VBMP"/"DLC_VB"/"DET_VB"): è l'unica traccia
-                # persistente del sotto-tipo reale dell'atto (es. decreto
-                # deliberativo vs presidenziale), dato che TipoDocumento nella
-                # risposta SOAP è identico per entrambi i sotto-tipi.
-                "registro_definitivo_codice": meta_atto.get("registro_definitivo_codice"),
-                # True se è stato trovato un registro verbale/definitivo per
-                # questo atto; False indica che numero/anno/data sopra sono
-                # rimasti None (nessun registro di quel tipo nella risposta).
-                "registro_definitivo_trovato": meta_atto.get("registro_definitivo_trovato"),
-                # Nomi degli allegati come dichiarati dalla ricerca (prima di
-                # whitelist estensioni/dedup .p7m/sbustamento): utile per audit,
-                # da non confondere con "files" sopra (i nomi realmente scritti).
-                "allegati_nomi_dichiarati": meta_atto.get("allegati_nomi"),
+                # id_tipo_iter (da LeggiAttoPlus): 8 = decreto del Presidente,
+                # 9/19 = decreto deliberativo. E' l'unica traccia persistente
+                # affidabile del sotto-tipo reale dell'atto — sostituisce il
+                # vecchio registro_definitivo_codice, che poteva mancare del
+                # tutto anche per atti reali (vedi decreto presidenziale
+                # 1/2024, UID 2119188).
+                "id_tipo_iter": meta_atto.get("id_tipo_iter"),
             }
         }
 
@@ -344,42 +436,23 @@ def main():
         log.warning("Ricerca fallita o senza risultati. Errore: %s", risultato_ricerca.errore)
         sys.exit(1)
 
-    # FILTRO REGISTRO/ANNO LATO CLIENT (stessa logica di verify_pipeline in
-    # verifica.py). NECESSARIO qui: <Documento><Numero> da solo può
-    # restituire decine di atti di anni e sotto-tipi diversi (es. Numero=1
-    # esistente sia come decreto deliberativo 2026 sia come presidenziale
-    # 2025, oltre a vecchi atti pre-2024 senza nessun registro Verbale). Senza
-    # questo filtro, si estrarrebbero e pubblicherebbero TUTTI questi
-    # "infiltrati", non solo gli atti realmente richiesti.
-    registro_atteso = semplice.registro_definitivo_atteso()
+    # VERIFICA SOTTO-TIPO/ANNO/DEFINITIVITA' VIA LeggiAttoPlus (stessa logica
+    # di verify_pipeline in verifica.py). NECESSARIO qui: <Documento><Numero>
+    # da solo può restituire decine di atti di anni e sotto-tipi diversi (es.
+    # Numero=1 esistente sia come decreto deliberativo 2026 sia come
+    # presidenziale 2025, oltre a vecchi atti pre-2024). Senza questo filtro,
+    # si estrarrebbero e pubblicherebbero TUTTI questi "infiltrati", non solo
+    # l'atto realmente richiesto.
+    #
+    # Sostituisce il vecchio filtro basato su registro_definitivo_codice
+    # dalla risposta di ricerca (RicercaDocumentiString), che può mancare del
+    # tutto per un atto reale (CONFERMATO: decreto presidenziale 1/2024, UID
+    # 2119188). Il discriminante ora è LeggiAttoPlus, chiamato qui UNA SOLA
+    # VOLTA per candidato: il risultato (allegati inclusi) viene poi passato
+    # direttamente a elabora_atto, invece di richiamare leggi_atto_plus una
+    # seconda volta per lo stesso UID.
     anno_atto_richiesto = raw_json.get("anno_atto")
-    ids_da_elaborare = list(risultato_ricerca.ids)
-
-    if registro_atteso:
-        prima = list(ids_da_elaborare)
-        ids_da_elaborare = [
-            u for u in prima
-            if risultato_ricerca.documenti_metadata.get(str(u), {}).get("registro_definitivo_codice") == registro_atteso
-        ]
-        esclusi = len(prima) - len(ids_da_elaborare)
-        if esclusi:
-            log.info("Filtro registro=%s: esclusi %d/%d atti di sotto-tipo/registro diverso.", registro_atteso, esclusi, len(prima))
-
-    if anno_atto_richiesto:
-        prima = list(ids_da_elaborare)
-        ids_da_elaborare = [
-            u for u in prima
-            if str(risultato_ricerca.documenti_metadata.get(str(u), {}).get("anno")).strip() == str(anno_atto_richiesto).strip()
-        ]
-        esclusi = len(prima) - len(ids_da_elaborare)
-        if esclusi:
-            log.info("Filtro anno=%s: esclusi %d/%d atti con anno diverso o senza registro definitivo.", anno_atto_richiesto, esclusi, len(prima))
-
-    if not ids_da_elaborare:
-        log.warning("Nessun atto corrispondente dopo il filtro registro/anno (candidati iniziali: %d). Recovery annullato.", len(risultato_ricerca.ids))
-        sys.exit(1)
-
-    log.info("Trovati %d documenti (dopo filtro registro/anno). Inizio download dei pacchetti binari...", len(ids_da_elaborare))
+    id_tipo_iter_attesi = ID_TIPO_ITER_ATTESO.get(tipo_atto)  # None per tipo_atto senza sotto-tipo (determina/qualsiasi/...)
 
     try:
         repwss_client = build_client_from_env()
@@ -387,14 +460,58 @@ def main():
         log.error("Impossibile inizializzare il client WSAtti: %s", str(e))
         sys.exit(1)
 
+    candidati = [str(u) for u in risultato_ricerca.ids]
+    dati_atti = {}
+    ids_da_elaborare = []
+
+    for uid_str in candidati:
+        dati = get_dati_atto_da_leggi_atto_plus(repwss_client, uid_str)
+        if dati is None:
+            log.warning("UID %s: escluso, errore durante leggi_atto_plus.", uid_str)
+            continue
+
+        numero_atto_reale = dati.get("numero_atto")
+        if not numero_atto_reale or numero_atto_reale == "0":
+            log.debug("UID %s: escluso, è una proposta non ancora protocollata (numero_atto=%r).", uid_str, numero_atto_reale)
+            continue
+
+        if id_tipo_iter_attesi and dati.get("id_tipo_iter") not in id_tipo_iter_attesi:
+            log.debug("UID %s: escluso, id_tipo_iter=%r non compatibile con %s (attesi: %s).", uid_str, dati.get("id_tipo_iter"), tipo_atto, id_tipo_iter_attesi)
+            continue
+
+        if anno_atto_richiesto:
+            anno_reale = dati.get("anno_atto")
+            if str(anno_reale).strip() != str(anno_atto_richiesto).strip():
+                log.debug("UID %s: escluso, anno %s != %s richiesto.", uid_str, anno_reale, anno_atto_richiesto)
+                continue
+
+        dati_atti[uid_str] = dati
+        ids_da_elaborare.append(uid_str)
+
+    esclusi = len(candidati) - len(ids_da_elaborare)
+    if esclusi:
+        log.info("Verifica LeggiAttoPlus: esclusi %d/%d atti (sotto-tipo diverso, proposte non definitive, o anno diverso).", esclusi, len(candidati))
+
+    if not ids_da_elaborare:
+        log.warning("Nessun atto corrispondente dopo la verifica via LeggiAttoPlus (candidati iniziali: %d). Recovery annullato.", len(candidati))
+        sys.exit(1)
+
+    log.info("Trovati %d documenti (dopo verifica LeggiAttoPlus). Inizio scrittura pacchetti binari...", len(ids_da_elaborare))
+
     success_count = 0
-    for doc_uid in ids_da_elaborare:
-        str_uid = str(doc_uid)
-        meta_atto = risultato_ricerca.documenti_metadata.get(str_uid, {})
-        if elabora_atto(str_uid, meta_atto, tipo_atto, tipo_cartella_statica, repwss_client):
+    for str_uid in ids_da_elaborare:
+        dati = dati_atti[str_uid]
+        meta_atto = {
+            "numero": dati.get("numero_atto"),
+            "anno": dati.get("anno_atto"),
+            "oggetto": dati.get("oggetto"),
+            "id_tipo_iter": dati.get("id_tipo_iter"),
+        }
+        if elabora_atto(str_uid, meta_atto, tipo_atto, tipo_cartella_statica, repwss_client, lista_allegati_raw=dati["allegati"]):
             success_count += 1
 
     log.info("Completato (%d/%d estratti).", success_count, len(ids_da_elaborare))
+
 
     if success_count == 0:
         # Trovati atti dalla ricerca ma NESSUNO elaborato/pubblicato con successo:

@@ -44,4 +44,4 @@ ENV BROKER_USERNAME=""
 ENV BROKER_PASSWORD=""
 
 # Define the command to run the app using Gunicorn for production
-CMD ["sh", "-c", "python estrattore.py"]
+CMD ["sh", "-c", "python verifica.py"]

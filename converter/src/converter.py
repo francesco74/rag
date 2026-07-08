@@ -21,7 +21,6 @@ from tenacity import retry, stop_after_attempt, wait_random_exponential, retry_i
 from google import genai
 from google.genai import types
 from google.genai import errors as genai_errors
-import concurrent.futures
 import multiprocessing as mp
 import queue
 
@@ -103,7 +102,13 @@ INGESTION_WATCH_DIR = DATA_FOLDER / "watch"
 ERROR_DIR = DATA_FOLDER / "converter" / "error"
 ARCHIVE_DIR = DATA_FOLDER / "converter" / "archive"
 
-PROCESS_POOL = concurrent.futures.ProcessPoolExecutor(max_workers=2)
+CONCURRENCY_LIMIT = 2  # numero massimo di file elaborati in parallelo da QUESTA istanza del worker.
+                        # Ogni file "pesante" genera comunque un sottoprocesso dedicato (via _run_killable)
+                        # con il proprio limite di thread ONNX (vedi _detect_cgroup_cpu_quota) — processarne
+                        # più di 2-3 in parallelo nello stesso container rischia di saturare CPU/RAM.
+                        # Per aumentare il throughput oltre questo, preferire più REPLICHE del worker
+                        # (RabbitMQ distribuisce automaticamente i messaggi tra consumer concorrenti sulla
+                        # stessa coda) piuttosto che alzare ulteriormente questo valore.
 
 FAULTHANDLER_INTERVAL = 30  # secondi - intervallo di dump automatico dello stack se il worker resta bloccato
 
@@ -136,7 +141,7 @@ def _killable_worker_entry(q, target_func, args):
 
 def _run_killable(target_func, args: tuple, timeout: float):
     """
-    Esegue target_func(*args) in un PROCESSO DEDICATO (non nel PROCESS_POOL
+    Esegue target_func(*args) in un PROCESSO DEDICATO (non in un pool condiviso
     condiviso) con un timeout che, se scaduto, TERMINA DAVVERO il processo
     (SIGTERM, poi SIGKILL se necessario).
 
@@ -215,14 +220,14 @@ CROP_OCR_LIMIT = 0
 OCR_MODEL_NAME = settings.ocr_model_name
 IMG_EXTENSIONS = [".png", ".jpg", ".jpeg"]
 
-EXTRACTION_TIMEOUT = 1200.0        # 20 minuti - estrazione ibrida (testo/vettori + OCR mirato)
-FALLBACK_RENDER_TIMEOUT = 300.0    # 5 minuti - estrazione di fallback per-pagina (senza get_drawings, deve essere più rapida)
-MAX_CHARS_FOR_AI_LAYOUT = 70_000   # oltre questa soglia una pagina è quasi certamente una planimetria/disegno tecnico, non testo normale: si salta il layout AI (ONNX) e si usa il testo grezzo
-                                    # NB: soglia abbassata da 200_000 a 70_000 dopo aver osservato hang di pymupdf4llm.to_markdown()
-                                    # (layout AI/ONNX) già a ~139k caratteri su una singola pagina (planimetrie CAD dense di etichette/quote).
-VECTOR_COUNT_LAYOUT_SKIP = 500     # soglia secondaria: molti tracciati vettoriali + testo già cospicuo è un altro segnale forte
-                                    # di disegno tecnico, indipendentemente dal superamento di MAX_CHARS_FOR_AI_LAYOUT.
-VECTOR_COUNT_MIN_CHARS_SKIP = 50_000
+EXTRACTION_TIMEOUT = 480.0         # 8 minuti - TENTATIVO 1: libreria CON layout AI (ONNX/GNN), intero documento
+LEGACY_EXTRACTION_TIMEOUT = 300.0  # 5 minuti - TENTATIVO 2: libreria SENZA layout AI (legacy mode), intero documento.
+                                    # NB: abbiamo verificato che la legacy mode NON è garantita più veloce
+                                    # dell'AI layout su pagine molto dense di tracciati vettoriali (CAD) — può
+                                    # anzi essere più lenta. Il vero paracadute è il TENTATIVO 3 (OCR), quindi
+                                    # non ha senso tenere timeout alti sui primi due livelli: tanto vale arrivare
+                                    # prima all'OCR, che funziona indipendentemente da quanto è "brutta" la pagina.
+FALLBACK_OCR_TIMEOUT = 300.0       # 5 minuti - rasterizzazione di TUTTE le pagine per il fallback OCR (TENTATIVO 3/4)
 
 # Limiter asincrono: gestisce internamente la concorrenza garantendo max 10 chiamate/minuto
 GEMINI_LIMITER = AsyncLimiter(max_rate=10, time_period=60)
@@ -232,25 +237,33 @@ api_llm_key = settings.api_llm_key
 client = genai.Client(api_key=api_llm_key)
 vision_client = vision.ImageAnnotatorClient()
 
-def _cpu_heavy_pdf_extraction(file_path_str: str, file_bytes: bytes, crop_limit: int):
+def _cpu_heavy_pdf_extraction(file_path_str: str, file_bytes: bytes, crop_limit: int, use_ai_layout: bool = True):
     """
-    Funzione isolata per ProcessPoolExecutor.
+    Funzione isolata per esecuzione in processo dedicato (via _run_killable).
     Gira in un processo OS separato, bypassando totalmente il GIL.
+
+    use_ai_layout=True  -> TENTATIVO 1 della catena: pymupdf4llm con layout AI
+                           (ONNX/GNN) attivo, qualità migliore su tabelle/multi-colonna.
+    use_ai_layout=False -> TENTATIVO 2 della catena: pymupdf4llm in "legacy mode"
+                           (pymupdf4llm.use_layout(False)): titoli via euristica
+                           sulla dimensione del font, tabelle via tabulate, ma
+                           SENZA invocare onnxruntime — quindi senza rischio di
+                           hang, a scapito di qualità leggermente inferiore su
+                           layout complessi (multi-colonna, tabelle articolate).
     """
     import fitz
     import pymupdf4llm
 
-    # Manteniamo attivo il modulo di layout AI (qualità migliore su
-    # tabelle/multi-colonna), ma limitiamo i thread ONNX Runtime al numero
-    # di CPU realmente assegnate dal cgroup (vedi _detect_cgroup_cpu_quota):
-    # di default ONNX Runtime auto-rileva le CPU dell'HOST, non quelle del
-    # container, generando più thread di quanti core siano disponibili e
-    # causando thrashing sotto contesa (probabile causa reale degli hang).
+    # Limitiamo comunque i thread ONNX Runtime al numero di CPU realmente
+    # assegnate dal cgroup (vedi _detect_cgroup_cpu_quota): utile quando
+    # use_ai_layout=True, innocuo (non viene mai creata una sessione ONNX)
+    # quando use_ai_layout=False.
     _limit_onnx_threads()
+    pymupdf4llm.use_layout(use_ai_layout)
 
-    print(f"[CHILD PROCESS] Avvio estrazione per {file_path_str} (ONNX thread limit: {ONNX_THREAD_LIMIT})")
-    
-    
+    mode_label = "layout AI (ONNX)" if use_ai_layout else "legacy mode (no ONNX)"
+    print(f"[CHILD PROCESS] Avvio estrazione per {file_path_str} in modalità: {mode_label} (ONNX thread limit: {ONNX_THREAD_LIMIT})")
+
     if file_bytes:
         doc = fitz.open(stream=file_bytes, filetype="pdf")
     else:
@@ -258,11 +271,6 @@ def _cpu_heavy_pdf_extraction(file_path_str: str, file_bytes: bytes, crop_limit:
 
     extracted_pages = []
     print(f"[CHILD PROCESS] Estrazione PDF iniziata per {file_path_str} ({len(doc)} pagine).")
-    # Teniamo traccia dello stato corrente di pymupdf4llm.use_layout() per evitare
-    # toggle ridondanti: riattivare il layout AI richiama pymupdf.layout.activate(),
-    # che ha un costo di inizializzazione non banale, quindi lo facciamo solo quando
-    # lo stato desiderato cambia rispetto a quello corrente.
-    layout_ai_active = True  # pymupdf4llm ha il layout AI attivo di default all'import
     for p_num in range(len(doc)):
         page_t0 = time.time()
         page = doc[p_num]
@@ -284,88 +292,47 @@ def _cpu_heavy_pdf_extraction(file_path_str: str, file_bytes: bytes, crop_limit:
             extracted_pages.append({"type": "image", "content": pix.tobytes("png")})
             print(f"[CHILD PROCESS] Pagina {p_num}: COMPLETATA (rasterizzazione per OCR) in {time.time() - page_t0:.1f}s.")
         else:
-            # Estrazione Markdown
-            skip_ai_layout = (
-                char_count > MAX_CHARS_FOR_AI_LAYOUT
-                or (vector_count > VECTOR_COUNT_LAYOUT_SKIP and char_count > VECTOR_COUNT_MIN_CHARS_SKIP)
-            )
-            if skip_ai_layout:
-                # Quantità di testo abnorme e/o presenza massiccia di elementi
-                # vettoriali (tipico di planimetrie/disegni tecnici con migliaia
-                # di etichette di quote/coordinate, non un documento "normale").
-                # Il modello di layout AI (ONNX/GNN) non scala su input di questo
-                # tipo e può restare bloccato a lungo (confermato via faulthandler,
-                # osservato hang già a ~139k caratteri su una singola pagina).
-                #
-                # Invece di usare testo grezzo (perdendo ogni struttura), usiamo
-                # pymupdf4llm in "legacy mode" (use_layout(False)): produce comunque
-                # vero Markdown (titoli via euristica su dimensione font, tabelle via
-                # tabulate) ma SENZA invocare onnxruntime/pymupdf_layout, quindi
-                # senza rischio di hang.
-                print(f"[CHILD PROCESS] Pagina {p_num}: Quantità di testo abnorme e/o troppi vettori ({char_count} chars / {vector_count} vettori) — probabile planimetria/disegno tecnico. Salto il layout AI (legacy mode), uso pymupdf4llm senza ONNX.")
-                if layout_ai_active:
-                    pymupdf4llm.use_layout(False)
-                    layout_ai_active = False
-                page_md = pymupdf4llm.to_markdown(doc, pages=[p_num])
-                page_md = page_md.replace("<br>", "\n")
-                extracted_pages.append({"type": "markdown", "content": page_md})
-                print(f"[CHILD PROCESS] Pagina {p_num}: COMPLETATA (legacy mode, no layout AI) in {time.time() - page_t0:.1f}s.")
-            else:
-                #log.debug(f"Pagina {p_num}: Rilevato testo nativo sufficiente ({char_count} chars). Estrazione Markdown.")
-                print(f"[CHILD PROCESS] Pagina {p_num}: Testo sufficiente ({char_count} chars). Estrazione Markdown...")
-                if not layout_ai_active:
-                    pymupdf4llm.use_layout(True)
-                    layout_ai_active = True
-                page_md = pymupdf4llm.to_markdown(doc, pages=[p_num])
-                page_md = page_md.replace("<br>", "\n")
-                extracted_pages.append({"type": "markdown", "content": page_md})
-                print(f"[CHILD PROCESS] Pagina {p_num}: COMPLETATA (layout AI) in {time.time() - page_t0:.1f}s.")
+            print(f"[CHILD PROCESS] Pagina {p_num}: Testo sufficiente ({char_count} chars). Estrazione Markdown ({mode_label})...")
+            page_md = pymupdf4llm.to_markdown(doc, pages=[p_num])
+            page_md = page_md.replace("<br>", "\n")
+            extracted_pages.append({"type": "markdown", "content": page_md})
+            print(f"[CHILD PROCESS] Pagina {p_num}: COMPLETATA ({mode_label}) in {time.time() - page_t0:.1f}s.")
             
     doc.close()
     return extracted_pages
 
 
-def _cpu_heavy_pdf_fallback_extraction(file_path_str: str, file_bytes: bytes):
+def _rasterize_all_pages(file_path_str: str, file_bytes: bytes):
     """
-    Funzione di FALLBACK, usata solo quando _cpu_heavy_pdf_extraction va in
-    timeout (chiamata via _run_killable, non più via ProcessPoolExecutor).
+    TENTATIVO 3/4 della catena: usata solo quando SIA il tentativo con layout AI
+    SIA quello in legacy mode sono andati in timeout (chiamata via _run_killable).
 
-    NON usa get_drawings() né pymupdf4llm.to_markdown(): quest'ultima,
-    pur sembrando "leggera", internamente richiama comunque get_drawings()
-    per il rilevamento di tabelle/layout, quindi non evitava affatto il
-    probabile collo di bottiglia. Qui usiamo solo get_text() grezzo, già
-    calcolato per decidere se la pagina ha testo sufficiente, così non
-    facciamo un secondo giro di analisi sulla pagina.
+    Non usa né get_drawings() né pymupdf4llm.to_markdown(): a questo punto non ci
+    fidiamo più di alcuna estrazione testuale nativa per l'intero documento, quindi
+    rasterizziamo TUTTE le pagine (anche quelle con testo nativo abbondante) e le
+    passiamo tutte all'OCR (Gemini, con fallback automatico su Cloud Vision in
+    caso di errore — vedi _ocr_with_final_fallback).
     """
     import fitz
 
-    print(f"[CHILD PROCESS - FALLBACK] Estrazione per-pagina (solo get_text, no drawings/pymupdf4llm) per {file_path_str}")
+    print(f"[CHILD PROCESS - FALLBACK OCR] Rasterizzazione completa di tutte le pagine per {file_path_str}")
 
     if file_bytes:
         doc = fitz.open(stream=file_bytes, filetype="pdf")
     else:
         doc = fitz.open(file_path_str)
 
-    extracted_pages = []
+    rendered_pages = []
     for p_num in range(len(doc)):
         page_t0 = time.time()
         page = doc[p_num]
-        text = page.get_text(sort=True).strip()
-        char_count = len(text)
-
-        if char_count < 50:
-            print(f"[CHILD PROCESS - FALLBACK] Pagina {p_num}: testo nativo insufficiente ({char_count} chars). OCR necessario.")
-            pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False)
-            extracted_pages.append({"type": "image", "content": pix.tobytes("png")})
-        else:
-            print(f"[CHILD PROCESS - FALLBACK] Pagina {p_num}: testo sufficiente ({char_count} chars). Uso testo grezzo (no pymupdf4llm).")
-            extracted_pages.append({"type": "markdown", "content": text})
-
-        print(f"[CHILD PROCESS - FALLBACK] Pagina {p_num}: COMPLETATA in {time.time() - page_t0:.1f}s.")
+        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+        rendered_pages.append(pix.tobytes("png"))
+        print(f"[CHILD PROCESS - FALLBACK OCR] Pagina {p_num}: rasterizzata in {time.time() - page_t0:.1f}s.")
 
     doc.close()
-    print(f"[CHILD PROCESS - FALLBACK] Completato: {len(extracted_pages)} pagine elaborate per {file_path_str}")
-    return extracted_pages
+    print(f"[CHILD PROCESS - FALLBACK OCR] Completato: {len(rendered_pages)} pagine rasterizzate per {file_path_str}")
+    return rendered_pages
 
 
 def safe_move(src: Path, dest: Path):
@@ -375,6 +342,59 @@ def safe_move(src: Path, dest: Path):
         dest.unlink()
     shutil.move(str(src), str(dest))
     log.debug(f"File spostato: {src.name} -> {dest.parent.name}/")
+
+
+# NOTA: la stessa identica esigenza si presenta in estrattore.py (che sbusta i
+# file .p7m PRIMA che arrivino qui) — questa è una rete di sicurezza per gli
+# eventuali allegati che, nonostante tutto, arrivano ancora incapsulati
+# (mislabeling a monte da Sicr@Web: un allegato dichiarato ".pdf" il cui
+# contenuto è in realtà ancora una busta CAdES/PKCS7 non sbustata, si veda la
+# stessa funzione in estrattore.py per i dettagli). Duplicata qui invece di
+# importata da un modulo condiviso solo perché converter.py ed estrattore.py
+# sono attualmente due deployable indipendenti senza un pacchetto comune
+# importabile da entrambi — da valutare un refactor futuro in common/ se la
+# duplicazione diventa scomoda da mantenere.
+def try_extract_pdf_from_pkcs7(file_bytes: bytes, filename: str = "") -> bytes | None:
+    """
+    Tenta di interpretare file_bytes come busta di firma PKCS7/CMS (CAdES) e,
+    se lo è, ne estrae il contenuto incapsulato (il PDF originale).
+
+    Usa asn1crypto per un parsing ASN.1 vero (controllo semantico del campo
+    content_type)
+    Restituisce:
+    - None se file_bytes NON è una struttura PKCS7 valida (caso normale: PDF
+      nativo già in chiaro) — il chiamante deve procedere con file_bytes
+      originali, nessun errore da segnalare.
+    - i bytes del PDF estratto, se file_bytes è una busta PKCS7 di tipo
+      signed_data e l'estrazione riesce.
+
+    Solleva ValueError SOLO se la struttura è riconosciuta come PKCS7
+    signed_data ma l'estrazione del contenuto incapsulato fallisce
+    (caso anomalo/da indagare, distinto da "non era affatto una busta").
+    """
+    from asn1crypto.cms import ContentInfo
+
+    try:
+        content_info = ContentInfo.load(file_bytes)
+    except Exception:
+        # Non è (o non è un valido) ASN.1: quasi certamente un PDF nativo normale.
+        return None
+
+    if content_info['content_type'].native != 'signed_data':
+        # E' una struttura ASN.1 valida ma non una busta di firma: non il nostro caso.
+        return None
+
+    try:
+        signed_data = content_info['content']
+        encap_content_info = signed_data['encap_content_info']
+        raw_content = encap_content_info['content'].native
+        extracted_bytes = raw_content if isinstance(raw_content, bytes) else encap_content_info['content'].chosen.contents
+        log.debug("Sbustamento completato per %s", filename)
+        return extracted_bytes
+    except Exception as e:
+        log.error("Fallimento sbustamento P7M per %s: %s", filename, str(e))
+        raise ValueError(f"Decodifica P7M fallita: {str(e)}")
+
 
 # ==============================================================================
 # 2. MOTORE IBRIDO DI ESTRAZIONE E OCR
@@ -461,30 +481,53 @@ async def _ocr_with_final_fallback(image: Image.Image, as_markdown: bool = True)
             raise
 
 async def extract_hybrid_markdown_from_pdf_async(file_path: Path, file_bytes: bytes = None) -> str:
-    """Estrae il testo nativo dal PDF o innesca l'OCR (Versione Multi-Processo Anti-Crash)."""
+    """
+    Estrae il testo nativo dal PDF o innesca l'OCR, seguendo questa catena di
+    fallback (ogni livello scatta solo se il precedente va in TIMEOUT):
+
+      1) pymupdf4llm CON layout AI (ONNX/GNN)      -> EXTRACTION_TIMEOUT (20 min)
+      2) pymupdf4llm SENZA layout AI (legacy mode) -> LEGACY_EXTRACTION_TIMEOUT (10 min)
+      3) OCR completo via Gemini (rasterizzazione di tutte le pagine)
+      4) Se Gemini fallisce (non timeout, ma errore/policy block): Cloud Vision
+         -> già incapsulato dentro _ocr_with_final_fallback, chiamato dal livello 3.
+    """
     log.info(f"Avvio estrazione ibrida MULTI-PROCESSO per: {file_path.name}")
     md_pages = []
-    
+
     try:
-        # Eseguiamo l'estrazione in un processo DEDICATO e killabile: se va in
-        # timeout, il worker viene terminato per davvero (vedi _run_killable),
-        # invece di restare appeso a occupare uno slot del PROCESS_POOL condiviso.
+        # --- TENTATIVO 1: layout AI (ONNX) ---
         try:
             pages_data = await asyncio.to_thread(
                 _run_killable,
                 _cpu_heavy_pdf_extraction,
-                (str(file_path), file_bytes, CROP_OCR_LIMIT),
-                EXTRACTION_TIMEOUT  # <--- TIMEOUT DI SICUREZZA (20 Minuti)
+                (str(file_path), file_bytes, CROP_OCR_LIMIT, True),
+                EXTRACTION_TIMEOUT
             )
         except TimeoutError:
             log.warning(
-                f"TIMEOUT: l'estrazione ibrida di {file_path.name} ha impiegato più di "
+                f"TIMEOUT: l'estrazione con layout AI di {file_path.name} ha impiegato più di "
                 f"{int(EXTRACTION_TIMEOUT // 60)} minuti (probabile PDF vettoriale/CAD pesante). "
-                f"Il worker è stato terminato forzatamente. Avvio fallback: estrazione per-pagina + OCR."
+                f"Il worker è stato terminato forzatamente. Provo TENTATIVO 2: legacy mode (no ONNX)."
             )
-            return await _fallback_full_gemini_ocr(file_path, file_bytes)
+            # --- TENTATIVO 2: legacy mode (senza ONNX) ---
+            try:
+                pages_data = await asyncio.to_thread(
+                    _run_killable,
+                    _cpu_heavy_pdf_extraction,
+                    (str(file_path), file_bytes, CROP_OCR_LIMIT, False),
+                    LEGACY_EXTRACTION_TIMEOUT
+                )
+            except TimeoutError:
+                log.warning(
+                    f"TIMEOUT: anche l'estrazione in legacy mode (no ONNX) di {file_path.name} ha impiegato più di "
+                    f"{int(LEGACY_EXTRACTION_TIMEOUT // 60)} minuti. Il worker è stato terminato forzatamente. "
+                    f"Provo TENTATIVO 3: OCR completo via Gemini/Vision."
+                )
+                # --- TENTATIVO 3/4: OCR completo (Gemini, poi Vision se Gemini fallisce) ---
+                return await _fallback_full_ocr_gemini_then_vision(file_path, file_bytes)
 
-        # 2. Tornati nell'Event Loop Async, gestiamo le eventuali chiamate API di rete (OCR)
+        # Tornati nell'Event Loop Async, gestiamo le eventuali chiamate API di rete (OCR
+        # per le pagine senza testo nativo sufficiente, sia nel Tentativo 1 che nel 2)
         for page_data in pages_data:
             if page_data["type"] == "image":
                 # Ricostruiamo l'oggetto PIL dai bytes generati dal processo figlio
@@ -502,43 +545,40 @@ async def extract_hybrid_markdown_from_pdf_async(file_path: Path, file_bytes: by
         raise
 
 
-async def _fallback_full_gemini_ocr(file_path: Path, file_bytes: bytes = None) -> str:
+async def _fallback_full_ocr_gemini_then_vision(file_path: Path, file_bytes: bytes = None) -> str:
     """
-    Fallback usato quando l'estrazione ibrida principale va in timeout.
-    Rifà l'estrazione pagina per pagina evitando sia get_drawings() che
-    pymupdf4llm.to_markdown() (che lo richiama internamente): usa solo
-    get_text() grezzo se la pagina ha testo sufficiente, altrimenti la
-    rasterizza per l'OCR via Gemini/Cloud Vision (_ocr_with_final_fallback).
-    Quindi, ad esempio, la pagina 1 può restare testo nativo grezzo e la
-    pagina 2 può finire in OCR, a seconda del contenuto di ciascuna.
+    TENTATIVO 3/4 della catena: usato quando SIA il tentativo con layout AI (ONNX)
+    SIA quello in legacy mode (senza ONNX) sono andati in timeout.
+
+    Rasterizza tutte le pagine del documento e le passa a _ocr_with_final_fallback,
+    che tenta Gemini per prima cosa e, solo se Gemini fallisce (errore o policy
+    block), ripiega automaticamente su Google Cloud Vision — quindi qui non serve
+    gestire esplicitamente il "livello 4" (Vision), è già incapsulato lì dentro.
     """
     try:
-        pages_data = await asyncio.to_thread(
+        rendered_pages = await asyncio.to_thread(
             _run_killable,
-            _cpu_heavy_pdf_fallback_extraction,
+            _rasterize_all_pages,
             (str(file_path), file_bytes),
-            FALLBACK_RENDER_TIMEOUT
+            FALLBACK_OCR_TIMEOUT
         )
     except TimeoutError:
         log.error(
-            f"TIMEOUT CRITICO: anche l'estrazione di fallback per {file_path.name} "
-            f"ha superato {int(FALLBACK_RENDER_TIMEOUT)}s. Il worker è stato terminato forzatamente. File saltato."
+            f"TIMEOUT CRITICO: anche la rasterizzazione di fallback per {file_path.name} "
+            f"ha superato {int(FALLBACK_OCR_TIMEOUT)}s. Il worker è stato terminato forzatamente. File saltato."
         )
         raise ValueError(
-            "PDF extraction timed out and fallback extraction also timed out "
-            "(possible corrupted or extremely heavy file)"
+            "PDF extraction timed out at every fallback level (AI layout, legacy mode, "
+            "and raw page rasterization) — possible corrupted or extremely heavy file"
         )
 
     md_pages = []
-    for page_data in pages_data:
-        if page_data["type"] == "image":
-            img = Image.open(io.BytesIO(page_data["content"]))
-            ocr_md = await _ocr_with_final_fallback(img, as_markdown=True)
-            md_pages.append(ocr_md)
-        else:
-            md_pages.append(page_data["content"])
+    for png_bytes in rendered_pages:
+        img = Image.open(io.BytesIO(png_bytes))
+        ocr_md = await _ocr_with_final_fallback(img, as_markdown=True)
+        md_pages.append(ocr_md)
 
-    log.info(f"Fallback completato per {file_path.name}. Generati {len(md_pages)} blocchi (misto testo nativo/OCR).")
+    log.info(f"Fallback OCR completo (Gemini/Vision) completato per {file_path.name}. Generati {len(md_pages)} blocchi.")
     return "\n\n---\n\n".join(md_pages)
 
 # ==============================================================================
@@ -602,7 +642,26 @@ async def process_single_job(payload: dict, channel: aio_pika.Channel):
             # Pipeline di conversione
             if attached_ext == ".pdf":
 
-                with fitz.open(attached_file_path) as doc:
+                pdf_bytes = attached_file_path.read_bytes()
+
+                try:
+                    extracted = try_extract_pdf_from_pkcs7(pdf_bytes, filename)
+                except ValueError as e:
+                    # Riconosciuto come busta PKCS7 ma estrazione fallita: caso
+                    # anomalo, non ha senso procedere con i bytes ancora
+                    # incapsulati (fitz fallirebbe comunque poco dopo con un
+                    # errore meno chiaro). Meglio un fallimento esplicito qui.
+                    raise ValueError(f"File '{filename}': {e}")
+
+                if extracted is not None:
+                    log.warning(
+                        f"Il file '{filename}' ha estensione .pdf ma il contenuto è in realtà "
+                        f"una busta di firma digitale PKCS7/CMS (.p7m) non sbustata a monte. "
+                        f"PDF incapsulato estratto con successo ({len(extracted)} bytes)."
+                    )
+                    pdf_bytes = extracted
+
+                with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
                     page_count = len(doc)
                 
                 if page_count > settings.max_allowed_pages:
@@ -612,7 +671,7 @@ async def process_single_job(payload: dict, channel: aio_pika.Channel):
                         f"superando il limite massimo di {settings.max_allowed_pages}."
                     )
                 
-                md_content = await extract_hybrid_markdown_from_pdf_async(attached_file_path)
+                md_content = await extract_hybrid_markdown_from_pdf_async(attached_file_path, file_bytes=pdf_bytes)
             elif attached_ext in [".txt", ".md"]:
                 md_content = attached_file_path.read_text(encoding="utf-8", errors="ignore")
             elif attached_ext in IMG_EXTENSIONS:
@@ -698,15 +757,35 @@ async def main_worker():
         
         async with connection:
             channel = await connection.channel()
-            await channel.set_qos(prefetch_count=1)
+            # prefetch_count = CONCURRENCY_LIMIT: RabbitMQ non consegna più di CONCURRENCY_LIMIT
+            # messaggi non ancora "ack-ati" contemporaneamente, il che throttla naturalmente
+            # l'iteratore qui sotto senza bisogno di ulteriore sincronizzazione esplicita.
+            await channel.set_qos(prefetch_count=CONCURRENCY_LIMIT)
 
             queue_in = await channel.get_queue("da-convertire")  # ← assume che esista già
 
-            log.info("✓ Connessione stabilita. In ascolto sulla coda 'da-convertire'.")
+            log.info(f"✓ Connessione stabilita. In ascolto sulla coda 'da-convertire' (concorrenza: {CONCURRENCY_LIMIT} file in parallelo).")
+
+            # Teniamo un riferimento ai task in corso per evitare che vengano
+            # garbage-collected prematuramente (rischio noto di asyncio.create_task
+            # senza riferimenti forti) e per loggare eventuali eccezioni non gestite.
+            in_flight_tasks = set()
+
+            def _on_task_done(task: asyncio.Task):
+                in_flight_tasks.discard(task)
+                if task.cancelled():
+                    return
+                exc = task.exception()
+                if exc is not None:
+                    # Non dovrebbe succedere: on_message_received gestisce già le sue
+                    # eccezioni internamente (ack/reject). Se arriva qui è un bug da correggere.
+                    log.error(f"Task di elaborazione messaggio terminato con eccezione non gestita: {exc}", exc_info=exc)
 
             async with queue_in.iterator() as queue_iter:
                 async for message in queue_iter:
-                    await on_message_received(message, channel)
+                    task = asyncio.create_task(on_message_received(message, channel))
+                    in_flight_tasks.add(task)
+                    task.add_done_callback(_on_task_done)
                     
     except Exception as e:
         log.error(f"Errore critico di connessione a RabbitMQ: {e}")
