@@ -2,6 +2,7 @@
 !.gitignore
 !ingestion/
 !saga_extract/
+!common/
 !api/
 !web/greenlees/
 !web/greenlees/src/
@@ -21,6 +22,7 @@
 !api/**
 !saga_extract/**
 !misc/**
+!common/**
 !web/greenlees/src/web/**
 !web/greenlees/src/lib/**
 !web/greenlees/src/assets/**
@@ -42,7 +44,6 @@
 !LICENSE
 !README.MD
 !README-TECH.MD
-!TECH.MD
 
 api/model_cache/
 ingestion/src/error/
