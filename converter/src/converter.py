@@ -100,9 +100,9 @@ DATA_FOLDER = settings.data_folder
 STAGING_DIR = DATA_FOLDER / "staging"
 INGESTION_WATCH_DIR = DATA_FOLDER / "watch"
 ERROR_DIR = DATA_FOLDER / "converter" / "error"
-ARCHIVE_DIR = DATA_FOLDER / "converter" / "archive"
+ARCHIVE_DIR = DATA_FOLDER / "processed"
 
-CONCURRENCY_LIMIT = 2  # numero massimo di file elaborati in parallelo da QUESTA istanza del worker.
+CONCURRENCY_LIMIT = 2  # numero massimo di file elaborati in parallelo da QUESTA istanza.
                         # Ogni file "pesante" genera comunque un sottoprocesso dedicato (via _run_killable)
                         # con il proprio limite di thread ONNX (vedi _detect_cgroup_cpu_quota) — processarne
                         # più di 2-3 in parallelo nello stesso container rischia di saturare CPU/RAM.
@@ -220,7 +220,7 @@ CROP_OCR_LIMIT = 0
 OCR_MODEL_NAME = settings.ocr_model_name
 IMG_EXTENSIONS = [".png", ".jpg", ".jpeg"]
 
-EXTRACTION_TIMEOUT = 480.0         # 8 minuti - TENTATIVO 1: libreria CON layout AI (ONNX/GNN), intero documento
+EXTRACTION_TIMEOUT = 600.0         # 10 minuti - TENTATIVO 1: libreria CON layout AI (ONNX/GNN), intero documento
 LEGACY_EXTRACTION_TIMEOUT = 300.0  # 5 minuti - TENTATIVO 2: libreria SENZA layout AI (legacy mode), intero documento.
                                     # NB: abbiamo verificato che la legacy mode NON è garantita più veloce
                                     # dell'AI layout su pagine molto dense di tracciati vettoriali (CAD) — può
