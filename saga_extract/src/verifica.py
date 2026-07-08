@@ -90,19 +90,11 @@ def get_expected_files_from_lista_allegati(uid: str, lista_allegati_raw: list) -
 
     return expected_files
 
-# Valori di id_tipo_iter CONFERMATI dal cliente (campo dentro
-# Determina/Workflow/Attributi/Attributo con Nome="id_tipo_iter" nella
-# risposta di LeggiAttoPlus — vedi estrazione_documenti.py). E' il segnale
-# affidabile per il sotto-tipo del decreto: 8 = decreto del Presidente,
-# 9/19 = decreto deliberativo. Sostituisce interamente il vecchio approccio
-# basato sul parsing del registro Verbale nella risposta di ricerca
-# (RicercaDocumentiString), che per alcuni atti reali può mancare del tutto
-# (CONFERMATO: decreto presidenziale 1/2024, UID 2119188, aveva solo un
-# registro "PR" generico nella ricerca pur essendo un decreto vero).
-ID_TIPO_ITER_ATTESO = {
-    "decreto_presidenziale": {"8"},
-    "decreto_deliberativo": {"9", "19"},
-}
+# La mappa dei valori attesi di id_tipo_iter ora vive in settings
+# (settings.id_tipo_iter_atteso, common/config.py), configurabile via env
+# ID_TIPO_ITER_DECRETO_PRESIDENZIALE/ID_TIPO_ITER_DECRETO_DELIBERATIVO,
+# così verifica.py ed estrattore.py usano sempre la stessa mappa.
+
 
 
 def get_dati_atto_da_leggi_atto_plus(repwss_client, uid: str) -> Optional[dict]:
@@ -239,27 +231,13 @@ async def verify_pipeline(json_filters_str: str, auto_recover: bool):
         log.warning(f"Nessun atto restituito dalla ricerca. Ultimo errore: {ultimo_errore}")
         return
 
-    # VERIFICA SOTTO-TIPO/ANNO/DEFINITIVITA' VIA LeggiAttoPlus: sostituisce
-    # interamente il vecchio doppio filtro (registro Verbale dalla risposta
-    # di ricerca + anno dal registro definitivo), perché quel registro può
-    # mancare del tutto per un atto reale (CONFERMATO: decreto presidenziale
-    # 1/2024, UID 2119188, ha solo un registro "PR" generico nella ricerca
-    # pur essendo un decreto vero). Il discriminante ora è LeggiAttoPlus:
-    #   - numero_atto: "0"/assente = mera proposta non protocollata, esclusa;
-    #   - id_tipo_iter: 8 = decreto presidenziale, 9/19 = decreto deliberativo
-    #     (vedi ID_TIPO_ITER_ATTESO) — non si applica a tipo_atto senza
-    #     sotto-tipo (es. "determina", "qualsiasi");
-    #   - anno_atto: confrontato con anno_atto_richiesto, se presente.
-    # Chiamiamo leggi_atto_plus() qui UNA SOLA VOLTA per candidato e ne
-    # riusiamo il risultato più avanti anche per il calcolo dei file attesi,
-    # invece di richiamarlo una seconda volta per lo stesso UID.
     try:
         repwss_client = build_client_from_env()
     except Exception as e:
         log.error(f"Impossibile istanziare il client Sicr@Web: {e}")
         return
 
-    id_tipo_iter_attesi = ID_TIPO_ITER_ATTESO.get(tipo_atto)  # None per tipo_atto senza sotto-tipo (determina/qualsiasi/...)
+    id_tipo_iter_attesi = settings.id_tipo_iter_atteso.get(tipo_atto)  # None per tipo_atto senza sotto-tipo (determina/qualsiasi/...)
 
     uids_prima = list(ids_totali)
     ids_totali = []

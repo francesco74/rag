@@ -39,20 +39,11 @@ TIPI_SUPPORTATI = {
 log = None
 init_db_pool()
 
-# Valori di id_tipo_iter CONFERMATI dal cliente (campo dentro
-# Determina/Workflow/Attributi/Attributo con Nome="id_tipo_iter" nella
-# risposta di LeggiAttoPlus — vedi estrazione_documenti.py). E' il segnale
-# affidabile per il sotto-tipo del decreto: 8 = decreto del Presidente,
-# 9/19 = decreto deliberativo. Sostituisce il vecchio approccio basato sul
-# parsing del registro Verbale nella risposta di ricerca
-# (RicercaDocumentiString), che per alcuni atti reali può mancare del tutto
-# (CONFERMATO: decreto presidenziale 1/2024, UID 2119188, aveva solo un
-# registro "PR" generico nella ricerca pur essendo un decreto vero). Stessa
-# mappa usata in verifica.py.
-ID_TIPO_ITER_ATTESO = {
-    "decreto_presidenziale": {"8"},
-    "decreto_deliberativo": {"9", "19"},
-}
+# La mappa dei valori attesi di id_tipo_iter ora vive in settings
+# (settings.id_tipo_iter_atteso, common/config.py), configurabile via env
+# ID_TIPO_ITER_DECRETO_PRESIDENZIALE/ID_TIPO_ITER_DECRETO_DELIBERATIVO,
+# così verifica.py ed estrattore.py usano sempre la stessa mappa.
+
 
 
 def get_dati_atto_da_leggi_atto_plus(repwss_client, uid: str):
@@ -435,24 +426,9 @@ def main():
     if risultato_ricerca.errore or not risultato_ricerca.ids:
         log.warning("Ricerca fallita o senza risultati. Errore: %s", risultato_ricerca.errore)
         sys.exit(1)
-
-    # VERIFICA SOTTO-TIPO/ANNO/DEFINITIVITA' VIA LeggiAttoPlus (stessa logica
-    # di verify_pipeline in verifica.py). NECESSARIO qui: <Documento><Numero>
-    # da solo può restituire decine di atti di anni e sotto-tipi diversi (es.
-    # Numero=1 esistente sia come decreto deliberativo 2026 sia come
-    # presidenziale 2025, oltre a vecchi atti pre-2024). Senza questo filtro,
-    # si estrarrebbero e pubblicherebbero TUTTI questi "infiltrati", non solo
-    # l'atto realmente richiesto.
-    #
-    # Sostituisce il vecchio filtro basato su registro_definitivo_codice
-    # dalla risposta di ricerca (RicercaDocumentiString), che può mancare del
-    # tutto per un atto reale (CONFERMATO: decreto presidenziale 1/2024, UID
-    # 2119188). Il discriminante ora è LeggiAttoPlus, chiamato qui UNA SOLA
-    # VOLTA per candidato: il risultato (allegati inclusi) viene poi passato
-    # direttamente a elabora_atto, invece di richiamare leggi_atto_plus una
-    # seconda volta per lo stesso UID.
+    
     anno_atto_richiesto = raw_json.get("anno_atto")
-    id_tipo_iter_attesi = ID_TIPO_ITER_ATTESO.get(tipo_atto)  # None per tipo_atto senza sotto-tipo (determina/qualsiasi/...)
+    id_tipo_iter_attesi = settings.id_tipo_iter_atteso.get(tipo_atto)  # None per tipo_atto senza sotto-tipo (determina/qualsiasi/...)
 
     try:
         repwss_client = build_client_from_env()
