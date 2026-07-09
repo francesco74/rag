@@ -3,6 +3,7 @@ import logging
 import argparse
 import pathlib
 import sys
+import re
 from pathlib import Path
 from typing import Optional
 import pika
@@ -10,6 +11,7 @@ import os
 from common.db_logger import MySQLLogHandler, init_db_pool
 from dotenv import load_dotenv
 from asn1crypto.cms import ContentInfo
+from common.utility import clean_iso_date
 
 load_dotenv()
 
@@ -49,10 +51,17 @@ init_db_pool()
 def get_dati_atto_da_leggi_atto_plus(repwss_client, uid: str):
     """
     Chiama leggi_atto_plus(uid) UNA SOLA VOLTA e restituisce sia gli
-    allegati (già materializzati) sia gli attributi discriminanti
-    (numero_atto, anno_atto, id_tipo_iter, oggetto). Lo stesso risultato
+    allegati (già materializzati) sia TUTTI gli attributi disponibili
+    (numero_atto, anno_atto, id_tipo_iter, oggetto, classifica,
+    classifica_descrizione, data_atto, data_esecutivita,
+    data_pubblicazione, giorni_pubblicazione, trattamento_descrizione,
+    proponente_descrizione, dirigente_descrizione). Lo stesso risultato
     viene poi passato a elabora_atto (parametro lista_allegati_raw) per
     evitare una seconda chiamata di rete per lo stesso UID.
+
+    Le date NON sono normalizzate qui: sono i valori grezzi restituiti da
+    Sicr@Web (via estrazione_documenti.py). La normalizzazione avviene in
+    un unico punto centrale, elabora_atto(), tramite clean_iso_date().
 
     Restituisce None in caso di errore nella chiamata (loggato).
     """
@@ -64,30 +73,34 @@ def get_dati_atto_da_leggi_atto_plus(repwss_client, uid: str):
         return None
 
     attributi_plus = attributi_plus or {}
-    if isinstance(attributi_plus, dict):
-        numero_atto = attributi_plus.get("numero_atto")
-        anno_atto = attributi_plus.get("anno_atto")
-        id_tipo_iter = attributi_plus.get("id_tipo_iter")
-        oggetto = attributi_plus.get("oggetto")
-    else:
-        numero_atto = getattr(attributi_plus, "numero_atto", None)
-        anno_atto = getattr(attributi_plus, "anno_atto", None)
-        id_tipo_iter = getattr(attributi_plus, "id_tipo_iter", None)
-        oggetto = getattr(attributi_plus, "oggetto", None)
+
+    def _get(nome):
+        if isinstance(attributi_plus, dict):
+            return attributi_plus.get(nome)
+        return getattr(attributi_plus, nome, None)
+
+    def _get_str(nome):
+        val = _get(nome)
+        return str(val).strip() if val is not None else None
 
     return {
         "allegati": lista_allegati_raw,
-        "numero_atto": str(numero_atto).strip() if numero_atto is not None else None,
-        "anno_atto": str(anno_atto).strip() if anno_atto else None,
-        "id_tipo_iter": str(id_tipo_iter).strip() if id_tipo_iter is not None else None,
-        "oggetto": oggetto,
+        "numero_atto": _get_str("numero_atto"),
+        "anno_atto": _get_str("anno_atto"),
+        "id_tipo_iter": _get_str("id_tipo_iter"),
+        "oggetto": _get("oggetto"),
+        "classifica": _get("classifica"),
+        "classifica_descrizione": _get("classifica_descrizione"),
+        "data_atto": _get("data_atto"),
+        "data_esecutivita": _get("data_esecutivita"),
+        "data_pubblicazione": _get("data_pubblicazione"),
+        "giorni_pubblicazione": _get("giorni_pubblicazione"),
+        "trattamento_descrizione": _get("trattamento_descrizione"),
+        "proponente_descrizione": _get("proponente_descrizione"),
+        "dirigente_descrizione": _get("dirigente_descrizione"),
     }
 
-def clean_iso_date(date_raw: str) -> Optional[str]:
-    """Uniforma le date al formato YYYY-MM-DD, rimuovendo le componenti temporali (T)."""
-    if not date_raw: 
-        return None
-    return date_raw.split("T")[0] if "T" in date_raw else date_raw.strip()
+
 
 def try_extract_pdf_from_pkcs7(file_bytes: bytes, filename: str = "") -> Optional[bytes]:
     """
@@ -266,6 +279,8 @@ def elabora_atto(str_uid: str, meta_atto: dict, tipo_atto: str, tipo_cartella_st
                 "id_sicraweb": str_uid,
                 "percorso_originale": percorso_logico,
                 "oggetto": meta_atto.get("oggetto"),
+                "classifica": meta_atto.get("classifica"),
+                "classifica_descrizione": meta_atto.get("classifica_descrizione"),
                 "trattamento_descrizione": meta_atto.get("trattamento_descrizione"),
                 "proponente_descrizione": meta_atto.get("proponente_descrizione"),
                 "dirigente_descrizione": meta_atto.get("dirigente_descrizione"),
@@ -338,6 +353,12 @@ def main():
     parser.add_argument("--debug", action="store_true", help="Abilita log di livello DEBUG.")
     parser.add_argument("--dry", action="store_true", help="Simula la ricerca.")
     parser.add_argument("--json-filters", type=str, required=True, help="Filtri in JSON.")
+    parser.add_argument(
+        "--sicraweb-delay",
+        type=float,
+        default=None,
+        help="Pausa minima in secondi tra due chiamate LeggiAttoPlus consecutive (sovrascrive il default/config).",
+    )
     args = parser.parse_args()
 
     init_db_pool()
@@ -355,7 +376,7 @@ def main():
     db_handler.setFormatter(logging.Formatter('%(asctime)s - ESTRATTORE - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s'))
     root_logger.addHandler(db_handler)
 
-    log = logging.getLogger("main_extractor")
+    log = logging.getLogger("ESTRATTORE")
 
     try:
         raw_json = json.loads(args.json_filters)
@@ -395,6 +416,8 @@ def main():
 
         try:
             repwss_client = build_client_from_env()
+            if args.sicraweb_delay is not None:
+                repwss_client.min_interval_seconds = args.sicraweb_delay
         except Exception as e:
             log.error("Impossibile inizializzare il client WSAtti: %s", str(e))
             sys.exit(1)
@@ -432,6 +455,8 @@ def main():
 
     try:
         repwss_client = build_client_from_env()
+        if args.sicraweb_delay is not None:
+            repwss_client.min_interval_seconds = args.sicraweb_delay
     except Exception as e:
         log.error("Impossibile inizializzare il client WSAtti: %s", str(e))
         sys.exit(1)
@@ -482,6 +507,15 @@ def main():
             "anno": dati.get("anno_atto"),
             "oggetto": dati.get("oggetto"),
             "id_tipo_iter": dati.get("id_tipo_iter"),
+            "classifica": dati.get("classifica"),
+            "classifica_descrizione": dati.get("classifica_descrizione"),
+            "data": dati.get("data_atto"),
+            "data_esecutivita": dati.get("data_esecutivita"),
+            "data_pubblicazione": dati.get("data_pubblicazione"),
+            "giorni_pubblicazione": dati.get("giorni_pubblicazione"),
+            "trattamento_descrizione": dati.get("trattamento_descrizione"),
+            "proponente_descrizione": dati.get("proponente_descrizione"),
+            "dirigente_descrizione": dati.get("dirigente_descrizione"),
         }
         if elabora_atto(str_uid, meta_atto, tipo_atto, tipo_cartella_statica, repwss_client, lista_allegati_raw=dati["allegati"]):
             success_count += 1

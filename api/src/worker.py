@@ -31,8 +31,6 @@ from common.config import settings
 from common.db_logger import MySQLLogHandler, get_db_connection, init_db_pool
 
 
-
-
 # ==============================================================================
 # 1. CONFIGURATION & LOGGING
 # ==============================================================================
@@ -45,7 +43,7 @@ def configure_worker_logging(*args, **kwargs):
         force=True  # Svuota e sovrascrive gli handler precedentemente configurati da Celery
     )
 
-log = logging.getLogger("rag_queue")
+log = logging.getLogger("WORKER")
 
 PROMPTS_DIR = os.path.join(os.path.dirname(__file__), 'prompts')
 
@@ -326,7 +324,14 @@ def generate_answer(query, rich_context, topic_id):
                 log.debug(f"Parent '{item['source']}' troncato: {len(content)} → {budget_per_parent} chars.")
                 content = content[:budget_per_parent]
 
-            chunk = f"[Source: {item['source']}]\n{content}\n\n"
+            header = f"[Source: {item['source']}"
+            if item.get('date'):
+                header += f" | Date: {item['date']}"
+            else:
+                header += f" | Date: unknown"
+            header += "]"
+
+            chunk = f"{header}\n{content}\n\n"
 
             if curr_len + len(chunk) > settings.max_context_chars:
                 log.warning(
@@ -508,7 +513,7 @@ def setup_periodic_tasks(sender, **kwargs):
 # ==============================================================================
 # 7. DOCUMENT RETRIEVAL (With OPTIMIZED Reranking)
 # ==============================================================================
-def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_sub_topics, metadata_filters):
+def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_sub_topics, metadata_filters, include_undated=True):
     """
     Recupera, fonde e riordina i chunk dal Vector DB in modo sicuro.
     """
@@ -536,15 +541,52 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
                         match=models.MatchText(text=str(value))
                     ))
                 
-                # Filtro range: {"data": {"gte": 1700000000, "lte": 1800000000}}
+                # Filtro range: {"data": {"gte": "2024-01-01", "lte": "2024-06-30"}}
+                # oppure numerico: {"prezzo": {"gte": 10, "lte": 100}}
+                # NB: i metadati sono dinamici (dipendono dalla fonte di ingestion),
+                # quindi un documento può legittimamente non avere questo campo.
+                # In tal caso lo includiamo comunque (non escludiamo per "assenza
+                # di dato", solo per "dato fuori range"): range_condition è
+                # soddisfatta OPPURE il campo non esiste affatto.
                 elif isinstance(value, dict) and ("gte" in value or "lte" in value):
-                    must_conditions.append(models.FieldCondition(
-                        key=key,
-                        range=models.Range(
-                            gte=value.get("gte"),
-                            lte=value.get("lte")
+                    range_values = [v for v in (value.get("gte"), value.get("lte")) if v is not None]
+                    is_date_range = any(isinstance(v, str) for v in range_values)
+
+                    if is_date_range:
+                        # models.Range accetta solo float: per stringhe (es. date
+                        # ISO "YYYY-MM-DD") serve DatetimeRange, altrimenti Qdrant
+                        # solleva un errore di validazione.
+                        range_condition = models.FieldCondition(
+                            key=key,
+                            range=models.DatetimeRange(
+                                gte=value.get("gte"),
+                                lte=value.get("lte")
+                            )
                         )
-                    ))
+                    else:
+                        range_condition = models.FieldCondition(
+                            key=key,
+                            range=models.Range(
+                                gte=value.get("gte"),
+                                lte=value.get("lte")
+                            )
+                        )
+
+                    if include_undated:
+                        # Il documento passa se rientra nel range OPPURE se il
+                        # campo non esiste affatto (comportamento di default:
+                        # non escludiamo per "assenza di dato").
+                        must_conditions.append(models.Filter(
+                            should=[
+                                range_condition,
+                                models.IsEmptyCondition(is_empty=models.PayloadField(key=key))
+                            ]
+                        ))
+                    else:
+                        # L'utente ha chiesto di escludere i documenti privi
+                        # del campo: nessuna clausola di "should", il documento
+                        # deve soddisfare strettamente il range.
+                        must_conditions.append(range_condition)
                 
                 # Filtro multi-valore: {"stato": ["approvato", "pubblicato"]}
                 elif isinstance(value, list):
@@ -881,9 +923,26 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
             source = p_doc.get("source", "Fonte_Sconosciuta")
             sub_topic_id = p_doc.get("sub_topic_id", "")
             content = p_doc.get("content", "").strip()
- 
+
+            # Estrae la data rilevata dal documento (se presente) dal JSON di
+            # metadata salvato in MySQL. Priorità: "data" > "data_pubblicazione"
+            # > "data_esecutivita" (stessi campi indicizzati come DATETIME su
+            # Qdrant, vedi setup_qdrant.py).
+            doc_date = None
+            raw_metadata = p_doc.get("metadata")
+            if raw_metadata:
+                try:
+                    meta = raw_metadata if isinstance(raw_metadata, dict) else json.loads(raw_metadata)
+                    doc_date = (
+                        meta.get("data")
+                        or meta.get("data_pubblicazione")
+                        or meta.get("data_esecutivita")
+                    )
+                except (json.JSONDecodeError, TypeError, AttributeError) as e:
+                    log.debug(f"Metadata non parsabile per parent_id={p_doc.get('id')}: {e}")
+
             if content:
-                rich_context.append({"content": content, "source": source})
+                rich_context.append({"content": content, "source": source, "date": doc_date})
                 if source not in unique_sources_map:
                     unique_sources_map[source] = {"file": source, "sub_topic": sub_topic_id}
  
@@ -1032,7 +1091,7 @@ def log_automatic_negative_feedback(query, answer, topic_id, history, task_id="U
 # ==============================================================================
 
 @celery_app.task(bind=True, name="rag_queue")
-def process_rag_query(self, query, history, topic_id, selected_sub_topics=None, metadata_filters=None):
+def process_rag_query(self, query, history, topic_id, selected_sub_topics=None, metadata_filters=None, include_undated=True):
     """Main RAG processing pipeline: JSON Mode, Multi-Query, and Defensive Error Handling."""
     start_time = time.time()
     task_id = self.request.id
@@ -1102,7 +1161,7 @@ def process_rag_query(self, query, history, topic_id, selected_sub_topics=None, 
     # SEMANTIC CACHE CHECK
     # ==========================================================
     try:
-        filters_key = generate_filters_key(metadata_filters)
+        filters_key = generate_filters_key({**(metadata_filters or {}), "_include_undated": include_undated})
 
         cached = check_semantic_cache(primary_vector, topic_id, st_key, filters_key)
         if cached:
@@ -1127,7 +1186,8 @@ def process_rag_query(self, query, history, topic_id, selected_sub_topics=None, 
             all_keywords, 
             topic_id, 
             selected_sub_topics,
-            metadata_filters
+            metadata_filters,
+            include_undated
         )
     except Exception as e:
         log.error(f"[{task_id}] Vector DB Retrieval failed: {e}", exc_info=True)
@@ -1222,7 +1282,8 @@ def process_rag_query(self, query, history, topic_id, selected_sub_topics=None, 
                         extracted_keywords, 
                         topic_id, 
                         selected_sub_topics,
-                        metadata_filters
+                        metadata_filters,
+                        include_undated
                     )
                 except Exception as e:
                     log.error(f"[{task_id}] Retry infrastructure failed: {e}", exc_info=True)
@@ -1248,7 +1309,7 @@ def process_rag_query(self, query, history, topic_id, selected_sub_topics=None, 
     # CACHE SAVING & RETURN
     # ==========================================================
     try:
-        # Evitiamo di cacchare risposte troppo brevi o palesemente vuote
+        # Evitiamo di mettere in cache risposte troppo brevi o palesemente vuote
         if answer and is_satisfactory and len(answer) > 20:
             save_to_semantic_cache(
                 primary_vector, 

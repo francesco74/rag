@@ -161,6 +161,35 @@ class AppTranslations {
       AppLang.en: "Send your question to the chatbot",
     },
 
+    'date_filter_title': {
+      AppLang.it: "Filtro per data",
+      AppLang.en: "Date Filter",
+    },
+    'date_from': {
+      AppLang.it: "Data da",
+      AppLang.en: "Date from",
+    },
+    'date_to': {
+      AppLang.it: "Data a",
+      AppLang.en: "Date to",
+    },
+    'clear_date_filter': {
+      AppLang.it: "Cancella filtro data",
+      AppLang.en: "Clear date filter",
+    },
+    'include_undated_docs': {
+      AppLang.it: "Includi documenti senza data",
+      AppLang.en: "Include undated documents",
+    },
+    'subtopic_stat_with_year': {
+      AppLang.it: "{desc}: {count} documenti, a partire dal {year}",
+      AppLang.en: "{desc}: {count} documents, since {year}",
+    },
+    'subtopic_stat_no_year': {
+      AppLang.it: "{desc}: {count} documenti",
+      AppLang.en: "{desc}: {count} documents",
+    },
+
   };
 
   /// Helper function to grab the correct string based on the current language

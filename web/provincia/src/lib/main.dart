@@ -220,9 +220,14 @@ class _ChatScreenState extends State<ChatScreen> {
   List<TargetFocus> _targets = [];
 
   Map<String, String> _subTopicDescriptions = {};
+  Map<String, Map<String, dynamic>> _subTopicStats = {};
   List<String> _availableSubTopicIds = [];
   Set<String> _selectedSubTopics = {};
   bool _allowSubtopicSelection = false;
+  bool _allowDateFilter = false;
+  DateTime? _dateFrom;
+  DateTime? _dateTo;
+  bool _includeUndatedDocs = true;
 
   // --- STATO PER PROGRESSIVE DELAY ---
   Timer? _longWaitTimer;
@@ -370,12 +375,20 @@ class _ChatScreenState extends State<ChatScreen> {
 
         setState(() {
           _allowSubtopicSelection = data['allow_subtopic_selection'] ?? false;
+          _allowDateFilter = data['allow_date_filter'] ?? false;
           _availableSubTopicIds = rawSubTopics
               .map((item) => item['id'].toString())
               .toList();
           _subTopicDescriptions = {
             for (var item in rawSubTopics)
               item['id'].toString(): item['desc'].toString(),
+          };
+          _subTopicStats = {
+            for (var item in rawSubTopics)
+              item['id'].toString(): {
+                "doc_count": item['doc_count'] ?? 0,
+                "since_year": item['since_year'],
+              },
           };
 
           _selectedSubTopics = _availableSubTopicIds.toSet();
@@ -496,6 +509,47 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
+  /// Escapes basic HTML-sensitive characters coming from DB-sourced text
+  /// (subtopic descriptions), since they get interpolated into raw HTML.
+  String _escapeHtml(String text) {
+    return text
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;');
+  }
+
+  /// Builds the "<desc>: <count> documenti, a partire dal <year>" list,
+  /// as an HTML fragment (one line per <br/>), from the live subtopic stats.
+  /// Used to replace the {{SUBTOPIC_LIST}} placeholder inside the static
+  /// welcome_it.html / welcome_en.html files.
+  String _buildSubtopicListHtml() {
+    if (_availableSubTopicIds.isEmpty) return '';
+
+    final entries = _availableSubTopicIds.where((id) {
+      final stats = _subTopicStats[id];
+      return stats != null && (stats['doc_count'] ?? 0) > 0;
+    }).toList();
+
+    if (entries.isEmpty) return '';
+
+    return entries.map((id) {
+      final desc = _escapeHtml(_subTopicDescriptions[id] ?? id);
+      final count = _subTopicStats[id]!['doc_count'] ?? 0;
+      final sinceYear = _subTopicStats[id]!['since_year'];
+
+      final label = sinceYear != null
+          ? AppTranslations.get('subtopic_stat_with_year', langNotifier.value)
+              .replaceAll('{desc}', desc)
+              .replaceAll('{count}', count.toString())
+              .replaceAll('{year}', sinceYear.toString())
+          : AppTranslations.get('subtopic_stat_no_year', langNotifier.value)
+              .replaceAll('{desc}', desc)
+              .replaceAll('{count}', count.toString());
+
+      return '$label<br />';
+    }).join('\n            ');
+  }
+
   /// Builds the static project information header at the top of the chat
   Widget _buildProjectInfoHeader() {
     final theme = Theme.of(context);
@@ -531,8 +585,14 @@ class _ChatScreenState extends State<ChatScreen> {
             );
           }
 
+          final rawHtml = snapshot.data ?? '';
+          final htmlWithSubtopics = rawHtml.replaceAll(
+            '{{SUBTOPIC_LIST}}',
+            _buildSubtopicListHtml(),
+          );
+
           return Html(
-            data: snapshot.data,
+            data: htmlWithSubtopics,
             extensions: [
               TagExtension(
                 tagsToExtend: {"a"},
@@ -779,6 +839,10 @@ class _ChatScreenState extends State<ChatScreen> {
               "query": lastQuery,
               "sub_topics": _selectedSubTopics.toList(),
               "topic_id": AppSettings.getTopicId,
+              if (_dateFrom != null) "date_from": _formatDate(_dateFrom!),
+              if (_dateTo != null) "date_to": _formatDate(_dateTo!),
+              if (_dateFrom != null || _dateTo != null)
+                "include_undated": _includeUndatedDocs,
             }),
           )
           .timeout(const Duration(seconds: 10));
@@ -964,9 +1028,17 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
+  String _formatDate(DateTime d) {
+    // "YYYY-MM-DD" — deve combaciare col formato atteso dal backend
+    final mm = d.month.toString().padLeft(2, '0');
+    final dd = d.day.toString().padLeft(2, '0');
+    return "${d.year}-$mm-$dd";
+  }
+
   void _showSubTopicSelector() {
     showModalBottomSheet(
       context: context,
+      isScrollControlled: true,
       builder: (context) {
         return StatefulBuilder(
           builder: (context, setModalState) {
@@ -975,35 +1047,128 @@ class _ChatScreenState extends State<ChatScreen> {
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  Text(
-                    AppTranslations.get('subtopics_title', langNotifier.value),
-                    style: Theme.of(context).textTheme.titleLarge,
-                  ),
-                  const Divider(),
-                  Expanded(
-                    child: ListView(
-                      children: _availableSubTopicIds.map((id) {
-                        return CheckboxListTile(
-                          title: Text(_subTopicDescriptions[id] ?? id),
-                          subtitle: Text(
-                            id,
-                            style: const TextStyle(fontSize: 10),
-                          ),
-                          value: _selectedSubTopics.contains(id),
-                          onChanged: (bool? value) {
-                            setState(() {
-                              if (value == true) {
-                                _selectedSubTopics.add(id);
-                              } else {
-                                _selectedSubTopics.remove(id);
-                              }
-                            });
-                            setModalState(() {});
-                          },
-                        );
-                      }).toList(),
+                  if (_allowSubtopicSelection && _availableSubTopicIds.isNotEmpty) ...[
+                    Text(
+                      AppTranslations.get('subtopics_title', langNotifier.value),
+                      style: Theme.of(context).textTheme.titleLarge,
                     ),
-                  ),
+                    const Divider(),
+                    ConstrainedBox(
+                      constraints: const BoxConstraints(maxHeight: 300),
+                      child: ListView(
+                        shrinkWrap: true,
+                        children: _availableSubTopicIds.map((id) {
+                          return CheckboxListTile(
+                            title: Text(_subTopicDescriptions[id] ?? id),
+                            subtitle: Text(
+                              id,
+                              style: const TextStyle(fontSize: 10),
+                            ),
+                            value: _selectedSubTopics.contains(id),
+                            onChanged: (bool? value) {
+                              setState(() {
+                                if (value == true) {
+                                  _selectedSubTopics.add(id);
+                                } else {
+                                  _selectedSubTopics.remove(id);
+                                }
+                              });
+                              setModalState(() {});
+                            },
+                          );
+                        }).toList(),
+                      ),
+                    ),
+                    const Divider(),
+                  ],
+
+                  // --- Filtro range temporale (opzionale) ---
+                  if (_allowDateFilter) ...[
+                    Text(
+                      AppTranslations.get('date_filter_title', langNotifier.value),
+                      style: Theme.of(context).textTheme.titleMedium,
+                    ),
+                    const SizedBox(height: 8.0),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: OutlinedButton(
+                            onPressed: () async {
+                              final picked = await showDatePicker(
+                                context: context,
+                                initialDate: _dateFrom ?? DateTime.now(),
+                                firstDate: DateTime(2000),
+                                lastDate: DateTime.now(),
+                              );
+                              if (picked != null) {
+                                setState(() => _dateFrom = picked);
+                                setModalState(() {});
+                              }
+                            },
+                            child: Text(
+                              _dateFrom == null
+                                  ? AppTranslations.get('date_from', langNotifier.value)
+                                  : _formatDate(_dateFrom!),
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 8.0),
+                        Expanded(
+                          child: OutlinedButton(
+                            onPressed: () async {
+                              final picked = await showDatePicker(
+                                context: context,
+                                initialDate: _dateTo ?? DateTime.now(),
+                                firstDate: DateTime(2000),
+                                lastDate: DateTime.now(),
+                              );
+                              if (picked != null) {
+                                setState(() => _dateTo = picked);
+                                setModalState(() {});
+                              }
+                            },
+                            child: Text(
+                              _dateTo == null
+                                  ? AppTranslations.get('date_to', langNotifier.value)
+                                  : _formatDate(_dateTo!),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                    if (_dateFrom != null || _dateTo != null) ...[
+                      CheckboxListTile(
+                        contentPadding: EdgeInsets.zero,
+                        controlAffinity: ListTileControlAffinity.leading,
+                        dense: true,
+                        title: Text(
+                          AppTranslations.get('include_undated_docs', langNotifier.value),
+                          style: Theme.of(context).textTheme.bodyMedium,
+                        ),
+                        value: _includeUndatedDocs,
+                        onChanged: (bool? value) {
+                          setState(() {
+                            _includeUndatedDocs = value ?? true;
+                          });
+                          setModalState(() {});
+                        },
+                      ),
+                      TextButton.icon(
+                        onPressed: () {
+                          setState(() {
+                            _dateFrom = null;
+                            _dateTo = null;
+                            _includeUndatedDocs = true;
+                          });
+                          setModalState(() {});
+                        },
+                        icon: const Icon(Icons.clear, size: 18),
+                        label: Text(
+                          AppTranslations.get('clear_date_filter', langNotifier.value),
+                        ),
+                      ),
+                    ],
+                  ],
                 ],
               ),
             );
@@ -1027,7 +1192,8 @@ class _ChatScreenState extends State<ChatScreen> {
       appBar: AppBar(
         title: Text(AppSettings.projectName),
         actions: [
-          if (_allowSubtopicSelection && _availableSubTopicIds.isNotEmpty)
+          if ((_allowSubtopicSelection && _availableSubTopicIds.isNotEmpty) ||
+              _allowDateFilter)
             IconButton(
               key: _filterKey,
               icon: const Icon(Icons.filter_list),

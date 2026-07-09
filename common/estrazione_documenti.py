@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import time
 import xml.etree.ElementTree as ET
 from typing import Tuple, Dict, Any, Iterator
 import requests
@@ -17,12 +18,38 @@ class WSAttiSoapClient:
     SOAPENV_NS = "http://schemas.xmlsoap.org/soap/envelope/"
     TEM_NS = "http://tempuri.org/"
 
-    def __init__(self, endpoint_url: str, username: str, timeout: int = 300, verify_tls: bool = True):
+    def __init__(
+        self,
+        endpoint_url: str,
+        username: str,
+        timeout: int = 300,
+        verify_tls: bool = True,
+        min_interval_seconds: float = 0.0,
+    ):
         self.endpoint_url = endpoint_url
         self.username = username  # La tua logica originale
         self.timeout = timeout
         self.verify_tls = verify_tls
         self.session = requests.Session()
+        # Pausa minima (in secondi) tra due chiamate SOAP consecutive verso
+        # Sicr@Web, per non sovraccaricare il gestionale. 0 = nessun limite
+        # (comportamento precedente). Applicata in _post_soap, quindi vale
+        # per QUALSIASI chiamata fatta con questo client (LeggiAttoPlus e
+        # future estensioni), non solo per singole call site.
+        self.min_interval_seconds = min_interval_seconds
+        self._last_call_monotonic = None
+
+    def _throttle(self):
+        if self.min_interval_seconds <= 0:
+            return
+        now = time.monotonic()
+        if self._last_call_monotonic is not None:
+            elapsed = now - self._last_call_monotonic
+            wait = self.min_interval_seconds - elapsed
+            if wait > 0:
+                log.debug("Throttling chiamata SOAP: attesa %.2fs", wait)
+                time.sleep(wait)
+        self._last_call_monotonic = time.monotonic()
 
     def __enter__(self) -> WSAttiSoapClient:
         return self
@@ -49,6 +76,7 @@ class WSAttiSoapClient:
 """
 
     def _post_soap(self, soap_xml: str) -> str:
+        self._throttle()
         resp = self.session.post(
             self.endpoint_url,
             data=soap_xml.encode("utf-8"),
@@ -94,9 +122,20 @@ class WSAttiSoapClient:
             raise RuntimeError(f"WSAttiSoap Errore Applicativo: {errore.strip()}")
 
         oggetto = inner_tree.findtext(".//Oggetto") or ""
+        # Classifica / Classifica_Descrizione vivono a livello <AttoOut>,
+        # non dentro <Determina>/<Delibera> (vedi XML reale fornito dal cliente).
+        classifica = inner_tree.findtext(".//Classifica") or ""
+        classifica_descrizione = inner_tree.findtext(".//Classifica_Descrizione") or ""
+
         numero_atto = ""
         data_atto = ""
         anno_atto = ""
+        data_esecutivita = ""
+        data_pubblicazione = ""
+        giorni_pubblicazione = ""
+        trattamento_descrizione = ""
+        proponente_descrizione = ""
+        dirigente_descrizione = ""
 
         atto_el = inner_tree.find(".//Determina") or inner_tree.find(".//Delibera")
         if atto_el is not None:
@@ -108,6 +147,17 @@ class WSAttiSoapClient:
             # ricerca (RicercaDocumentiString), che per alcuni atti reali può
             # mancare del tutto (vedi decreto presidenziale 1/2024, UID 2119188).
             anno_atto = atto_el.findtext(".//Anno") or ""
+            # NB: DataEsecutivita può valere la sentinella Sicr@Web
+            # "0001-01-01T00:00:00Z" quando l'atto non è (ancora) esecutivo:
+            # NON è una data reale. La normalizzazione/scarto di questo valore
+            # è responsabilità di clean_iso_date() lato estrattore.py, qui
+            # restituiamo il dato grezzo così com'è.
+            data_esecutivita = atto_el.findtext(".//DataEsecutivita") or ""
+            data_pubblicazione = atto_el.findtext(".//DataPubblicazione") or ""
+            giorni_pubblicazione = atto_el.findtext(".//GiorniPubblicazione") or ""
+            trattamento_descrizione = atto_el.findtext(".//Trattamento_Descrizione") or ""
+            proponente_descrizione = atto_el.findtext(".//Proponente_Descrizione") or ""
+            dirigente_descrizione = atto_el.findtext(".//Dirigente_Descrizione") or ""
 
         # id_tipo_iter: CONFERMATO dal cliente essere il campo che distingue
         # realmente il sotto-tipo dell'atto (deliberativo vs presidenziale),
@@ -131,9 +181,17 @@ class WSAttiSoapClient:
 
         attributes = {
             "oggetto": oggetto,
+            "classifica": classifica,
+            "classifica_descrizione": classifica_descrizione,
             "numero_atto": numero_atto,
             "data_atto": data_atto,
             "anno_atto": anno_atto,
+            "data_esecutivita": data_esecutivita,
+            "data_pubblicazione": data_pubblicazione,
+            "giorni_pubblicazione": giorni_pubblicazione,
+            "trattamento_descrizione": trattamento_descrizione,
+            "proponente_descrizione": proponente_descrizione,
+            "dirigente_descrizione": dirigente_descrizione,
             "id_tipo_iter": id_tipo_iter,
         }
 
@@ -155,9 +213,16 @@ class WSAttiSoapClient:
         return estrai_allegati(), attributes
 
 def build_client_from_env() -> WSAttiSoapClient:
+    # getattr con default: funziona anche se non hai ancora aggiunto il
+    # campo a common/config.py. Consigliato aggiungerlo lì come impostazione
+    # vera e propria (es. SICRAWEB_MIN_INTERVAL_SECONDS via env), così è
+    # configurabile senza toccare il codice. Default prudente: 1.5s tra una
+    # chiamata LeggiAttoPlus e la successiva.
+    min_interval = getattr(settings, "sicraweb_min_interval_seconds", 1.5)
     return WSAttiSoapClient(
         endpoint_url=settings.docws_atti_endpoint,
         username=settings.ws_username,
         timeout=settings.http_timeout_seconds,
         verify_tls=settings.verify_tls,
+        min_interval_seconds=min_interval,
     )

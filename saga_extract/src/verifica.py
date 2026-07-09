@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+import re
 import logging
 import argparse
 import asyncio
@@ -17,8 +18,35 @@ from common.estrazione_documenti import build_client_from_env
 from qdrant_client import AsyncQdrantClient
 from qdrant_client import models
 
+from common.utility import clean_iso_date
+
 QDRANT_COLLECTION = "document_chunks"
 ESTENSIONI_CONSENTITE = {".pdf", ".p7m"}
+
+def build_fresh_metadata(dati: dict) -> dict:
+    """
+    Ricostruisce, a partire dai dati freschi restituiti da leggi_atto_plus(),
+    SOLO le chiavi "di contenuto" del blocco metadati (non id_sicraweb né
+    percorso_originale, che non cambiano nel tempo e non vengono toccate
+    dall'update "solo metadati"). Usata sia per l'update MySQL (via
+    JSON_SET, che tocca solo queste chiavi) sia per l'update Qdrant (via
+    set_payload, che fa merge parziale by design).
+    """
+    return {
+        "oggetto": dati.get("oggetto"),
+        "classifica": dati.get("classifica"),
+        "classifica_descrizione": dati.get("classifica_descrizione"),
+        "trattamento_descrizione": dati.get("trattamento_descrizione"),
+        "proponente_descrizione": dati.get("proponente_descrizione"),
+        "dirigente_descrizione": dati.get("dirigente_descrizione"),
+        "data": clean_iso_date(dati.get("data_atto")),
+        "anno": dati.get("anno_atto"),
+        "numero": dati.get("numero_atto"),
+        "data_esecutivita": clean_iso_date(dati.get("data_esecutivita")),
+        "data_pubblicazione": clean_iso_date(dati.get("data_pubblicazione")),
+        "giorni_pubblicazione": dati.get("giorni_pubblicazione"),
+        "id_tipo_iter": dati.get("id_tipo_iter"),
+    }
 
 log_level_str = settings.log_level
 log_level = getattr(logging, log_level_str, logging.INFO)
@@ -100,15 +128,25 @@ def get_expected_files_from_lista_allegati(uid: str, lista_allegati_raw: list) -
 def get_dati_atto_da_leggi_atto_plus(repwss_client, uid: str) -> Optional[dict]:
     """
     Chiama leggi_atto_plus(uid) UNA SOLA VOLTA per UID e restituisce sia gli
-    allegati (già materializzati) sia gli attributi discriminanti
-    (numero_atto, anno_atto, id_tipo_iter, oggetto), così lo stesso risultato
+    allegati (già materializzati) sia TUTTI gli attributi disponibili
+    (numero_atto, anno_atto, id_tipo_iter, oggetto, classifica,
+    classifica_descrizione, data_atto, data_esecutivita,
+    data_pubblicazione, giorni_pubblicazione, trattamento_descrizione,
+    proponente_descrizione, dirigente_descrizione), così lo stesso risultato
     viene riusato più avanti sia per la verifica sotto-tipo/anno/definitività
-    sia per il calcolo dei file attesi, invece di richiamare leggi_atto_plus
-    due volte per lo stesso UID (comportamento precedente).
+    sia per il calcolo dei file attesi sia per il recovery (che ora porta con
+    sé anche i metadati completi, invece di scartarli), evitando di
+    richiamare leggi_atto_plus due volte per lo stesso UID.
 
     numero_atto: "0" (con data_atto sentinella "0001-01-01...") indica una
     mera proposta non ancora protocollata; qualunque altro valore indica un
     atto realmente protocollato (CONFERMATO su UID 2119188: numero_atto="1").
+
+    Le date NON sono normalizzate qui: sono i valori grezzi restituiti da
+    Sicr@Web. La normalizzazione avviene in un unico punto centrale,
+    elabora_atto() in estrattore.py, tramite clean_iso_date() — mantenuta
+    identica a quella usata lì per garantire lo stesso comportamento sia
+    che l'atto arrivi dalla modalità ricerca sia dal recovery.
 
     Restituisce None in caso di errore nella chiamata (loggato).
     """
@@ -122,23 +160,31 @@ def get_dati_atto_da_leggi_atto_plus(repwss_client, uid: str) -> Optional[dict]:
         return None
 
     attributi_plus = attributi_plus or {}
-    if isinstance(attributi_plus, dict):
-        numero_atto = attributi_plus.get("numero_atto")
-        anno_atto = attributi_plus.get("anno_atto")
-        id_tipo_iter = attributi_plus.get("id_tipo_iter")
-        oggetto = attributi_plus.get("oggetto")
-    else:
-        numero_atto = getattr(attributi_plus, "numero_atto", None)
-        anno_atto = getattr(attributi_plus, "anno_atto", None)
-        id_tipo_iter = getattr(attributi_plus, "id_tipo_iter", None)
-        oggetto = getattr(attributi_plus, "oggetto", None)
+
+    def _get(nome):
+        if isinstance(attributi_plus, dict):
+            return attributi_plus.get(nome)
+        return getattr(attributi_plus, nome, None)
+
+    def _get_str(nome):
+        val = _get(nome)
+        return str(val).strip() if val is not None else None
 
     return {
         "allegati": lista_allegati_raw,
-        "numero_atto": str(numero_atto).strip() if numero_atto is not None else None,
-        "anno_atto": str(anno_atto).strip() if anno_atto else None,
-        "id_tipo_iter": str(id_tipo_iter).strip() if id_tipo_iter is not None else None,
-        "oggetto": oggetto,
+        "numero_atto": _get_str("numero_atto"),
+        "anno_atto": _get_str("anno_atto"),
+        "id_tipo_iter": _get_str("id_tipo_iter"),
+        "oggetto": _get("oggetto"),
+        "classifica": _get("classifica"),
+        "classifica_descrizione": _get("classifica_descrizione"),
+        "data_atto": _get("data_atto"),
+        "data_esecutivita": _get("data_esecutivita"),
+        "data_pubblicazione": _get("data_pubblicazione"),
+        "giorni_pubblicazione": _get("giorni_pubblicazione"),
+        "trattamento_descrizione": _get("trattamento_descrizione"),
+        "proponente_descrizione": _get("proponente_descrizione"),
+        "dirigente_descrizione": _get("dirigente_descrizione"),
     }
 
 
@@ -157,6 +203,78 @@ def check_mysql_file_presence(source: str, file_name: str) -> int:
             return res[0] if res else 0
     finally:
         conn.close()
+
+
+def update_mysql_metadata(source: str, fresh_metadata: dict) -> int:
+    """
+    Aggiorna SOLO le chiavi presenti in fresh_metadata dentro la colonna JSON
+    'metadata' su parent_documents (via JSON_SET: le chiavi non elencate,
+    es. id_sicraweb/percorso_originale, restano invariate). NON tocca
+    'content' né alcun embedding/vettore — nessuna re-ingestion.
+
+    Restituisce il numero di righe MySQL effettivamente aggiornate.
+    """
+    conn = get_db_connection()
+    if not conn:
+        raise ConnectionError("Database MySQL non raggiungibile.")
+    try:
+        set_clauses = ", ".join(f"'$.{k}', %s" for k in fresh_metadata)
+        values = list(fresh_metadata.values()) + [source]
+        with conn.cursor() as cursor:
+            cursor.execute(
+                f"UPDATE parent_documents SET metadata = JSON_SET(metadata, {set_clauses}) WHERE source = %s",
+                values
+            )
+            conn.commit()
+            return cursor.rowcount
+    finally:
+        conn.close()
+
+
+async def _qdrant_call_with_retry(coro_factory, description: str, retries: int = 3, base_delay: float = 3.0):
+    """
+    Esegue una chiamata Qdrant con retry ed exponential backoff su timeout/errori
+    di rete transitori — comuni quando il server è sotto carico (scritture
+    massive di metadati, come in --update-metadata-only).
+    """
+    last_exc = None
+    for attempt in range(1, retries + 1):
+        try:
+            return await coro_factory()
+        except Exception as e:
+            last_exc = e
+            if attempt < retries:
+                wait = base_delay * (2 ** (attempt - 1))
+                log.warning(f"{description}: tentativo {attempt}/{retries} fallito ({e}); ritento tra {wait:.0f}s...")
+                await asyncio.sleep(wait)
+            else:
+                log.error(f"{description}: falliti tutti i {retries} tentativi: {e}")
+    raise last_exc
+
+
+async def update_qdrant_metadata_batch(qdrant_client: AsyncQdrantClient, sources: list, fresh_metadata: dict) -> None:
+    """
+    Aggiorna SOLO il payload dei punti Qdrant il cui 'source' è in `sources`
+    (set_payload fa merge parziale: le chiavi non elencate in fresh_metadata,
+    es. topic_id/sub_topic_id/content_hash, restano invariate). NON tocca
+    vettori né content — nessuna re-ingestion, nessun nuovo embedding.
+
+    Un'UNICA chiamata per tutti gli allegati dello stesso atto (via MatchAny),
+    invece di una per allegato: riduce il numero di round-trip verso Qdrant,
+    che sotto carico è la causa più probabile dei timeout osservati.
+    """
+    if not sources:
+        return
+    await _qdrant_call_with_retry(
+        lambda: qdrant_client.set_payload(
+            collection_name=QDRANT_COLLECTION,
+            payload=fresh_metadata,
+            points=models.Filter(
+                must=[models.FieldCondition(key="source", match=models.MatchAny(any=sources))]
+            ),
+        ),
+        description=f"set_payload batch ({len(sources)} source)",
+    )
 
 # Aggiorna queste due funzioni dentro verifica.py:
 
@@ -199,7 +317,7 @@ async def retrigger_extraction(uid: str, tipo_atto: str, meta_atto: dict):
 
         
 
-async def verify_pipeline(json_filters_str: str, auto_recover: bool):
+async def verify_pipeline(json_filters_str: str, auto_recover: bool, update_metadata_only: bool = False, sicraweb_delay: float = None):
     init_db_pool()
     filtri_list, tipo_atto, anno_atto_richiesto = parse_filters(json_filters_str)
 
@@ -233,6 +351,8 @@ async def verify_pipeline(json_filters_str: str, auto_recover: bool):
 
     try:
         repwss_client = build_client_from_env()
+        if sicraweb_delay is not None:
+            repwss_client.min_interval_seconds = sicraweb_delay
     except Exception as e:
         log.error(f"Impossibile istanziare il client Sicr@Web: {e}")
         return
@@ -244,7 +364,13 @@ async def verify_pipeline(json_filters_str: str, auto_recover: bool):
     dati_atti: dict = {}
 
     for uid_str in uids_prima:
-        dati = get_dati_atto_da_leggi_atto_plus(repwss_client, uid_str)
+        # Offload su thread: get_dati_atto_da_leggi_atto_plus è sincrona/bloccante
+        # (requests + il nuovo time.sleep() di throttling). Chiamarla direttamente
+        # dentro questa coroutine blocca l'intero event loop, e con il throttling
+        # ora attivo il blocco può durare secondi consecutivi per centinaia di UID:
+        # rischia di far scadere le connessioni HTTP mantenute aperte da
+        # AsyncQdrantClient più avanti, causando errori di lettura risposta.
+        dati = await asyncio.to_thread(get_dati_atto_da_leggi_atto_plus, repwss_client, uid_str)
         if dati is None:
             log.warning(f"UID {uid_str}: escluso, errore durante leggi_atto_plus.")
             continue
@@ -278,10 +404,17 @@ async def verify_pipeline(json_filters_str: str, auto_recover: bool):
     uids = ids_totali
     log.info(f"Trovati {len(uids)} atti su Sicr@Web (dopo aver unito {len(filtri_list)} ricerche e verificato via LeggiAttoPlus). Inizio controlli puntuali allegati...")
 
-    qdrant_client = AsyncQdrantClient(host=settings.qdrant_host, port=settings.qdrant_port, timeout=20.0)
+    # Timeout più permissivo del default precedente (20s): sotto scritture
+    # massive di metadati il server può rispondere più lentamente. Configurabile
+    # via settings.qdrant_client_timeout_seconds se lo aggiungi al config.
+    qdrant_timeout = getattr(settings, "qdrant_client_timeout_seconds", 60.0)
+    qdrant_client = AsyncQdrantClient(host=settings.qdrant_host, port=settings.qdrant_port, timeout=qdrant_timeout)
 
     print("\n" + "="*128)
-    print(f"{'UID':<10} | {'NUMERO':<10} | {'FILE ALLEGATO ATTESO':<48} | {'MYSQL (PARENTS)':<15} | {'QDRANT (CHUNKS)':<15} | {'STATO'}")
+    if update_metadata_only:
+        print(f"{'UID':<10} | {'NUMERO':<10} | {'FILE ALLEGATO ATTESO':<48} | {'MYSQL':<15} | {'QDRANT':<15} | {'STATO'}")
+    else:
+        print(f"{'UID':<10} | {'NUMERO':<10} | {'FILE ALLEGATO ATTESO':<48} | {'MYSQL (PARENTS)':<15} | {'QDRANT (CHUNKS)':<15} | {'STATO'}")
     print("="*128)
 
     for uid in uids:
@@ -297,6 +430,8 @@ async def verify_pipeline(json_filters_str: str, auto_recover: bool):
             continue
 
         needs_recovery = False
+        fresh_metadata = build_fresh_metadata(dati) if update_metadata_only else None
+        sources_da_aggiornare_qdrant = []  # popolato solo in update_metadata_only
 
         for safe_name in expected_files:
             target_source = f"sicraweb://{uid}::{safe_name}"
@@ -304,15 +439,40 @@ async def verify_pipeline(json_filters_str: str, auto_recover: bool):
             mysql_count = check_mysql_file_presence(target_source, safe_name)
             
             try:
-                qdrant_res = await qdrant_client.count(
-                    collection_name=QDRANT_COLLECTION,
-                    count_filter=models.Filter(
-                        must=[models.FieldCondition(key="source", match=models.MatchValue(value=target_source))]
-                    )
+                qdrant_res = await _qdrant_call_with_retry(
+                    lambda: qdrant_client.count(
+                        collection_name=QDRANT_COLLECTION,
+                        count_filter=models.Filter(
+                            must=[models.FieldCondition(key="source", match=models.MatchValue(value=target_source))]
+                        )
+                    ),
+                    description=f"count({target_source})",
                 )
                 qdrant_count = qdrant_res.count
             except Exception:
                 qdrant_count = "ERR_QDRANT"
+
+            if update_metadata_only:
+                # Aggiorna SOLO i metadati dove il documento esiste già.
+                # Non tocca content/vettori, non fa alcuna re-ingestion, non
+                # crea nulla di nuovo dove manca (per quello serve --recover).
+                # L'update Qdrant vero e proprio è differito a DOPO questo
+                # loop (una sola chiamata batch per tutti gli allegati
+                # dell'atto, invece di una per allegato — vedi più sotto).
+                mysql_updated = 0
+                if mysql_count > 0:
+                    mysql_updated = update_mysql_metadata(target_source, fresh_metadata)
+                if isinstance(qdrant_count, int) and qdrant_count > 0:
+                    sources_da_aggiornare_qdrant.append(target_source)
+
+                if mysql_updated or (isinstance(qdrant_count, int) and qdrant_count > 0):
+                    stato = f"METADATA DA AGGIORNARE (mysql:{mysql_updated} righe, qdrant:{qdrant_count if isinstance(qdrant_count, int) else 0} chunk)"
+                else:
+                    stato = "SKIP (non presente né in MySQL né in Qdrant)"
+
+                display_name = safe_name if len(safe_name) <= 46 else f"...{safe_name[-43:]}"
+                print(f"{uid:<10} | {display_num:<10} | {display_name:<48} | {mysql_count:<15} | {qdrant_count:<15} | {stato}")
+                continue
 
             if mysql_count == 0 and qdrant_count == 0:
                 stato = "MISSING ENTIRELY"
@@ -329,6 +489,19 @@ async def verify_pipeline(json_filters_str: str, auto_recover: bool):
             display_name = safe_name if len(safe_name) <= 46 else f"...{safe_name[-43:]}"
             print(f"{uid:<10} | {display_num:<10} | {display_name:<48} | {mysql_count:<15} | {qdrant_count:<15} | {stato}")
 
+        if update_metadata_only:
+            # Un'unica chiamata Qdrant per TUTTI gli allegati di questo atto
+            # (MatchAny sui source raccolti sopra), invece di una per allegato.
+            if sources_da_aggiornare_qdrant:
+                try:
+                    await update_qdrant_metadata_batch(qdrant_client, sources_da_aggiornare_qdrant, fresh_metadata)
+                    print(f"    [✓] Qdrant aggiornato per {len(sources_da_aggiornare_qdrant)} source (UID {uid}).")
+                except Exception as e:
+                    print(f"    [✗] Aggiornamento Qdrant fallito per UID {uid} dopo i retry: {e}")
+            # Modalità "solo metadati": mai recovery/re-ingestion, qualunque
+            # sia lo stato dei file.
+            continue
+
         if needs_recovery:
             if auto_recover:
                 meta_atto_recovery = {
@@ -336,6 +509,15 @@ async def verify_pipeline(json_filters_str: str, auto_recover: bool):
                     "anno": dati.get("anno_atto"),
                     "oggetto": dati.get("oggetto"),
                     "id_tipo_iter": dati.get("id_tipo_iter"),
+                    "classifica": dati.get("classifica"),
+                    "classifica_descrizione": dati.get("classifica_descrizione"),
+                    "data": dati.get("data_atto"),
+                    "data_esecutivita": dati.get("data_esecutivita"),
+                    "data_pubblicazione": dati.get("data_pubblicazione"),
+                    "giorni_pubblicazione": dati.get("giorni_pubblicazione"),
+                    "trattamento_descrizione": dati.get("trattamento_descrizione"),
+                    "proponente_descrizione": dati.get("proponente_descrizione"),
+                    "dirigente_descrizione": dati.get("dirigente_descrizione"),
                 }
                 await retrigger_extraction(uid, tipo_atto, meta_atto_recovery)
             else:
@@ -348,9 +530,27 @@ def main():
     parser = argparse.ArgumentParser(description="Verificatore Pipeline Documentale con Auto-Recovery")
     parser.add_argument("--json-filters", type=str, required=True, help="Filtri JSON di ricerca.")
     parser.add_argument("--recover", action="store_true", help="Lancia estrattore.py per tentare il recupero dei file mancanti.")
+    parser.add_argument(
+        "--update-metadata-only",
+        action="store_true",
+        help=(
+            "Aggiorna SOLO i metadati (MySQL 'metadata' + payload Qdrant) dei documenti "
+            "già presenti, richiamando leggi_atto_plus() per dati freschi. Non tocca "
+            "content/vettori, non fa alcuna re-ingestion. Ignora --recover."
+        ),
+    )
+    parser.add_argument(
+        "--sicraweb-delay",
+        type=float,
+        default=None,
+        help="Pausa minima in secondi tra due chiamate LeggiAttoPlus consecutive (sovrascrive il default/config).",
+    )
     args = parser.parse_args()
-    
-    asyncio.run(verify_pipeline(args.json_filters, args.recover))
+
+    if args.update_metadata_only and args.recover:
+        log.warning("--recover ignorato: --update-metadata-only non fa mai recovery/re-ingestion.")
+
+    asyncio.run(verify_pipeline(args.json_filters, args.recover, args.update_metadata_only, args.sicraweb_delay))
 
 if __name__ == "__main__":
     main()

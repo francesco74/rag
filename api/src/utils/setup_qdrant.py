@@ -64,6 +64,11 @@ async def setup_infrastructure():
             "content": models.TextIndexParams(
                 type="text", tokenizer=models.TokenizerType.WORD, min_token_len=2, max_token_len=20, lowercase=True
             ),
+            # Campi data usati per il filtro range temporale opzionale in chat.
+            # Sono stringhe "YYYY-MM-DD" (vedi estrattore.py: clean_iso_date()),
+            # quindi vanno indicizzate come DATETIME per usare models.DatetimeRange
+            # in worker.py (retrieve_chunks) in modo efficiente e validato.
+            "data": models.PayloadSchemaType.DATETIME,
         }
 
         for field, schema in indexes_chunks.items():

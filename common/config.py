@@ -64,6 +64,7 @@ class Settings:
     qdrant_port: int
 
     allow_subtopic_selection: bool
+    allow_date_filter: bool
 
     allowed_origins: list[str]
 
@@ -101,12 +102,11 @@ class Settings:
 
     max_reranker_thread: int
     reranker_pool_size: int
+    max_allowed_pages: int
 
     id_tipo_iter_atteso: dict[str, set[str]]
 
-    answer_thinking_level: str = None
-
-    max_allowed_pages: int = 300
+    answer_thinking_level: str
 
 
 def load_settings() -> Settings:
@@ -205,6 +205,8 @@ def load_settings() -> Settings:
         },
 
         max_allowed_pages = int(os.environ.get("MAX_ALLOWED_PAGES") or 300),
+
+        allow_date_filter=_parse_bool(os.environ.get("ALLOW_DATE_FILTER"), default=True),
     )
 
 settings = load_settings()

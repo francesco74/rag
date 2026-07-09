@@ -13,7 +13,7 @@ However, you are authorized to use external knowledge to fill in gaps regarding 
 
 CONTEXT STRUCTURE:
 The <context> is composed of multiple chunks. Each chunk begins with a header in the format: 
-"[Source: filename]" 
+"[Source: filename | Date: date ]"  
 followed by the text content from that file.
 
 CITATION RULE:

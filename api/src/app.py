@@ -1,6 +1,7 @@
 import logging
 import uuid
 import time
+from datetime import datetime
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from celery import Celery
@@ -113,14 +114,50 @@ def get_config():
         
         cursor.execute("SELECT sub_topic_id, description FROM sub_topics WHERE topic_id = %s", (topic_id,))
         rows = cursor.fetchall()
-        
+
+        # Conteggio documenti e anno più vecchio per sub_topic, per mostrare
+        # nel frontend qualcosa tipo "Determine presenti nel sistema: 1834
+        # a partire dal 2015".
+        # Usiamo il campo "anno" del JSON di metadata (es. "2025") invece di
+        # "data": quest'ultimo è salvato in formato italiano "DD/MM/YYYY"
+        # (es. "26/11/2025"), non ISO, quindi né un MIN() lessicografico né
+        # un'estrazione di sottostringa darebbero un anno corretto. "anno"
+        # è già la stringa numerica dell'anno, quindi basta un CAST.
+        cursor.execute(
+            """
+            SELECT sub_topic_id,
+                   COUNT(*) AS doc_count,
+                   MIN(
+                       CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.anno')), '') AS UNSIGNED)
+                   ) AS since_year
+            FROM parent_documents
+            WHERE topic_id = %s
+            GROUP BY sub_topic_id
+            """,
+            (topic_id,)
+        )
+        stats_rows = cursor.fetchall()
+        stats_by_subtopic = {
+            row['sub_topic_id']: {
+                "doc_count": row['doc_count'],
+                "since_year": row['since_year']
+            }
+            for row in stats_rows
+        }
+
         sub_topics_data = [
-            {"id": row['sub_topic_id'], "desc": row['description'] or row['sub_topic_id']} 
+            {
+                "id": row['sub_topic_id'],
+                "desc": row['description'] or row['sub_topic_id'],
+                "doc_count": stats_by_subtopic.get(row['sub_topic_id'], {}).get("doc_count", 0),
+                "since_year": stats_by_subtopic.get(row['sub_topic_id'], {}).get("since_year"),
+            }
             for row in rows
         ]
 
         return jsonify({
             "allow_subtopic_selection": settings.allow_subtopic_selection,
+            "allow_date_filter": settings.allow_date_filter,
             "sub_topics": sub_topics_data 
         }), 200
     finally:
@@ -157,11 +194,45 @@ def chat_handler():
         selected_sub_topics = data.get("sub_topics", []) 
         metadata_filters = data.get("filters", {})
 
+        # --- Filtro opzionale sul range temporale ---
+        # Il campo "data" su Qdrant è una stringa "YYYY-MM-DD" (vedi
+        # estrattore.py: clean_iso_date() rimuove sempre la componente oraria),
+        # quindi confrontiamo direttamente stringhe: il confronto lessicografico
+        # su ISO 8601 coincide con l'ordine cronologico.
+        date_from = data.get("date_from") if settings.allow_date_filter else None
+        date_to = data.get("date_to") if settings.allow_date_filter else None
+
+        include_undated = data.get("include_undated", True)
+        if not isinstance(include_undated, bool):
+            return jsonify({
+                "error": "Bad Request",
+                "message": "include_undated deve essere un booleano"
+            }), 400
+
+        if date_from or date_to:
+            log.info(f"Received data range: {date_from}...{date_to}  for topic {topic_id}")
+            date_range = {}
+            try:
+                if date_from:
+                    datetime.strptime(date_from, "%Y-%m-%d")  # solo validazione formato
+                    date_range["gte"] = date_from
+
+                if date_to:
+                    datetime.strptime(date_to, "%Y-%m-%d")  # solo validazione formato
+                    date_range["lte"] = date_to
+
+                metadata_filters = {**metadata_filters, "data": date_range}
+            except ValueError:
+                return jsonify({
+                    "error": "Bad Request",
+                    "message": "date_from/date_to devono essere in formato YYYY-MM-DD"
+                }), 400
+
         log.info(f"Received query: '{query[:50]}...'. Offloading to Worker.")
 
         task = celery_client.send_task(
             'rag_queue', 
-            args=[query, history, topic_id, selected_sub_topics, metadata_filters] 
+            args=[query, history, topic_id, selected_sub_topics, metadata_filters, include_undated] 
         )
 
         return jsonify({
