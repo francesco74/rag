@@ -48,9 +48,6 @@ BASE_DIR = pathlib.Path(__file__).parent.resolve()
 QDRANT_COLLECTION = "document_chunks"
 
 init_db_pool()
-    
-
-
 
 logging.basicConfig(
     level=getattr(logging, settings.log_level, logging.INFO),
@@ -499,13 +496,22 @@ async def process_single_job(payload: dict):
 
     rel_path = pathlib.Path(rel_path_str)
     
-    # Path Resolution Dinamica: assuming topic/subtopic/file.json
+    # Path Resolution Dinamica: topic_id e sub_topic_id sono SEMPRE i primi
+    # due segmenti del path (rel_path.parts[0]/[1]), indipendentemente da
+    # quante sottocartelle seguano prima del file (es.
+    # "topic/sub/preliminari/gennaio/file.json" con direct.py, non solo
+    # "topic/sub/file.json" come nella pipeline Sicr@Web). In precedenza si
+    # usava rel_path.parent.parent.name (le ULTIME due cartelle prima del
+    # file), che per path più profondi di 3 livelli restituiva le cartelle
+    # sbagliate (es. "preliminari"/"gennaio" invece di "topic"/"sub").
+    # finalize_file_move() più sotto è già agnostico alla profondità (usa
+    # relative_to(root_folder)), quindi non necessita di modifiche.
     if len(rel_path.parts) < 3:
-        log.error(f"Struttura path non supportata (attesa: topic/sub/file.json). Ricevuta: {rel_path}")
+        log.error(f"Struttura path non supportata (attesa: topic/sub_topic/.../file.json). Ricevuta: {rel_path}")
         return
 
-    sub_topic_id = rel_path.parent.name
-    topic_id = rel_path.parent.parent.name
+    topic_id = rel_path.parts[0]
+    sub_topic_id = rel_path.parts[1]
     
     json_path = WATCH_FOLDER / rel_path
     root_folder = WATCH_FOLDER / topic_id / sub_topic_id
@@ -577,17 +583,22 @@ async def on_message_received(message: aio_pika.IncomingMessage):
             rel_path_str = payload.get("json_manifest_path")
             if rel_path_str:
                 rel_path = pathlib.Path(rel_path_str)
-                topic_id = rel_path.parent.parent.name
-                sub_topic_id = rel_path.parent.name
-                root_folder = WATCH_FOLDER / topic_id / sub_topic_id
-                json_path = WATCH_FOLDER / rel_path
-                
-                # Sposta JSON e il file di testo associato
-                await finalize_file_move(json_path, root_folder, topic_id, sub_topic_id, error_msg=str(e))
-                for ext in [".md", ".txt"]:
-                    text_path = json_path.with_suffix(ext)
-                    if text_path.exists():
-                        await finalize_file_move(text_path, root_folder, topic_id, sub_topic_id, error_msg=str(e))
+                # Stessa correzione applicata sopra: primi due segmenti, non
+                # le ultime due cartelle (vedi commento in process_single_job).
+                if len(rel_path.parts) < 3:
+                    log.error(f"Struttura path non supportata in DLQ handler (attesa: topic/sub_topic/.../file.json). Ricevuta: {rel_path}")
+                else:
+                    topic_id = rel_path.parts[0]
+                    sub_topic_id = rel_path.parts[1]
+                    root_folder = WATCH_FOLDER / topic_id / sub_topic_id
+                    json_path = WATCH_FOLDER / rel_path
+
+                    # Sposta JSON e il file di testo associato
+                    await finalize_file_move(json_path, root_folder, topic_id, sub_topic_id, error_msg=str(e))
+                    for ext in [".md", ".txt"]:
+                        text_path = json_path.with_suffix(ext)
+                        if text_path.exists():
+                            await finalize_file_move(text_path, root_folder, topic_id, sub_topic_id, error_msg=str(e))
             
             # Invio in Dead Letter Queue per ispezione
             await message.reject(requeue=False)

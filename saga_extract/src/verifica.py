@@ -7,6 +7,7 @@ import argparse
 import asyncio
 import pathlib
 from pathlib import Path
+from collections import defaultdict
 from typing import Optional, List
 
 from common.config import settings
@@ -18,10 +19,53 @@ from common.estrazione_documenti import build_client_from_env
 from qdrant_client import AsyncQdrantClient
 from qdrant_client import models
 
-from common.utility import clean_iso_date
-
 QDRANT_COLLECTION = "document_chunks"
 ESTENSIONI_CONSENTITE = {".pdf", ".p7m"}
+
+# NOTA MANUTENZIONE: questi due valori DEVONO restare identici a quelli in
+# estrattore.py (TIPI_SUPPORTATI e la cartella "attiprovincia" dentro
+# STAGING_ATTI_FOLDER, che è il topic_id effettivo scritto poi da ingest.py
+# su MySQL/Qdrant). Non importati direttamente per evitare gli effetti
+# collaterali a import-time di estrattore.py (init_db_pool, lettura .env).
+TOPIC_ID = "attiprovincia"
+TIPI_SUPPORTATI = {
+    "determina": "determine",
+    "delibera": "delibere",
+    "decreto_deliberativo": "decreti_deliberativi",
+    "decreto_presidenziale": "decreti_presidenziali",
+}
+
+# NOTA MANUTENZIONE: questa funzione è una copia intenzionale di
+# clean_iso_date() in estrattore.py, necessaria per non importare l'intero
+# modulo estrattore.py qui (che ha effetti collaterali a import-time, es.
+# init_db_pool() e lettura .env). Se la si modifica in un file, replicare
+# la modifica anche nell'altro (idealmente andrebbe estratta in un modulo
+# common/ condiviso in un refactor successivo).
+_SENTINEL_DATES_ISO = {"0001-01-01"}
+
+
+def clean_iso_date(date_raw):
+    """Normalizza una data Sicr@Web al formato ISO 'YYYY-MM-DD' (vedi estrattore.py)."""
+    if not date_raw:
+        return None
+    date_raw = date_raw.strip()
+    if not date_raw:
+        return None
+
+    date_part = date_raw.split("T")[0].split(" ")[0]
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", date_part):
+        if date_part in _SENTINEL_DATES_ISO:
+            return None
+        return date_part
+
+    m = re.match(r"^(\d{2})/(\d{2})/(\d{4})$", date_raw)
+    if m:
+        day, month, year = m.groups()
+        return f"{year}-{month}-{day}"
+
+    log.warning("clean_iso_date: formato data non riconosciuto, scartato: %r", date_raw)
+    return None
+
 
 def build_fresh_metadata(dati: dict) -> dict:
     """
@@ -278,7 +322,7 @@ async def update_qdrant_metadata_batch(qdrant_client: AsyncQdrantClient, sources
 
 # Aggiorna queste due funzioni dentro verifica.py:
 
-async def retrigger_extraction(uid: str, tipo_atto: str, meta_atto: dict):
+async def retrigger_extraction(uid: str, tipo_atto: str, meta_atto: dict, sicraweb_delay: float = None):
     """
     Richiama estrattore.py in MODALITA' DIRETTA: passa l'UID e i metadati che
     verify_pipeline ha già ottenuto e verificato (dopo i filtri registro/anno),
@@ -287,6 +331,12 @@ async def retrigger_extraction(uid: str, tipo_atto: str, meta_atto: dict):
     rischio di "infiltrati" (altri atti con lo stesso numero/anno che una
     ri-ricerca indipendente per solo numero+anno potrebbe ripescare, dato che
     <Documento><Numero> da solo può restituire atti di anni/sotto-tipi diversi).
+
+    sicraweb_delay: se specificato, viene propagato al sottoprocesso
+    estrattore.py via --sicraweb-delay. SENZA questo, il sottoprocesso non
+    eredita in alcun modo il valore passato a verifica.py — ricadrebbe sul
+    default di build_client_from_env()/settings, ignorando silenziosamente
+    l'override scelto dall'utente per QUESTO run.
     """
     if not uid:
         print(f"    [!] SALTO RECOVERY: UID mancante.")
@@ -299,6 +349,8 @@ async def retrigger_extraction(uid: str, tipo_atto: str, meta_atto: dict):
     }
 
     cmd = [sys.executable, "estrattore.py", "--json-filters", json.dumps(payload)]
+    if sicraweb_delay is not None:
+        cmd += ["--sicraweb-delay", str(sicraweb_delay)]
     print(f"    [>] Esecuzione recovery: python3 estrattore.py (UID: {uid})...")
     
     process = await asyncio.create_subprocess_exec(
@@ -317,7 +369,249 @@ async def retrigger_extraction(uid: str, tipo_atto: str, meta_atto: dict):
 
         
 
+def _fetch_parent_documents_rows(sub_topic_id: str) -> list:
+    """Query grezza su MySQL (NESSUNA chiamata SOAP) per un sub_topic dato."""
+    init_db_pool()
+    conn = get_db_connection()
+    if not conn:
+        raise ConnectionError("Impossibile connettersi al DB MySQL.")
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute(
+            "SELECT id, source, metadata FROM parent_documents WHERE topic_id = %s AND sub_topic_id = %s",
+            (TOPIC_ID, sub_topic_id)
+        )
+        rows = cursor.fetchall()
+        cursor.close()
+        return rows
+    finally:
+        conn.close()
+
+
+def _group_by_anno_numero(rows: list, anno_filter: Optional[int]) -> tuple:
+    """
+    Raggruppa le righe MySQL per (anno, numero) -> lista di 'source'
+    (un atto può avere più righe/allegati in parent_documents). Ritorna
+    (by_year_number, righe_non_parsabili).
+    """
+    by_year_number = defaultdict(list)
+    unparsed = 0
+    for row in rows:
+        raw = row.get("metadata")
+        if not raw:
+            unparsed += 1
+            continue
+        try:
+            meta = raw if isinstance(raw, dict) else json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            unparsed += 1
+            continue
+
+        anno_raw = meta.get("anno")
+        numero_raw = meta.get("numero")
+        if not anno_raw or not numero_raw:
+            continue
+        try:
+            anno = int(str(anno_raw).strip())
+            numero = int(str(numero_raw).strip())
+        except ValueError:
+            continue
+
+        if anno_filter is not None and anno != anno_filter:
+            continue
+
+        by_year_number[(anno, numero)].append(row["source"])
+
+    return by_year_number, unparsed
+
+
+def _find_numbering_gaps(by_year_number: dict) -> list:
+    """Ritorna la lista di (anno, numero) mancanti nel range min-max di ogni anno presente."""
+    missing = []
+    anni = sorted({anno for anno, _ in by_year_number})
+    for anno in anni:
+        numeri_anno = sorted(numero for (a, numero) in by_year_number if a == anno)
+        lo, hi = numeri_anno[0], numeri_anno[-1]
+        missing.extend((anno, n) for n in range(lo, hi + 1) if n not in numeri_anno)
+    return missing
+
+
+async def check_ingestion_status(tipo_atto: str, anno_filter: Optional[int]):
+    """
+    Verifica SOLO su MySQL e Qdrant (NESSUNA chiamata SOAP a Sicr@Web) se ci
+    sono "buchi" nella numerazione degli atti già caricati per un dato
+    tipo_atto — es. manca il 4/2025 o il 125/2026 — e se qualche atto
+    presente in MySQL non ha invece nessun chunk indicizzato in Qdrant
+    (ingestion incompleta).
+
+    anno_filter: se specificato limita la verifica a quell'anno, altrimenti
+    controlla tutti gli anni trovati per quel tipo_atto.
+
+    NB: un "buco" segnalato non è necessariamente un errore — potrebbe
+    trattarsi di un atto annullato, ritirato, secretato o non ancora
+    pubblicato. Va verificato caso per caso.
+    """
+    if tipo_atto not in TIPI_SUPPORTATI:
+        print(f"[!] tipo_atto non valido: {tipo_atto!r}. Valori ammessi: {list(TIPI_SUPPORTATI.keys())}")
+        return
+
+    sub_topic_id = TIPI_SUPPORTATI[tipo_atto]
+
+    try:
+        rows = _fetch_parent_documents_rows(sub_topic_id)
+    except ConnectionError as e:
+        print(f"[!] {e}")
+        return
+
+    print(f"\n{'='*80}")
+    print(f"VERIFICA BUCHI INGESTION — tipo_atto: {tipo_atto} (sub_topic: {sub_topic_id})")
+    print(f"{'='*80}")
+    print(f"Righe MySQL trovate: {len(rows)}")
+
+    by_year_number, unparsed = _group_by_anno_numero(rows, anno_filter)
+
+    if unparsed:
+        print(f"({unparsed} righe con metadata mancante/non parsabile, escluse dal controllo)")
+
+    if not by_year_number:
+        print("Nessun atto trovato per i criteri specificati (tipo_atto/anno).")
+        print(f"{'='*80}\n")
+        return
+
+    # --- 1. Buchi nella numerazione, per anno ---
+    print("\n--- Buchi nella numerazione (per anno) ---")
+    anni = sorted({anno for anno, _ in by_year_number})
+    for anno in anni:
+        numeri_anno = sorted(numero for (a, numero) in by_year_number if a == anno)
+        lo, hi = numeri_anno[0], numeri_anno[-1]
+        missing = sorted(set(range(lo, hi + 1)) - set(numeri_anno))
+        if missing:
+            print(f"  anno {anno}: {len(numeri_anno)} atti presenti, range {lo}-{hi} -> MANCANTI: {missing}")
+        else:
+            print(f"  anno {anno}: {len(numeri_anno)} atti presenti, range {lo}-{hi} -> nessun buco.")
+
+    # --- 2. Presenti in MySQL ma senza alcun chunk in Qdrant ---
+    print("\n--- Presenza in Qdrant per gli atti trovati in MySQL ---")
+    qdrant_client = AsyncQdrantClient(
+        host=settings.qdrant_host,
+        port=settings.qdrant_port,
+        timeout=getattr(settings, "qdrant_client_timeout_seconds", 60.0),
+    )
+    incompleti = []
+    try:
+        for (anno, numero), sources in sorted(by_year_number.items()):
+            has_qdrant_chunks = False
+            for source in sources:
+                try:
+                    res = await _qdrant_call_with_retry(
+                        lambda: qdrant_client.count(
+                            collection_name=QDRANT_COLLECTION,
+                            count_filter=models.Filter(
+                                must=[models.FieldCondition(key="source", match=models.MatchValue(value=source))]
+                            ),
+                        ),
+                        description=f"count({source})",
+                    )
+                    if res.count > 0:
+                        has_qdrant_chunks = True
+                        break
+                except Exception as e:
+                    log.warning(f"Errore verificando Qdrant per {source}: {e}")
+            if not has_qdrant_chunks:
+                incompleti.append((anno, numero))
+    finally:
+        await qdrant_client.close()
+
+    if incompleti:
+        print(f"  ATTENZIONE: {len(incompleti)} atti presenti in MySQL ma SENZA alcun chunk in Qdrant:")
+        for anno, numero in sorted(incompleti):
+            print(f"    - {numero}/{anno}")
+    else:
+        print("  OK: tutti gli atti trovati in MySQL hanno almeno un chunk indicizzato in Qdrant.")
+
+    print(
+        "\nNota: un 'buco' nella numerazione o un'assenza in Qdrant non è "
+        "necessariamente un errore di ingestion — potrebbe trattarsi di un "
+        "atto annullato, ritirato, secretato o non ancora pubblicato. Va "
+        "verificato caso per caso (es. controllando l'Albo Pretorio) prima "
+        "di considerarlo un problema."
+    )
+    print(f"{'='*80}\n")
+
+
+async def check_ingestion_and_recover(tipo_atto: str, anno_filter: Optional[int], sicraweb_delay: float = None):
+    """
+    Trova i "buchi" nella numerazione (SOLO MySQL, nessuna chiamata SOAP in
+    questa fase — stessa logica di check_ingestion_status), poi per OGNI
+    numero mancante lancia una ricerca mirata su Sicr@Web e il normale
+    ciclo verifica+recovery (riusando verify_pipeline con auto_recover=True),
+    UN atto alla volta, con una pausa esplicita tra un tentativo e il
+    successivo.
+
+    La pausa qui è ESPLICITA (asyncio.sleep tra un'iterazione e l'altra) e
+    non affidata solo al throttling interno del client SOAP: ogni chiamata a
+    verify_pipeline crea un client nuovo (throttle-timer azzerato), quindi
+    senza questa pausa a livello di orchestrazione, con molti buchi da
+    recuperare si rischia comunque di bombardare il gestionale — esattamente
+    ciò che --sicraweb-delay doveva evitare.
+
+    NB: un numero "mancante per numerazione" potrebbe non esistere affatto
+    sul gestionale (atto annullato, ritirato, secretato, mai protocollato).
+    In quel caso la ricerca mirata restituirà 0 risultati e verify_pipeline
+    lo segnalerà come tale — non viene inventato né forzato nulla che non
+    risulti realmente presente su Sicr@Web.
+    """
+    if tipo_atto not in TIPI_SUPPORTATI:
+        print(f"[!] tipo_atto non valido: {tipo_atto!r}. Valori ammessi: {list(TIPI_SUPPORTATI.keys())}")
+        return
+
+    sub_topic_id = TIPI_SUPPORTATI[tipo_atto]
+
+    try:
+        rows = _fetch_parent_documents_rows(sub_topic_id)
+    except ConnectionError as e:
+        print(f"[!] {e}")
+        return
+
+    by_year_number, _ = _group_by_anno_numero(rows, anno_filter)
+    if not by_year_number:
+        print("Nessun atto trovato per i criteri specificati (tipo_atto/anno): nulla da recuperare.")
+        return
+
+    missing = _find_numbering_gaps(by_year_number)
+    if not missing:
+        print(f"Nessun buco nella numerazione per {tipo_atto}" + (f" (anno {anno_filter})" if anno_filter else "") + ": nulla da recuperare.")
+        return
+
+    delay = sicraweb_delay if sicraweb_delay is not None else getattr(settings, "sicraweb_min_interval_seconds", 1.5)
+
+    print(f"\n{'='*80}")
+    print(f"RECOVERY BUCHI — {len(missing)} atti mancanti da tentare: {sorted(missing)}")
+    print(f"Pausa tra un tentativo e il successivo: {delay}s")
+    print(f"{'='*80}\n")
+
+    for i, (anno, numero) in enumerate(sorted(missing), start=1):
+        print(f"--- [{i}/{len(missing)}] Tentativo recovery: {numero}/{anno} ({tipo_atto}) ---")
+        json_filters_str = json.dumps({
+            "tipo_atto": tipo_atto,
+            "numero_atto": str(numero),
+            "anno_atto": str(anno),
+        })
+        try:
+            await verify_pipeline(json_filters_str, auto_recover=True, sicraweb_delay=sicraweb_delay)
+        except Exception as e:
+            log.error(f"Errore durante il recovery di {numero}/{anno}: {e}")
+
+        if i < len(missing):
+            await asyncio.sleep(delay)
+
+    print(f"\n{'='*80}")
+    print("RECOVERY BUCHI COMPLETATO. Rilancia --check-ingestion-status per confermare l'esito.")
+    print(f"{'='*80}\n")
+
+
 async def verify_pipeline(json_filters_str: str, auto_recover: bool, update_metadata_only: bool = False, sicraweb_delay: float = None):
+
     init_db_pool()
     filtri_list, tipo_atto, anno_atto_richiesto = parse_filters(json_filters_str)
 
@@ -459,14 +753,22 @@ async def verify_pipeline(json_filters_str: str, auto_recover: bool, update_meta
                 # L'update Qdrant vero e proprio è differito a DOPO questo
                 # loop (una sola chiamata batch per tutti gli allegati
                 # dell'atto, invece di una per allegato — vedi più sotto).
-                mysql_updated = 0
+                # NB: cursor.rowcount dopo una UPDATE riporta le righe
+                # EFFETTIVAMENTE CAMBIATE, non quelle trovate dal WHERE. Se i
+                # metadati freschi coincidono con quelli già salvati (già
+                # aggiornati in un run precedente, o mai divergenti), MySQL
+                # riporta 0 anche se la query ha trovato ed eseguito
+                # correttamente su mysql_count righe. Per questo qui
+                # riportiamo mysql_count (righe coperte), non rows_changed.
+                rows_changed = 0
                 if mysql_count > 0:
-                    mysql_updated = update_mysql_metadata(target_source, fresh_metadata)
+                    rows_changed = update_mysql_metadata(target_source, fresh_metadata)
                 if isinstance(qdrant_count, int) and qdrant_count > 0:
                     sources_da_aggiornare_qdrant.append(target_source)
 
-                if mysql_updated or (isinstance(qdrant_count, int) and qdrant_count > 0):
-                    stato = f"METADATA DA AGGIORNARE (mysql:{mysql_updated} righe, qdrant:{qdrant_count if isinstance(qdrant_count, int) else 0} chunk)"
+                if mysql_count > 0 or (isinstance(qdrant_count, int) and qdrant_count > 0):
+                    invariato = " (nessuna modifica: dati già aggiornati)" if mysql_count > 0 and rows_changed == 0 else ""
+                    stato = f"METADATA OK (mysql:{mysql_count} righe{invariato}, qdrant:{qdrant_count if isinstance(qdrant_count, int) else 0} chunk)"
                 else:
                     stato = "SKIP (non presente né in MySQL né in Qdrant)"
 
@@ -519,7 +821,7 @@ async def verify_pipeline(json_filters_str: str, auto_recover: bool, update_meta
                     "proponente_descrizione": dati.get("proponente_descrizione"),
                     "dirigente_descrizione": dati.get("dirigente_descrizione"),
                 }
-                await retrigger_extraction(uid, tipo_atto, meta_atto_recovery)
+                await retrigger_extraction(uid, tipo_atto, meta_atto_recovery, sicraweb_delay)
             else:
                 print(f"    [!] Recovery disabilitato. Utilizzare flag --recover per forzare l'inserimento.")
             
@@ -527,8 +829,41 @@ async def verify_pipeline(json_filters_str: str, auto_recover: bool, update_meta
     await qdrant_client.close()
 
 def main():
-    parser = argparse.ArgumentParser(description="Verificatore Pipeline Documentale con Auto-Recovery")
-    parser.add_argument("--json-filters", type=str, required=True, help="Filtri JSON di ricerca.")
+    parser = argparse.ArgumentParser(
+        description="Verificatore Pipeline Documentale con Auto-Recovery",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+ESEMPI D'USO:
+
+  Ricerca + verifica (nessun recovery):
+    python verifica.py --json-filters '{"tipo_atto": "determina", "numero_atto": "34", "anno_atto": "2026"}'
+
+  Come sopra, ma recupera i file mancanti (MySQL/Qdrant):
+    python verifica.py --json-filters '{"tipo_atto": "determina", "numero_atto": "34", "anno_atto": "2026"}' --recover
+
+  Aggiorna SOLO i metadati (no re-ingestion, no nuovo embedding):
+    python verifica.py --json-filters '{"tipo_atto": "decreto_deliberativo", "data_da": "01/01/2025", "data_a": "31/12/2026"}' --update-metadata-only
+
+  Rallenta le chiamate LeggiAttoPlus (gestionale sensibile al carico):
+    python verifica.py --json-filters '{"tipo_atto": "determina", "anno_atto": "2026"}' --recover --sicraweb-delay 3
+
+  Solo controllo buchi nella numerazione (NESSUNA chiamata SOAP):
+    python verifica.py --json-filters '{"tipo_atto": "determina", "anno_atto": "2024"}' --check-ingestion-status
+
+  Controllo buchi + tentativo di recupero automatico, un buco alla volta:
+    python verifica.py --json-filters '{"tipo_atto": "determina", "anno_atto": "2024"}' --check-ingestion-recover --sicraweb-delay 3
+
+NOTE:
+  - --check-ingestion-status e --check-ingestion-recover leggono SOLO 'tipo_atto'
+    e (opzionale) 'anno_atto' da --json-filters; ogni altro campo viene ignorato.
+  - --check-ingestion-status e --check-ingestion-recover sono mutuamente esclusivi.
+  - --update-metadata-only ignora --recover se specificato insieme.
+  - tipo_atto validi: determina, delibera, decreto_deliberativo, decreto_presidenziale, qualsiasi
+    (qualsiasi richiede 'oggetto' e NON è supportato da --check-ingestion-status/--check-ingestion-recover,
+    che hanno bisogno di un sub_topic specifico).
+""",
+    )
+    parser.add_argument("--json-filters", type=str, required=True, help="Filtri JSON di ricerca (es. '{\"tipo_atto\": \"determina\", \"anno_atto\": \"2026\"}').")
     parser.add_argument("--recover", action="store_true", help="Lancia estrattore.py per tentare il recupero dei file mancanti.")
     parser.add_argument(
         "--update-metadata-only",
@@ -545,7 +880,47 @@ def main():
         default=None,
         help="Pausa minima in secondi tra due chiamate LeggiAttoPlus consecutive (sovrascrive il default/config).",
     )
+    parser.add_argument(
+        "--check-ingestion-status",
+        action="store_true",
+        help=(
+            "Verifica SOLO su MySQL/Qdrant (NESSUNA chiamata SOAP a Sicr@Web) se ci sono "
+            "buchi nella numerazione degli atti già caricati per il tipo_atto indicato in "
+            "--json-filters, e se qualche atto presente in MySQL manca del tutto in Qdrant. "
+            "Legge solo 'tipo_atto' e (opzionale) 'anno_atto' da --json-filters; tutti gli "
+            "altri campi (oggetto, data_da, ecc.) vengono ignorati in questa modalità."
+        ),
+    )
+    parser.add_argument(
+        "--check-ingestion-recover",
+        action="store_true",
+        help=(
+            "Come --check-ingestion-status, ma per OGNI numero mancante trovato lancia "
+            "anche una ricerca mirata su Sicr@Web + verifica + recovery (una ricerca SOAP "
+            "per buco, non per l'intero range). Ignora --recover/--update-metadata-only."
+        ),
+    )
     args = parser.parse_args()
+
+    if args.check_ingestion_status and args.check_ingestion_recover:
+        parser.error("Usa --check-ingestion-status oppure --check-ingestion-recover, non entrambi.")
+
+    if args.check_ingestion_status or args.check_ingestion_recover:
+        try:
+            raw_json = json.loads(args.json_filters)
+        except json.JSONDecodeError as e:
+            parser.error(f"--json-filters non è un JSON valido: {e}")
+        tipo_atto = raw_json.get("tipo_atto")
+        if not tipo_atto:
+            parser.error("--check-ingestion-status/--check-ingestion-recover richiedono 'tipo_atto' dentro --json-filters.")
+        anno_raw = raw_json.get("anno_atto")
+        anno_filter = int(anno_raw) if anno_raw else None
+
+        if args.check_ingestion_recover:
+            asyncio.run(check_ingestion_and_recover(tipo_atto, anno_filter, args.sicraweb_delay))
+        else:
+            asyncio.run(check_ingestion_status(tipo_atto, anno_filter))
+        return
 
     if args.update_metadata_only and args.recover:
         log.warning("--recover ignorato: --update-metadata-only non fa mai recovery/re-ingestion.")

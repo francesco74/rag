@@ -629,7 +629,15 @@ async def process_single_job(payload: dict, channel: aio_pika.Channel):
         current_json_dir = file_path.parent
         
         for filename in attached_files:
-            attached_file_path = current_json_dir / filename
+            # Risoluzione sul filesystem: usiamo solo il nome base di
+            # 'filename', perché il file è co-locato nella stessa cartella
+            # del JSON (anche quando 'filename' nel manifest è un percorso
+            # relativo più lungo, es. "preliminari/gennaio/test.pdf" per i
+            # manifest generati da direct.py — lì serve per file_name in DB,
+            # non per la risoluzione fisica). Per i manifest Sicr@Web,
+            # 'filename' è già un nome semplice: Path(filename).name
+            # restituisce lo stesso valore, nessun cambio di comportamento.
+            attached_file_path = current_json_dir / Path(filename).name
             
             if not attached_file_path.exists():
                 log.warning(f"Allegato mancante {filename} nella cartella {current_json_dir.name}.")
@@ -683,13 +691,33 @@ async def process_single_job(payload: dict, channel: aio_pika.Channel):
             
             if md_content:
                 safe_stem = Path(filename).stem
-                unique_base_name = f"{base_name}_{safe_stem}"
+                # Se lo stem del JSON coincide già con quello dell'allegato
+                # (sempre vero per i manifest a singolo file di direct.py,
+                # dato che il JSON è nominato come f"{stem_del_file}.json"),
+                # non concateniamo: eviterebbe solo una ripetizione inutile
+                # (es. "test_test"). Nella pipeline Sicr@Web, dove un JSON
+                # può referenziare più allegati diversi, i due stem sono
+                # tipicamente diversi e la concatenazione resta necessaria
+                # per disambiguare l'output dei vari allegati.
+                unique_base_name = safe_stem if safe_stem == base_name else f"{base_name}_{safe_stem}"
                 
                 final_md_path = dest_dir / f"{unique_base_name}.md"
                 final_md_path.write_text(md_content, encoding="utf-8")
                 
                 child_manifest = manifest.copy()
-                child_manifest["source"] = f"{original_source}::{filename}"
+                # Se 'source' include già il nome/percorso dell'allegato per
+                # intero (es. i manifest di direct.py, dove source =
+                # "direct://topic/sub/preliminari/gennaio/test.pdf" e filename
+                # = "preliminari/gennaio/test.pdf"), non appendiamo di nuovo
+                # "::filename" — finirebbe duplicato (".../test.pdf::preliminari/gennaio/test.pdf").
+                # Nella pipeline Sicr@Web, dove 'source' è solo l'identificativo
+                # dell'atto (es. "sicraweb://{uid}", senza alcun nome file),
+                # questa condizione è sempre falsa e il comportamento resta
+                # quello originale.
+                if original_source.endswith(filename):
+                    child_manifest["source"] = original_source
+                else:
+                    child_manifest["source"] = f"{original_source}::{filename}"
                 child_manifest["files"] = [filename]
                 
                 final_json_path = dest_dir / f"{unique_base_name}.json"
@@ -704,8 +732,15 @@ async def process_single_job(payload: dict, channel: aio_pika.Channel):
                 )
                 log.info(f"✓ Notificato Ingest per file generato: {unique_base_name}.json")
 
-            # Archiviazione allegato processato
-            safe_move(attached_file_path, archive_target_dir / attached_file_path.name)
+            # Archiviazione allegato processato. Usiamo Path(filename).name
+            # (solo il nome base) perché archive_target_dir mirrora già
+            # l'intera alberatura originale (deriva da rel_path.parent, che
+            # con file e JSON co-locati è già profondo/univoco di suo).
+            # Usare il 'filename' completo qui raddoppierebbe il sottopercorso
+            # (es. .../preliminari/gennaio/preliminari/gennaio/test.pdf).
+            archived_dest = archive_target_dir / Path(filename).name
+            archived_dest.parent.mkdir(parents=True, exist_ok=True)
+            safe_move(attached_file_path, archived_dest)
 
         # Archiviazione manifesto radice
         safe_move(file_path, archive_target_dir / file_path.name)
