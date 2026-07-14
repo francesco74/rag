@@ -139,8 +139,19 @@ def safe_json_parse(raw_text: str, task_id: str = "UNKNOWN") -> dict:
         log.debug(f"[{task_id}] [JSON_PARSE] ✓ Successo al Livello 1 (Standard Parse).")
         return parsed_data
     except json.JSONDecodeError as e:
-        log.debug(f"[{task_id}] [JSON_PARSE] Livello 1 fallito: {e}. Passo al Livello 2 (Markdown Strip).")
-        
+        log.debug(f"[{task_id}] [JSON_PARSE] Livello 1 fallito: {e}. Passo al Livello 1b (Raw Decode).")
+ 
+    # 1b. Tentativo con raw_decode: parsa il primo oggetto JSON valido e ignora
+    # eventuale "extra data" successiva (es. una '}' spuria aggiunta dal modello
+    # dopo la chiusura corretta dell'oggetto).
+    try:
+        decoder = json.JSONDecoder()
+        parsed_data, _ = decoder.raw_decode(raw_text)
+        log.debug(f"[{task_id}] [JSON_PARSE] ✓ Successo al Livello 1b (raw_decode, extra data ignorata).")
+        return parsed_data
+    except json.JSONDecodeError as e:
+        log.debug(f"[{task_id}] [JSON_PARSE] Livello 1b fallito: {e}. Passo al Livello 2 (Markdown Strip).")
+ 
     # 2. Tentativo con pulizia Markdown esplicita
     clean_text = re.sub(r'^```json\s*|\s*```$', '', raw_text, flags=re.MULTILINE).strip()
     try:
@@ -149,7 +160,7 @@ def safe_json_parse(raw_text: str, task_id: str = "UNKNOWN") -> dict:
         return parsed_data
     except json.JSONDecodeError as e:
         log.debug(f"[{task_id}] [JSON_PARSE] Livello 2 fallito: {e}. Passo al Livello 3 (Brute Force Regex).")
-
+ 
     # 2b. Tentativo di riparazione stringa troncata
     try:
         repaired = clean_text.rstrip() + '"}'
@@ -158,7 +169,7 @@ def safe_json_parse(raw_text: str, task_id: str = "UNKNOWN") -> dict:
         return parsed_data
     except json.JSONDecodeError as e:
         log.debug(f"[{task_id}] [JSON_PARSE] Livello 2b fallito: {e}. Passo al Livello 3 (Brute Force Regex).")
-
+ 
     # 3. Tentativo "Forza Bruta": Cerca tutto ciò che è tra parentesi graffe
     match = re.search(r'\{.*\}', raw_text, re.DOTALL)
     if match:
@@ -405,7 +416,7 @@ def generate_answer(query, rich_context, topic_id):
     log.debug(f"Raw response:\n{raw[:500]}...")
 
     try:
-        result_data = json.loads(raw.strip())
+        result_data = safe_json_parse(raw, task_id=topic_id)
         raw_answer = str(result_data.get("answer", ""))
         resolved_answer = resolve_citations(raw_answer, index_to_item)
         return {
