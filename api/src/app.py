@@ -112,7 +112,7 @@ def get_config():
             return jsonify({"error": "Service Unavailable"}), 503
         cursor = conn.cursor(dictionary=True)
         
-        cursor.execute("SELECT sub_topic_id, description FROM sub_topics WHERE topic_id = %s", (topic_id,))
+        cursor.execute("SELECT sub_topic_id, description, description_long FROM sub_topics WHERE topic_id = %s", (topic_id,))
         rows = cursor.fetchall()
 
         # Conteggio documenti e anno più vecchio per sub_topic, per mostrare
@@ -148,7 +148,8 @@ def get_config():
         sub_topics_data = [
             {
                 "id": row['sub_topic_id'],
-                "desc": row['description'] or row['sub_topic_id'],
+                "desc": row['description'],
+                "desc_long": row['description_long'],
                 "doc_count": stats_by_subtopic.get(row['sub_topic_id'], {}).get("doc_count", 0),
                 "since_year": stats_by_subtopic.get(row['sub_topic_id'], {}).get("since_year"),
             }
@@ -157,7 +158,6 @@ def get_config():
 
         return jsonify({
             "allow_subtopic_selection": settings.allow_subtopic_selection,
-            "allow_date_filter": settings.allow_date_filter,
             "sub_topics": sub_topics_data 
         }), 200
     finally:
@@ -199,8 +199,8 @@ def chat_handler():
         # estrattore.py: clean_iso_date() rimuove sempre la componente oraria),
         # quindi confrontiamo direttamente stringhe: il confronto lessicografico
         # su ISO 8601 coincide con l'ordine cronologico.
-        date_from = data.get("date_from") if settings.allow_date_filter else None
-        date_to = data.get("date_to") if settings.allow_date_filter else None
+        date_from = data.get("date_from")
+        date_to = data.get("date_to")
 
         include_undated = data.get("include_undated", True)
         if not isinstance(include_undated, bool):

@@ -220,11 +220,11 @@ class _ChatScreenState extends State<ChatScreen> {
   List<TargetFocus> _targets = [];
 
   Map<String, String> _subTopicDescriptions = {};
+  Map<String, String> _subTopicLongDescriptions = {};
   Map<String, Map<String, dynamic>> _subTopicStats = {};
   List<String> _availableSubTopicIds = [];
   Set<String> _selectedSubTopics = {};
   bool _allowSubtopicSelection = false;
-  bool _allowDateFilter = false;
   DateTime? _dateFrom;
   DateTime? _dateTo;
   bool _includeUndatedDocs = true;
@@ -375,13 +375,16 @@ class _ChatScreenState extends State<ChatScreen> {
 
         setState(() {
           _allowSubtopicSelection = data['allow_subtopic_selection'] ?? false;
-          _allowDateFilter = data['allow_date_filter'] ?? false;
           _availableSubTopicIds = rawSubTopics
               .map((item) => item['id'].toString())
               .toList();
           _subTopicDescriptions = {
             for (var item in rawSubTopics)
               item['id'].toString(): item['desc'].toString(),
+          };
+          _subTopicLongDescriptions = {
+            for (var item in rawSubTopics)
+              item['id'].toString(): (item['desc_long'] ?? '').toString(),
           };
           _subTopicStats = {
             for (var item in rawSubTopics)
@@ -1058,11 +1061,25 @@ class _ChatScreenState extends State<ChatScreen> {
                       child: ListView(
                         shrinkWrap: true,
                         children: _availableSubTopicIds.map((id) {
+                          final longDesc = _subTopicLongDescriptions[id];
                           return CheckboxListTile(
                             title: Text(_subTopicDescriptions[id] ?? id),
-                            subtitle: Text(
-                              id,
-                              style: const TextStyle(fontSize: 10),
+                            subtitle: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                if (longDesc != null && longDesc.trim().isNotEmpty) ...[
+                                  Text(
+                                    longDesc,
+                                    style: const TextStyle(fontSize: 11),
+                                  ),
+                                  const SizedBox(height: 2),
+                                ],
+                                Text(
+                                  id,
+                                  style: const TextStyle(fontSize: 10),
+                                ),
+                              ],
                             ),
                             value: _selectedSubTopics.contains(id),
                             onChanged: (bool? value) {
@@ -1083,7 +1100,7 @@ class _ChatScreenState extends State<ChatScreen> {
                   ],
 
                   // --- Filtro range temporale (opzionale) ---
-                  if (_allowDateFilter) ...[
+                  if (AppSettings.allowDateFilter) ...[
                     Text(
                       AppTranslations.get('date_filter_title', langNotifier.value),
                       style: Theme.of(context).textTheme.titleMedium,
@@ -1193,7 +1210,7 @@ class _ChatScreenState extends State<ChatScreen> {
         title: Text(AppSettings.projectName),
         actions: [
           if ((_allowSubtopicSelection && _availableSubTopicIds.isNotEmpty) ||
-              _allowDateFilter)
+              AppSettings.allowDateFilter)
             IconButton(
               key: _filterKey,
               icon: const Icon(Icons.filter_list),
@@ -1535,16 +1552,15 @@ class _ChatScreenState extends State<ChatScreen> {
                           runSpacing: 4.0,
                           children: message.sources.map((source) {
                             final String fileName =
-                                source['file'] ??
+                                source['file_name'] ??
                                 AppTranslations.get(
                                   'unknown_file',
                                   langNotifier.value,
                                 );
                             final String subTopic = source['sub_topic'] ?? '';
 
-                            final String url = subTopic.isNotEmpty
-                                ? "${AppSettings.downloadDocumentUrl}/$topic/$subTopic/$fileName"
-                                : "${AppSettings.downloadDocumentUrl}/$topic/$fileName";
+                            final String url =
+                                "${AppSettings.downloadDocumentUrl}/${Uri.encodeComponent(topic)}/${Uri.encodeComponent(subTopic)}/${Uri.encodeComponent(fileName)}";
 
                             return ActionChip(
                               onPressed: () => _launchUrl(url),

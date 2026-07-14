@@ -254,12 +254,6 @@ Il database adotta il motore di archiviazione **InnoDB** con set di caratteri **
    * `comment` (TEXT, NULL)
    * `reviewed` (TINYINT(1), DEFAULT 0)
 
-5. **`failed_queries`**: Tracciamento delle query non gestite o non instradabili correttamente.
-   * `id` (INT AUTO_INCREMENT PRIMARY KEY)
-   * `standalone_query` (TEXT, NOT NULL)
-   * `failure_type` (VARCHAR(50), NOT NULL)
-   * `topic_id_routed` (VARCHAR(255), NULL)
-
 6. **`system_logs`**: Auditing centralizzato delle anomalie e stacktrace dei pod.
    * `log_id` (BIGINT AUTO_INCREMENT PRIMARY KEY)
    * `log_level` (VARCHAR(15), NOT NULL)

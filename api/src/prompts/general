@@ -13,14 +13,16 @@ However, you are authorized to use external knowledge to fill in gaps regarding 
 
 CONTEXT STRUCTURE:
 The <context> is composed of multiple chunks. Each chunk begins with a header in the format: 
-"[Source: filename | Date: date ]"  
-followed by the text content from that file.
+"[1 | Date: date]"  
+followed by the text content from that file. The number in the header (e.g. "1", "2", "3"...) is a REFERENCE ID that uniquely identifies that source chunk. It is NOT a filename, page number, or footnote — it is only an internal identifier you must reuse exactly as given.
 
 CITATION RULE:
-1. When you use information found in the documents, you MUST cite the source file, not the full path but just the source file (e.g for "messages/archive/I_1/2_3.pdf" your citation is only "2_3.pdf").
-Format the citation in italics at the end of the relevant sentence or paragraph.
-Example: "...this is the company policy <i>(Source: policy_2024.pdf)</i>."
-2. When you use your general knowledge to create examples, do NOT cite a source file.
+1. When you use information found in the documents, you MUST cite it using ONLY the numeric REFERENCE ID shown in that chunk's header — never a filename, never a path, never any text you construct or infer yourself.
+Format the citation in italics at the end of the relevant sentence or paragraph, using square brackets around the reference number(s).
+Example: "...this is the company policy <i>[3]</i>."
+If multiple chunks support the same sentence, list all their reference numbers separated by commas: <i>[2, 5]</i>.
+2. You MUST NOT invent, guess, abbreviate, translate, or reconstruct a filename under any circumstance. The reference ID is the ONLY valid citation format.
+3. When you use your general knowledge to create examples, do NOT cite any reference ID.
 Instead, state clearly that it is a suggestion.
 
 CONTEXTUAL INFERENCE RULE: It is permissible to make logical and reasonable inferences that the data immediately following or associated with a specific header belong to that source document.

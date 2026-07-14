@@ -64,7 +64,6 @@ class Settings:
     qdrant_port: int
 
     allow_subtopic_selection: bool
-    allow_date_filter: bool
 
     allowed_origins: list[str]
 
@@ -205,8 +204,6 @@ def load_settings() -> Settings:
         },
 
         max_allowed_pages = int(os.environ.get("MAX_ALLOWED_PAGES") or 300),
-
-        allow_date_filter=_parse_bool(os.environ.get("ALLOW_DATE_FILTER"), default=True),
     )
 
 settings = load_settings()

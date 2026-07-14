@@ -13,6 +13,7 @@ extension type EnvConfigJS._(JSObject _) implements JSObject {
   external String? get PROJECT_NAME;
   external String? get API_SECRET_KEY;
   external String? get TOPIC_ID;
+  external String? get ALLOW_DATE_FILTER;
 }
 
 class AppSettings {
@@ -25,6 +26,7 @@ class AppSettings {
   static const String _projectName = "Provincia di Lucca - Progetti innovativi";
   static const String _secretKeyValue = "default_secret_key";
   static const String _topicId = "provincia";
+  static const bool _allowDateFilter = false; 
 
   static String get apiUrl {
     // Read from JavaScript first (Runtime value)
@@ -63,6 +65,19 @@ class AppSettings {
     final topicId = envConfigJS?.TOPIC_ID;
 
     return topicId  ?? _topicId;
+
+   }
+
+   static bool get allowDateFilter {
+    // Read from JavaScript first (Runtime value)
+    final runtimeValue = envConfigJS?.ALLOW_DATE_FILTER;
+    
+    if (runtimeValue == null) {
+      return _allowDateFilter;
+    }
+    
+    // Converte la stringa in bool (case-insensitive)
+    return runtimeValue.toLowerCase() == 'true';
 
    }
 }

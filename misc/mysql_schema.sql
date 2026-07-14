@@ -17,20 +17,6 @@
     -- --------------------------------------------------------
 
     --
-    -- Struttura della tabella `failed_queries`
-    --
-
-    CREATE TABLE `failed_queries` (
-      `id` int NOT NULL AUTO_INCREMENT PRIMARY KEY,
-      `timestamp` timestamp NULL DEFAULT CURRENT_TIMESTAMP,
-      `standalone_query` text NOT NULL,
-      `failure_type` varchar(50) NOT NULL,
-      `topic_id_routed` varchar(255) DEFAULT NULL
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
-
-    -- --------------------------------------------------------
-
-    --
     -- Struttura della tabella `topics`
     --
 
@@ -47,6 +33,7 @@
       `topic_id` varchar(100) NOT NULL,
       `sub_topic_id` varchar(100) NOT NULL,
       `description` varchar(255) NOT NULL,
+      `description_long` varchar(255) NOT NULL,
       `chunk_size` int DEFAULT NULL,     
       `chunk_overlap` int DEFAULT 50,
       `parent_chunk_size` int DEFAULT 1500,

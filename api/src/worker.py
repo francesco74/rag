@@ -300,10 +300,48 @@ def transform_query(history, query, task_id="UNKNOWN"):
         return {"standalone_query": query, "search_queries": [query], "keywords": []}
 
 
+def resolve_citations(answer_html: str, index_to_item: dict) -> str:
+    """
+    Sostituisce i riferimenti numerici scritti dal modello (es. <i>[3]</i> o
+    <i>[2, 5]</i>) con il nome file CANONICO, preso direttamente dai metadati
+    di retrieval (index_to_item), mai dal testo generato dal modello.
+ 
+    Questo elimina alla radice il disallineamento tra la citazione mostrata
+    nella risposta e il file_name reale usato per costruire i link di
+    download (vedi CITATION RULE nel prompt: il modello ora cita SOLO indici
+    numerici, mai filename).
+    """
+    def replace_match(m):
+        raw_numbers = m.group(1)
+        numbers = [n.strip() for n in raw_numbers.split(',')]
+        file_names = []
+        for n in numbers:
+            try:
+                idx = int(n)
+            except ValueError:
+                continue
+            item = index_to_item.get(idx)
+            if not item:
+                log.warning(f"[CITATION] Riferimento [{idx}] generato dal modello non risolvibile: nessun chunk con questo indice.")
+                continue
+            fname = item["file_name"]
+            if fname not in file_names:
+                file_names.append(fname)
+        if not file_names:
+            # Nessun riferimento valido: rimuoviamo la citazione invece di mostrare un numero grezzo/errato
+            return ""
+        return "[" + ", ".join(file_names) + "]"
+ 
+    # Cattura i pattern tipo [3] o [2, 5] ovunque compaiano nella risposta
+    pattern = r'\[([\d,\s]+)\]'
+    return re.sub(pattern, replace_match, answer_html)
+
+
 def generate_answer(query, rich_context, topic_id):
     formatted_chunks = []
     curr_len = 0
     n_parents = len(rich_context)
+    index_to_item = {}
 
     if n_parents == 0:
         context_str = ""
@@ -318,13 +356,17 @@ def generate_answer(query, rich_context, topic_id):
             f"parent effettivi={n_parents})."
         )
 
-        for item in rich_context:
+        for idx, item in enumerate(rich_context, start=1):
             content = item['content']
             if len(content) > budget_per_parent:
-                log.debug(f"Parent '{item['source']}' troncato: {len(content)} → {budget_per_parent} chars.")
+                log.debug(f"Parent '{item['source']}' (rif. [{idx}]) troncato: {len(content)} → {budget_per_parent} chars.")
                 content = content[:budget_per_parent]
 
-            header = f"[Source: {item['source']}"
+            # NOTA: l'header espone al modello SOLO un indice numerico, mai il
+            # filename. Il modello non può più scrivere/storpiare un nome file:
+            # può solo riferirsi a "idx", che viene poi risolto in modo
+            # deterministico da resolve_citations() usando index_to_item.
+            header = f"[{idx}"
             if item.get('date'):
                 header += f" | Date: {item['date']}"
             else:
@@ -342,6 +384,7 @@ def generate_answer(query, rich_context, topic_id):
 
             formatted_chunks.append(chunk)
             curr_len += len(chunk)
+            index_to_item[idx] = item
 
         context_str = "".join(formatted_chunks)
 
@@ -356,19 +399,23 @@ def generate_answer(query, rich_context, topic_id):
 
     log.info(f"Generating structured answer for topic '{topic_id}'")
     log.debug(f"Context size: {len(context_str)} chars")
+    log.debug(f"Context  {context_str[:500]}...")
 
     raw = get_llm_provider().generate_json(settings.answer_generator_model_name, prompt, max_tokens=settings.answer_max_tokens, thinking_level=settings.answer_thinking_level )
     log.debug(f"Raw response:\n{raw[:500]}...")
 
     try:
         result_data = json.loads(raw.strip())
+        raw_answer = str(result_data.get("answer", ""))
+        resolved_answer = resolve_citations(raw_answer, index_to_item)
         return {
             "is_found": bool(result_data.get("is_found", True)),
-            "answer":   str(result_data.get("answer", ""))
+            "is_general_knowledge": bool(result_data.get("is_general_knowledge", False)),
+            "answer": resolved_answer,
         }
     except json.JSONDecodeError as e:
         log.error(f"Generazione JSON fallita: {e}. Output grezzo: {raw}")
-        return {"is_found": True, "answer": raw.strip()}
+        return {"is_found": True, "is_general_knowledge": False, "answer": raw.strip()}
     
 
 def grade_answer(query, context_snippet, answer):
@@ -889,7 +936,7 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
 
             format_strings = ','.join(['%s'] * len(final_parent_ids_ordered))
             sql = f"""
-                SELECT id, topic_id, sub_topic_id, source, content, metadata
+                SELECT id, topic_id, sub_topic_id, source, file_name, content, metadata
                 FROM parent_documents
                 WHERE id IN ({format_strings})
             """
@@ -921,6 +968,7 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
  
         for p_doc in parent_records:
             source = p_doc.get("source", "Fonte_Sconosciuta")
+            file_name = p_doc.get("file_name", "File_Sconosciuto")
             sub_topic_id = p_doc.get("sub_topic_id", "")
             content = p_doc.get("content", "").strip()
 
@@ -942,9 +990,15 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
                     log.debug(f"Metadata non parsabile per parent_id={p_doc.get('id')}: {e}")
 
             if content:
-                rich_context.append({"content": content, "source": source, "date": doc_date})
+                rich_context.append({
+                    "content": content,
+                    "source": source,
+                    "date": doc_date,
+                    "file_name": file_name,
+                    "sub_topic": sub_topic_id,
+                })
                 if source not in unique_sources_map:
-                    unique_sources_map[source] = {"file": source, "sub_topic": sub_topic_id}
+                    unique_sources_map[source] = {"source": source, "sub_topic": sub_topic_id, "file_name": file_name, "date": doc_date}
  
         log.info(f"=== Retrieval completata. Parent al generatore: {len(rich_context)} ===")
         return rich_context, list(unique_sources_map.values())
