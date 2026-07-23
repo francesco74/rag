@@ -91,6 +91,8 @@ class Settings:
     min_prob_threshold: float
     parents_per_query: int
 
+    mmr_similarity_threshold: float
+
     query_rewriter_model_name: str
     answer_generator_model_name: str
     grader_model_name: str
@@ -102,6 +104,7 @@ class Settings:
     max_reranker_thread: int
     reranker_pool_size: int
     max_allowed_pages: int
+    model_max_retry: int
 
     id_tipo_iter_atteso: dict[str, set[str]]
 
@@ -182,6 +185,8 @@ def load_settings() -> Settings:
         min_prob_threshold = float(os.environ.get("MIN_PROB_THRESHOLD") or 0.02),
         parents_per_query = int(os.environ.get("PARENTS_PER_QUERY") or 4),
 
+        mmr_similarity_threshold = float(os.environ.get("MMR_SIMILARITY_THRESHOLD") or 0.92),
+
         query_rewriter_model_name = os.environ.get("QUERY_REWRITER_MODEL_NAME", "gemini-3.1-flash-lite"),
         answer_generator_model_name = os.environ.get("ANSWER_GENERATOR_MODEL_NAME", "gemini-3.5-flash"),
         grader_model_name = os.environ.get("GRADER_MODEL_NAME", "gemini-3.1-flash-lite"),
@@ -204,6 +209,8 @@ def load_settings() -> Settings:
         },
 
         max_allowed_pages = int(os.environ.get("MAX_ALLOWED_PAGES") or 300),
+
+        model_max_retry = int(os.environ.get("MODEL_MAX_RETRY") or 3),
     )
 
 settings = load_settings()

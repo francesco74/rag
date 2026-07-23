@@ -231,6 +231,7 @@ class _ChatScreenState extends State<ChatScreen> {
 
   // --- STATO PER PROGRESSIVE DELAY ---
   Timer? _longWaitTimer;
+  Timer? _veryLongWaitTimer; // Terzo messaggio di attesa, per code ancora più lunghe
   String? _dynamicLoadingMessage;
 
   @override
@@ -724,6 +725,7 @@ class _ChatScreenState extends State<ChatScreen> {
     _scrollController.dispose();
     _textFocusNode.dispose();
     _longWaitTimer?.cancel(); // Prevenzione Memory Leak
+    _veryLongWaitTimer?.cancel(); // Prevenzione Memory Leak
     super.dispose();
   }
 
@@ -802,12 +804,30 @@ class _ChatScreenState extends State<ChatScreen> {
 
     // --- PROGRESSIVE DELAY MESSAGING ---
     _longWaitTimer?.cancel();
+    _veryLongWaitTimer?.cancel();
+
     _longWaitTimer = Timer(const Duration(seconds: 20), () {
       if (mounted && _isLoading) {
         setState(() {
           // Assicurati che 'taking_longer' sia tradotto nel tuo file app_translations
           _dynamicLoadingMessage = AppTranslations.get(
             'taking_longer',
+            langNotifier.value,
+          );
+        });
+      }
+    });
+
+    // Terzo messaggio: scatta solo se, dopo il secondo, si è ancora in attesa.
+    // Assicurati di aggiungere la chiave 'taking_much_longer' in app_translations.dart
+    // (sia per 'it' che per 'en'), es:
+    // it: "Ci vuole più del previsto, sto ancora analizzando i documenti..."
+    // en: "This is taking a while, still analyzing the documents..."
+    _veryLongWaitTimer = Timer(const Duration(seconds: 35), () {
+      if (mounted && _isLoading) {
+        setState(() {
+          _dynamicLoadingMessage = AppTranslations.get(
+            'taking_much_longer',
             langNotifier.value,
           );
         });
@@ -898,8 +918,9 @@ class _ChatScreenState extends State<ChatScreen> {
         ),
       );
     } finally {
-      // Spegne SEMPRE il timer, a prescindere dal successo o dal fallimento
+      // Spegne SEMPRE i timer, a prescindere dal successo o dal fallimento
       _longWaitTimer?.cancel();
+      _veryLongWaitTimer?.cancel();
 
       if (mounted) {
         setState(() {

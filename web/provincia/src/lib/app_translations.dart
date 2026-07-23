@@ -152,6 +152,12 @@ class AppTranslations {
       AppLang.en:
           "The search is complex, it's taking longer than expected...please wait a bit more...",
     },
+    'taking_much_longer': {
+      AppLang.it:
+          "La ricerca è molto complessa, ci sta volendo più del previsto...ci siamo quasi...",
+      AppLang.en:
+          "The search is very complex, it's taking longer than expected...we're almost there...",
+    },
     'send_question': {
       AppLang.it: "Invia domanda",
       AppLang.en: "Send question",
@@ -189,6 +195,7 @@ class AppTranslations {
       AppLang.it: "{desc}: {count} documenti",
       AppLang.en: "{desc}: {count} documents",
     },
+
 
   };
 

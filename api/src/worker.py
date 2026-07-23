@@ -13,6 +13,7 @@ from google.genai.errors import APIError
 import math
 import json, re
 import hashlib
+import numpy as np
 # Use the optimized reranker
 from reranker import ONNXReranker, RerankResult
 
@@ -48,7 +49,6 @@ log = logging.getLogger("WORKER")
 PROMPTS_DIR = os.path.join(os.path.dirname(__file__), 'prompts')
 
 MAX_AGE_SECONDS = 86400  # 24 hours
-MAX_MODEL_RETRIES = 2
 _RERANKER_POOL: list = []
 _POOL_SIZE = settings.reranker_pool_size
 
@@ -191,6 +191,137 @@ def safe_sigmoid(x):
     if x < -100:  # Qualsiasi logit sotto -100 è di fatto 0 probabilità
         return 0.0
     return 1 / (1 + math.exp(-x))
+
+
+# ==============================================================================
+# 4bis. MMR (Maximal Marginal Relevance) — diversificazione dei parent
+# ==============================================================================
+# Applicato SOLO in fase di redistribuzione degli slot liberi (vedi retrieve_chunks,
+# step 5). La quota garantita per sottoquery non viene mai toccata da MMR: questo
+# limita il rischio di escludere un parent rilevante ma "solo" per somiglianza
+# vettoriale con un altro (vedi discussione: il vettore-proxy, un centroid dei
+# chunk recuperati, non rappresenta l'intero parent).
+
+MMR_LOG_TAG = "[MMR]"
+
+def cosine(v1, v2):
+    """Similarità coseno tra due vettori. Ritorna 0.0 se uno dei due è nullo."""
+    v1, v2 = np.asarray(v1), np.asarray(v2)
+    denom = np.linalg.norm(v1) * np.linalg.norm(v2)
+    return float(np.dot(v1, v2) / denom) if denom else 0.0
+
+
+def select_with_mmr(candidates, selected_vectors, lam, sim_threshold, k, task_id="UNKNOWN"):
+    """
+    Seleziona fino a k parent tra 'candidates' massimizzando rilevanza e penalizzando
+    la ridondanza rispetto ai parent già selezionati (already_selected, quota garantita).
+
+    candidates: list di dict {"pid": str, "score": float, "vector": np.ndarray}
+    selected_vectors: dict {pid: vector} dei parent GIÀ in quota (fissi, non rimovibili,
+                      usati solo per calcolare la penalità di similarità)
+    lam: peso rilevanza vs diversità. lam=1.0 -> comportamento identico al ranking puro.
+    sim_threshold: la penalità scatta solo se la similarità supera questa soglia
+                   (evita di penalizzare parent solo "un po'" simili ma complementari)
+    k: numero di slot da riempire
+
+    Ritorna: (picked_pids, debug_info) dove debug_info è una lista di dict utile al log
+    (pid, score, max_sim_to_selected, penalizzato: bool)
+    """
+    debug_info = []
+
+    if lam >= 1.0:
+        # Nessuna penalità: puro ranking per score, identico al comportamento pre-MMR.
+        ordered = sorted(candidates, key=lambda c: c["score"], reverse=True)
+        picked = [c["pid"] for c in ordered[:k]]
+        log.debug(f"[{task_id}] {MMR_LOG_TAG} lam=1.0 -> bypass, ranking puro su {len(candidates)} candidati.")
+        return picked, debug_info
+
+    picked = []
+    pool = list(candidates)
+    current_vectors = dict(selected_vectors)  # cresce ad ogni pick
+
+    log.info(
+        f"[{task_id}] {MMR_LOG_TAG} Avvio selezione: {len(candidates)} candidati, "
+        f"{len(selected_vectors)} già selezionati (quota), lam={lam}, "
+        f"sim_threshold={sim_threshold}, slot da riempire={k}."
+    )
+
+    while pool and len(picked) < k:
+        best_item, best_mmr, best_max_sim, best_penalized = None, float("-inf"), 0.0, False
+
+        for item in pool:
+            valid_selected_vectors = [v for v in current_vectors.values() if v is not None]
+            if valid_selected_vectors and item.get("vector") is not None:
+                max_sim = max(cosine(item["vector"], v) for v in valid_selected_vectors)
+            else:
+                max_sim = 0.0  # nessun vettore disponibile: non penalizzabile per similarità
+            penalized = max_sim >= sim_threshold
+            penalty = max_sim if penalized else 0.0
+            mmr_score = lam * item["score"] - (1 - lam) * penalty
+
+            if mmr_score > best_mmr:
+                best_mmr, best_item = mmr_score, item
+                best_max_sim, best_penalized = max_sim, penalized
+
+        picked.append(best_item["pid"])
+        current_vectors[best_item["pid"]] = best_item["vector"]
+        pool.remove(best_item)
+
+        debug_info.append({
+            "pid": best_item["pid"],
+            "score": round(best_item["score"], 4),
+            "max_sim_to_selected": round(best_max_sim, 4),
+            "penalized": best_penalized,
+            "mmr_score": round(best_mmr, 4),
+        })
+
+        log.debug(
+            f"[{task_id}] {MMR_LOG_TAG} Scelto parent_id={best_item['pid']} "
+            f"(score={best_item['score']:.4f}, max_sim_to_selected={best_max_sim:.4f}, "
+            f"penalizzato={'sì' if best_penalized else 'no'}, mmr_score={best_mmr:.4f})."
+        )
+
+    n_penalized = sum(1 for d in debug_info if d["penalized"])
+    log.info(
+        f"[{task_id}] {MMR_LOG_TAG} Selezione completata: {len(picked)}/{k} slot riempiti, "
+        f"{n_penalized} scelti nonostante penalità di ridondanza (sopra soglia {sim_threshold})."
+    )
+
+    return picked, debug_info
+
+
+# ==============================================================================
+# 4ter. PROFILI DI RETRY — escalation progressiva
+# ==============================================================================
+# Tentativo 0: comportamento attuale (recall di base, MMR di fatto disattivato).
+# Tentativo 1: allarga la RECALL (più candidati, soglia più permissiva), MMR ancora spento
+#              -> "forse non ho pescato abbastanza materiale, allargo la rete".
+# Tentativo 2: recall ancora più larga + MMR attivo (lam<1)
+#              -> "ho materiale ma è probabilmente un cluster semantico ripetitivo,
+#                  forzo diversità per esplorare angolazioni diverse".
+RETRY_PROFILES = {
+    0: {"size_mult": 1.0, "threshold_mult": 1.0, "mmr_lambda": 1.0},
+    1: {"size_mult": 1.5, "threshold_mult": 0.8, "mmr_lambda": 1.0},
+    2: {"size_mult": 2.0, "threshold_mult": 0.7, "mmr_lambda": 0.8},
+}
+
+
+def profile_kwargs(attempt, task_id="UNKNOWN"):
+    """Traduce il numero di tentativo in parametri concreti per retrieve_chunks."""
+    profile = RETRY_PROFILES.get(attempt, RETRY_PROFILES[max(RETRY_PROFILES)])
+    kwargs = {
+        "semantic_size": int(settings.qdrant_semantic_size * profile["size_mult"]),
+        "semantic_threshold": settings.qdrant_semantic_threshold * profile["threshold_mult"],
+        "mmr_lambda": profile["mmr_lambda"],
+    }
+    log.info(
+        f"[{task_id}] [RETRY_PROFILE] Tentativo {attempt} -> "
+        f"semantic_size={kwargs['semantic_size']} "
+        f"(x{profile['size_mult']}), semantic_threshold={kwargs['semantic_threshold']:.3f} "
+        f"(x{profile['threshold_mult']}), mmr_lambda={kwargs['mmr_lambda']}."
+    )
+    return kwargs
+
 
 def load_prompt_template(filename):
     """Load a prompt template from the prompts directory."""
@@ -571,15 +702,30 @@ def setup_periodic_tasks(sender, **kwargs):
 # ==============================================================================
 # 7. DOCUMENT RETRIEVAL (With OPTIMIZED Reranking)
 # ==============================================================================
-def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_sub_topics, metadata_filters, include_undated=True):
+def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_sub_topics,
+                     metadata_filters, include_undated=True,
+                     semantic_size=None, semantic_threshold=None, mmr_lambda=1.0,
+                     task_id="UNKNOWN"):
     """
     Recupera, fonde e riordina i chunk dal Vector DB in modo sicuro.
+
+    semantic_size / semantic_threshold: sovrascrivono i default di settings, usati
+        dai profili di retry per allargare progressivamente la recall.
+    mmr_lambda: peso rilevanza/diversità nella redistribuzione degli slot liberi.
+        1.0 = comportamento identico a prima dell'introduzione di MMR.
     """
     if not qdrant_client:
         log.error("Qdrant client not available! Retrieval aborted.")
-        return [], []
-    
+        return [], [], {}
+
+    semantic_size = semantic_size or settings.qdrant_semantic_size
+    semantic_threshold = semantic_threshold if semantic_threshold is not None else settings.qdrant_semantic_threshold
+
     log.info(f"=== Inizio Retrieval per topic '{topic_id}' ===")
+    log.info(
+        f"[{task_id}] [RETRIEVAL_PARAMS] semantic_size={semantic_size}, "
+        f"semantic_threshold={semantic_threshold:.3f}, mmr_lambda={mmr_lambda}."
+    )
     log.debug(f"Search Queries: {search_queries} | Keywords: {keywords}")
     
     try:
@@ -670,9 +816,10 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
                     query=vector,
                     group_by="content_hash",
                     group_size=1,
-                    limit=settings.qdrant_semantic_size,
-                    score_threshold=settings.qdrant_semantic_threshold,
-                    query_filter=models.Filter(must=must_conditions)
+                    limit=semantic_size,
+                    score_threshold=semantic_threshold,
+                    query_filter=models.Filter(must=must_conditions),
+                    with_vectors=True  # necessario per costruire i centroid-per-parent usati da MMR
                 )
                 points = [group.hits[0] for group in res.groups if group.hits]
                 log.debug(f"Vector search #{idx} returned {len(points)} grouped hits.")
@@ -704,7 +851,8 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
                         scroll_filter=models.Filter(must=must_conditions + [models.Filter(should=should_cond)]),
                         limit=target_size * 2,  # batch ampio per compensare i duplicati scartati
                         offset=next_offset,
-                        with_payload=True
+                        with_payload=True,
+                        with_vectors=True  # necessario per costruire i centroid-per-parent usati da MMR
                     )
                     iterations += 1
 
@@ -830,6 +978,41 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
 
 
         # ==========================================================
+        # 3bis. CENTROID PER PARENT (vettore-proxy per MMR)
+        #
+        # Il parent non ha un proprio embedding: usiamo la media (centroid) dei
+        # vettori di tutti i chunk recuperati per quel parent, tra tutte le
+        # sottoquery. È più rappresentativo di un singolo "chunk vincitore"
+        # perché riflette tutto ciò che il retrieval ha effettivamente trovato
+        # di quel documento, non solo il suo frammento più rilevante.
+        # ==========================================================
+        parent_chunk_vectors: dict[str, list] = {}
+        parent_best_score: dict[str, float] = {}
+
+        for chunks in top_chunks_per_query:
+            for chunk in chunks:
+                pid = chunk.payload.get("parent_id") if chunk.payload else None
+                if not pid:
+                    continue
+                score = getattr(chunk, "score", 0.0) or 0.0
+                if pid not in parent_best_score or score > parent_best_score[pid]:
+                    parent_best_score[pid] = score
+
+                vec = getattr(chunk, "vector", None)
+                if vec is not None:
+                    parent_chunk_vectors.setdefault(pid, []).append(np.asarray(vec))
+
+        parent_centroids = {
+            pid: np.mean(vecs, axis=0) for pid, vecs in parent_chunk_vectors.items()
+        }
+
+        n_missing_vectors = sum(1 for pid in parent_best_score if pid not in parent_centroids)
+        log.info(
+            f"[{task_id}] {MMR_LOG_TAG} Centroid calcolati per {len(parent_centroids)} parent "
+            f"(su {len(parent_best_score)} parent candidati; {n_missing_vectors} senza vettore disponibile)."
+        )
+
+        # ==========================================================
         # 4. QUOTA GARANTITA PER SOTTOQUERY
         #
         # Ogni sottoquery contribuisce al massimo PARENTS_PER_QUERY
@@ -873,13 +1056,21 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
         # ==========================================================
         total_budget = settings.parents_per_query * n_queries
         slots_free = total_budget - len(already_selected)
- 
+
+        # Inizializzati qui così restano definiti (a 0/vuoto) anche se non
+        # scatta la redistribuzione — servono per le metriche finali.
+        n_mmr_candidates = 0
+        n_mmr_penalized = 0
+
         if slots_free > 0:
             log.info(f"Redistribuzione: {slots_free} slot liberi su {total_budget} totali.")
- 
-            # Riserve per ogni query: parent validi oltre la quota, nell'ordine del reranker
+
+            # Riserve per ogni query: parent validi oltre la quota, nell'ordine del reranker.
+            # pid_owner_query serve per sapere a quale sottoquery "restituire" il pid dopo
+            # la selezione MMR, così quota_per_query resta coerente con la struttura precedente.
             reserve_per_query: list[list[str]] = []
-            for top_chunks in top_chunks_per_query:
+            pid_owner_query: dict[str, int] = {}
+            for q_idx, top_chunks in enumerate(top_chunks_per_query):
                 reserve: list[str] = []
                 seen_parents: set[str] = set()
                 for chunk in top_chunks:
@@ -889,29 +1080,92 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
                     seen_parents.add(pid)
                     if pid not in already_selected:
                         reserve.append(pid)
+                        pid_owner_query.setdefault(pid, q_idx)
                 reserve_per_query.append(reserve)
- 
-            # Round-robin tra le sottoquery finché slot esauriti o riserve vuote
+
+            # Pool unico di candidati (deduplicato) per la selezione MMR globale.
+            # Solo i pid con centroid disponibile entrano nella valutazione MMR;
+            # quelli senza vettore (raro: mismatch nel recupero with_vectors) vengono
+            # solo loggati, non selezionabili da MMR (con lam=1.0 il problema non si pone,
+            # perché MMR non serve nemmeno il vettore per ordinare per score).
+            seen_reserve: set[str] = set()
+            reserve_pool = []
+            n_skipped_no_vector = 0
+            for reserve in reserve_per_query:
+                for pid in reserve:
+                    if pid in seen_reserve:
+                        continue
+                    seen_reserve.add(pid)
+                    if pid in parent_centroids:
+                        reserve_pool.append({
+                            "pid": pid,
+                            "score": parent_best_score.get(pid, 0.0),
+                            "vector": parent_centroids[pid],
+                        })
+                    else:
+                        n_skipped_no_vector += 1
+                        # Fallback: se manca il vettore includiamo comunque il pid con score,
+                        # così anche con lam<1 non lo perdiamo (verrà solo trattato come non
+                        # comparabile: nessuna penalità di similarità applicabile su di lui).
+                        reserve_pool.append({
+                            "pid": pid,
+                            "score": parent_best_score.get(pid, 0.0),
+                            "vector": None,
+                        })
+
+            if n_skipped_no_vector:
+                log.warning(
+                    f"[{task_id}] {MMR_LOG_TAG} {n_skipped_no_vector} parent candidati alla "
+                    f"redistribuzione senza vettore disponibile (inclusi comunque, senza "
+                    f"possibilità di essere penalizzati per similarità)."
+                )
+
+            already_selected_vectors = {
+                pid: parent_centroids[pid] for pid in already_selected if pid in parent_centroids
+            }
+
+            picked_pids, mmr_debug = select_with_mmr(
+                reserve_pool,
+                already_selected_vectors,
+                lam=mmr_lambda,
+                sim_threshold=settings.mmr_similarity_threshold,
+                k=slots_free,
+                task_id=task_id,
+            )
+
             redistributed = 0
-            changed = True
-            while slots_free > 0 and changed:
-                changed = False
-                for q_idx, reserve in enumerate(reserve_per_query):
-                    if slots_free == 0:
-                        break
-                    if not reserve:
-                        continue
-                    pid = reserve.pop(0)
-                    if pid in already_selected:
-                        continue
-                    quota_per_query[q_idx].append(pid)
-                    already_selected.add(pid)
-                    slots_free -= 1
-                    redistributed += 1
-                    changed = True
+            for pid in picked_pids:
+                q_idx = pid_owner_query.get(pid)
+                if q_idx is None:
+                    log.warning(f"[{task_id}] {MMR_LOG_TAG} pid={pid} scelto ma senza sottoquery proprietaria: skip.")
+                    continue
+                quota_per_query[q_idx].append(pid)
+                already_selected.add(pid)
+                redistributed += 1
+
+            log.info(
+                f"[{task_id}] Redistribuzione completata: {redistributed} parent aggiunti "
+                f"(mmr_lambda={mmr_lambda}, candidati valutati={len(reserve_pool)})."
+            )
+            if mmr_debug:
+                log.debug(f"[{task_id}] {MMR_LOG_TAG} Dettaglio scelte: {mmr_debug}")
+
+            n_mmr_candidates = len(reserve_pool)
+            n_mmr_penalized = sum(1 for d in mmr_debug if d["penalized"])
  
-            log.info(f"Redistribuzione completata: {redistributed} parent aggiunti.")
- 
+        # ==========================================================
+        # 5bis. STATISTICHE DI RETRIEVAL (per la tabella rag_metrics)
+        # ==========================================================
+        retrieval_stats = {
+            "semantic_size": semantic_size,
+            "semantic_threshold": round(semantic_threshold, 4),
+            "mmr_lambda": mmr_lambda,
+            "n_parent_candidates": len(parent_best_score),
+            "n_mmr_candidates": n_mmr_candidates,
+            "n_mmr_penalized": n_mmr_penalized,
+            "n_parents_selected": len(already_selected),
+        }
+
         # ==========================================================
         # 6. POOL FINALE — ordine FIFO per sottoquery
         # ==========================================================
@@ -926,7 +1180,7 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
  
         if not final_parent_ids_ordered:
             log.warning("Nessun parent_id estratto da nessuna sottoquery.")
-            return [], []
+            return [], [], retrieval_stats
  
         log.info(
             f"Pool finale: {len(final_parent_ids_ordered)} parent distinti "
@@ -940,7 +1194,7 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
         parent_records = []
         conn = get_db_connection()
         if not conn:
-            return [], []
+            return [], [], retrieval_stats
  
         try:
             log.debug(f"Parent ID da recuperare da DB: {final_parent_ids_ordered}")
@@ -1012,11 +1266,12 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
                     unique_sources_map[source] = {"source": source, "sub_topic": sub_topic_id, "file_name": file_name, "date": doc_date}
  
         log.info(f"=== Retrieval completata. Parent al generatore: {len(rich_context)} ===")
-        return rich_context, list(unique_sources_map.values())
+        retrieval_stats["n_parents_final"] = len(rich_context)
+        return rich_context, list(unique_sources_map.values()), retrieval_stats
  
     except Exception as e:
         log.critical(f"Errore critico nel Retrieval: {e}", exc_info=True)
-        return [], []
+        return [], [], {}
 
 def get_reranker_pool():
     global _RERANKER_POOL
@@ -1150,6 +1405,53 @@ def log_automatic_negative_feedback(query, answer, topic_id, history, task_id="U
         conn.close()
 
 
+def log_rag_metrics(task_id, topic_id, query, cache_hit, is_satisfactory,
+                     total_attempts, duration_ms, attempts_metrics):
+    """
+    Salva su MySQL (tabella rag_metrics, vedi create_rag_metrics_table.sql) una
+    riga di sintesi per ogni task RAG processato: quanti tentativi sono serviti,
+    se è finito in cache, e il dettaglio per-tentativo (parametri di recall,
+    lambda MMR, quanti candidati/penalizzati) come JSON in attempts_detail.
+
+    Non blocca mai il flusso principale: un fallimento qui viene solo loggato,
+    esattamente come già fatto per la cache semantica e il feedback automatico.
+    """
+    conn = get_db_connection()
+    if not conn:
+        log.error(f"[{task_id}] [RAG_METRICS] Impossibile salvare: DB pool non disponibile.")
+        return
+
+    try:
+        attempts_json = json.dumps(attempts_metrics, default=str)
+
+        sql = """
+            INSERT INTO rag_metrics
+            (task_id, topic_id, query_preview, cache_hit, is_satisfactory,
+             total_attempts, duration_ms, attempts_detail)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        """
+
+        with conn.cursor() as cursor:
+            cursor.execute(sql, (
+                task_id,
+                topic_id,
+                query[:255] if query else None,
+                cache_hit,
+                is_satisfactory,
+                total_attempts,
+                duration_ms,
+                attempts_json
+            ))
+        conn.commit()
+        log.debug(f"[{task_id}] [RAG_METRICS] ✓ Metriche salvate (attempts={total_attempts}, cache_hit={cache_hit}).")
+
+    except Exception as e:
+        log.error(f"[{task_id}] [RAG_METRICS] ✗ Errore durante il salvataggio a DB: {e}")
+        conn.rollback()
+    finally:
+        conn.close()
+
+
 
 # ==============================================================================
 # 8. MAIN CELERY TASK
@@ -1161,6 +1463,11 @@ def process_rag_query(self, query, history, topic_id, selected_sub_topics=None, 
     start_time = time.time()
     task_id = self.request.id
     log.info(f"[{task_id}] Task started: '{query[:50]}...' su topic: {topic_id}")
+
+    # Accumula, per ciascun tentativo di retrieval, i parametri usati e le stats
+    # ritornate da retrieve_chunks. Alla fine viene salvato in rag_metrics
+    # (vedi log_rag_metrics) come JSON, per analisi a posteriori sui profili.
+    attempts_metrics: list[dict] = []
 
     # ==========================================================
     # SETUP & VALIDATION
@@ -1231,6 +1538,12 @@ def process_rag_query(self, query, history, topic_id, selected_sub_topics=None, 
         cached = check_semantic_cache(primary_vector, topic_id, st_key, filters_key)
         if cached:
             log.info(f"[{task_id}] Cache HIT. Returning cached response.")
+            log_rag_metrics(
+                task_id=task_id, topic_id=topic_id, query=query,
+                cache_hit=True, is_satisfactory=True,
+                total_attempts=0, duration_ms=int((time.time() - start_time) * 1000),
+                attempts_metrics=[]
+            )
             return {
                 "answer": cached['answer'],
                 "sources": cached['sources'],
@@ -1245,15 +1558,18 @@ def process_rag_query(self, query, history, topic_id, selected_sub_topics=None, 
     # RETRIEVAL (Parallel Vector + Keyword)
     # ==========================================================
     try:
-        context, sources = retrieve_chunks(
+        context, sources, retrieval_stats = retrieve_chunks(
             search_queries, 
             vectors_list, 
             all_keywords, 
             topic_id, 
             selected_sub_topics,
             metadata_filters,
-            include_undated
+            include_undated,
+            task_id=task_id,
+            **profile_kwargs(0, task_id=task_id)
         )
+        attempts_metrics.append({"attempt": 0, "standalone_query": standalone_query, **retrieval_stats})
     except Exception as e:
         log.error(f"[{task_id}] Vector DB Retrieval failed: {e}", exc_info=True)
         return {"error": "Database Error", "message": "Errore durante il recupero dei documenti.", "status": "failed"}
@@ -1265,7 +1581,7 @@ def process_rag_query(self, query, history, topic_id, selected_sub_topics=None, 
     answer = None
     is_satisfactory = False
 
-    while attempt < MAX_MODEL_RETRIES and not is_satisfactory:
+    while attempt < settings.max_model_retries and not is_satisfactory:
         if not context:
             answer = "<p>Non sono riuscito a trovare la risposta nei documenti che ho analizzato.</p>"
             log.debug(f"[{task_id}] Context empty. Breaking loop.")
@@ -1317,8 +1633,8 @@ def process_rag_query(self, query, history, topic_id, selected_sub_topics=None, 
         # D. Gestione Retry Fallimento
         if not is_satisfactory:
             attempt += 1
-            if attempt < MAX_MODEL_RETRIES:
-                log.warning(f"[{task_id}] Answer unsatisfactory. Retrying ({attempt}/{MAX_MODEL_RETRIES}) with full pipeline...")
+            if attempt < settings.max_model_retries:
+                log.warning(f"[{task_id}] Answer unsatisfactory. Retrying ({attempt}/{settings.max_model_retries}) with full pipeline...")
                 try:
                     # 1. Iniettiamo un "falso" messaggio di sistema nella history per forzare l'LLM a cambiare approccio
                     retry_history = history.copy() if history else []
@@ -1341,15 +1657,18 @@ def process_rag_query(self, query, history, topic_id, selected_sub_topics=None, 
                     
                     # 3. Rieseguiamo il Batch Embedding e il Retrieval Multi-Query
                     vectors_list = embed_queries_batch(search_queries)
-                    context, sources = retrieve_chunks(
+                    context, sources, retrieval_stats = retrieve_chunks(
                         search_queries, 
                         vectors_list, 
                         extracted_keywords, 
                         topic_id, 
                         selected_sub_topics,
                         metadata_filters,
-                        include_undated
+                        include_undated,
+                        task_id=task_id,
+                        **profile_kwargs(attempt, task_id=task_id)
                     )
+                    attempts_metrics.append({"attempt": attempt, "standalone_query": standalone_query, **retrieval_stats})
                 except Exception as e:
                     log.error(f"[{task_id}] Retry infrastructure failed: {e}", exc_info=True)
                     break  # Usciamo usando l'ultima answer generata
@@ -1390,7 +1709,14 @@ def process_rag_query(self, query, history, topic_id, selected_sub_topics=None, 
 
     duration = time.time() - start_time
     log.info(f"[{task_id}] ✓ Completed gracefully in {duration:.2f}s")
-    
+
+    log_rag_metrics(
+        task_id=task_id, topic_id=topic_id, query=query,
+        cache_hit=False, is_satisfactory=is_satisfactory,
+        total_attempts=len(attempts_metrics), duration_ms=int(duration * 1000),
+        attempts_metrics=attempts_metrics
+    )
+
     return {
         "answer": answer,
         "sources": sources,

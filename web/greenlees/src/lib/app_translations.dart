@@ -132,8 +132,10 @@ class AppTranslations {
           "Change the screen colors (Light, Dark, or High Contrast) to improve visibility.",
     },
     'delete_chat_desc': {
-      AppLang.it: "Elimina la chat corrente e inizia una nuova conversazione.",
-      AppLang.en: "Delete the current chat and start a new conversation.",
+      AppLang.it:
+          "Elimina la chat corrente e inizia una nuova conversazione.",
+      AppLang.en:
+          "Delete the current chat and start a new conversation.",
     },
     'filter_subtopics_desc': {
       AppLang.it:
@@ -150,7 +152,16 @@ class AppTranslations {
       AppLang.en:
           "The search is complex, it's taking longer than expected...please wait a bit more...",
     },
-    'send_question': {AppLang.it: "Invia domanda", AppLang.en: "Send question"},
+    'taking_much_longer': {
+      AppLang.it:
+          "La ricerca è molto complessa, ci sta volendo più del previsto...ci siamo quasi...",
+      AppLang.en:
+          "The search is very complex, it's taking longer than expected...we're almost there...",
+    },
+    'send_question': {
+      AppLang.it: "Invia domanda",
+      AppLang.en: "Send question",
+    },
     'send_question_desc': {
       AppLang.it: "Invia la tua domanda al chatbot",
       AppLang.en: "Send your question to the chatbot",
@@ -160,8 +171,14 @@ class AppTranslations {
       AppLang.it: "Filtro per data",
       AppLang.en: "Date Filter",
     },
-    'date_from': {AppLang.it: "Data da", AppLang.en: "Date from"},
-    'date_to': {AppLang.it: "Data a", AppLang.en: "Date to"},
+    'date_from': {
+      AppLang.it: "Data da",
+      AppLang.en: "Date from",
+    },
+    'date_to': {
+      AppLang.it: "Data a",
+      AppLang.en: "Date to",
+    },
     'clear_date_filter': {
       AppLang.it: "Cancella filtro data",
       AppLang.en: "Clear date filter",
@@ -178,6 +195,8 @@ class AppTranslations {
       AppLang.it: "{desc}: {count} documenti",
       AppLang.en: "{desc}: {count} documents",
     },
+
+
   };
 
   /// Helper function to grab the correct string based on the current language
