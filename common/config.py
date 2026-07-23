@@ -104,7 +104,7 @@ class Settings:
     max_reranker_thread: int
     reranker_pool_size: int
     max_allowed_pages: int
-    model_max_retry: int
+    max_model_retries: int
 
     id_tipo_iter_atteso: dict[str, set[str]]
 
@@ -210,7 +210,7 @@ def load_settings() -> Settings:
 
         max_allowed_pages = int(os.environ.get("MAX_ALLOWED_PAGES") or 300),
 
-        model_max_retry = int(os.environ.get("MODEL_MAX_RETRY") or 3),
+        max_model_retries = int(os.environ.get("MAX_MODEL_RETRIES") or 3),
     )
 
 settings = load_settings()

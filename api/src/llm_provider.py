@@ -120,6 +120,7 @@ class GeminiProvider(LLMProvider):
                     contents=prompt,
                     config=config
                 )
+                self._log_usage(model_name, response, max_tokens)
                 return response.text
             except self._rate_limit_exceptions as e:
                 # Il nuovo APIError espone l'attributo 'code' (lo status HTTP).
@@ -130,6 +131,51 @@ class GeminiProvider(LLMProvider):
                 raise
 
         return _retry_with_backoff(_attempt)
+
+    def _log_usage(self, model_name: str, response, max_tokens: int) -> None:
+        """
+        Logga finish_reason e ripartizione token (thinking vs output) per ogni
+        chiamata Gemini. Nel google-genai SDK, max_output_tokens è un budget
+        CONDIVISO tra token di thinking e token di output visibile (comportamento
+        confermato da più issue upstream, es. googleapis/python-genai#782,#2062):
+        se il thinking (che può essere dinamico e imprevedibile) consuma quasi
+        tutto il budget, il testo visibile viene troncato con finish_reason
+        MAX_TOKENS — esattamente il sintomo osservato nei log di generate_answer.
+
+        Non solleva mai eccezioni: è pura osservabilità, un suo fallimento non
+        deve mai far cadere la chiamata principale.
+        """
+        try:
+            usage = getattr(response, "usage_metadata", None)
+            candidates = getattr(response, "candidates", None)
+            finish_reason = getattr(candidates[0], "finish_reason", None) if candidates else None
+            finish_reason_str = str(finish_reason) if finish_reason is not None else "UNKNOWN"
+
+            thinking_tokens = getattr(usage, "thoughts_token_count", None) if usage else None
+            output_tokens = getattr(usage, "candidates_token_count", None) if usage else None
+            total_tokens = getattr(usage, "total_token_count", None) if usage else None
+
+            base_msg = (
+                f"[GEMINI_USAGE] model={model_name} finish_reason={finish_reason_str} "
+                f"thinking_tokens={thinking_tokens} output_tokens={output_tokens} "
+                f"total_tokens={total_tokens} max_output_tokens_budget={max_tokens}"
+            )
+
+            if "MAX_TOKENS" in finish_reason_str:
+                thinking_pct = (
+                    round(thinking_tokens / max_tokens * 100)
+                    if thinking_tokens and max_tokens else None
+                )
+                log.warning(
+                    f"{base_msg} — ⚠ Risposta troncata (MAX_TOKENS). Il thinking ha "
+                    f"consumato {f'{thinking_pct}%' if thinking_pct is not None else 'N/D'} "
+                    f"del budget totale, lasciando poco/nessun margine per l'output visibile."
+                )
+            else:
+                log.debug(base_msg)
+        except Exception as e:
+            # La telemetria non deve mai bloccare il flusso principale.
+            log.debug(f"[GEMINI_USAGE] Impossibile leggere usage_metadata: {e}")
 
     def generate_json(self, model_name: str, prompt: str, temperature: float = 0.1, max_tokens: int = 2048, thinking_level: bool = None) -> str:
         return self._call(model_name, prompt, temperature, max_tokens, json_mode=True, thinking_level=thinking_level)
