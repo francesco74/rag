@@ -203,8 +203,8 @@ def load_settings() -> Settings:
                   "parent_index", "child_index", "file_name", "_ingestion_error", "_ingestion_id", "content_hash"},
 
         max_reranker_thread = int(os.environ.get("MAX_RERANKER_THREAD") or 2),
-        answer_thinking_level = os.environ.get("ANSWER_THINKING_LEVEL") or 'low',
-        grader_thinking_level = os.environ.get("GRADER_THINKING_LEVEL") or 'minimal',
+        answer_thinking_level = os.environ.get("ANSWER_THINKING_LEVEL") or 'LOW',
+        grader_thinking_level = os.environ.get("GRADER_THINKING_LEVEL") or 'MINIMAL',
 
         reranker_pool_size = int(os.environ.get("RERANKER_POOL_SIZE") or 1),
 

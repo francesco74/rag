@@ -91,7 +91,6 @@ celery_app.conf.update(
 # Globals assigned strictly AFTER the fork
 db_pool = None
 qdrant_client = None
-_RERANKER_INSTANCE = None
 
 EMBEDDING_MODEL = "gemini-embedding-001"
 
@@ -1059,8 +1058,15 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
 
         # ==========================================================
         # 3. RERANK PER-QUERY — salva top_chunks per riuso nella redistribuzione
+        #
+        # Ogni sotto-query pesca dal pool di istanze ONNXReranker (get_reranker_pool),
+        # una per thread concorrente invece di condividerne una sola. Prima, tutti i
+        # thread del ThreadPoolExecutor sotto chiamavano .rerank() sulla STESSA
+        # istanza globale (get_reranker()): la sessione ONNX è deliberatamente
+        # ORT_SEQUENTIAL (per evitare deadlock in Celery), quindi 2 thread paralleli
+        # si contendevano lo stesso budget di calcolo invece di raddoppiarlo.
         # ==========================================================
-        reranker = get_reranker()
+        pool = get_reranker_pool()
         n_queries = len(search_queries)
         top_chunks_per_query: list[list] = [[] for _ in range(n_queries)]
 
@@ -1094,14 +1100,16 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
                     f"(rimossi {n_before_content_dedup - len(unique_candidates)} duplicati)."
                 )
 
-            # Rerank effettivo
-            if reranker:
+            # Rerank effettivo — istanza dedicata dal pool per questo q_idx,
+            # non condivisa con gli altri thread concorrenti.
+            reranker_instance = pool[q_idx % len(pool)] if pool else None
+            if reranker_instance:
                 docs_content = [
                     c.payload.get("content", "")[:settings.rerank_truncate]
                     for c in unique_candidates
                 ]
                 try:
-                    reranked = reranker.rerank(query_str, docs_content)
+                    reranked = reranker_instance.rerank(query_str, docs_content)
                     reranked.sort(key=lambda x: x.score, reverse=True)
                     top_chunks = []
                     for res in reranked[:settings.rerank_size]:
@@ -1454,50 +1462,31 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
         return [], [], {}
 
 def get_reranker_pool():
+    """
+    Pool di istanze ONNXReranker indipendenti, una per thread concorrente
+    (settings.reranker_pool_size). Ogni sotto-query pesca la propria istanza
+    via round-robin su q_idx (vedi process_single_rerank in retrieve_chunks),
+    invece di contendersi un'unica sessione condivisa tra tutti i thread.
+
+    num_threads per istanza è calcolato dividendo i core disponibili per la
+    dimensione del pool, invece di un valore fisso: con un pool più grande,
+    ogni istanza usa meno thread intra-op, evitando di sovra-allocare i core
+    quando più istanze girano in parallelo.
+    """
     global _RERANKER_POOL
     if not _RERANKER_POOL:
+        num_threads = max(1, (os.cpu_count() or 2) // max(1, _POOL_SIZE))
         for i in range(_POOL_SIZE):
-            log.info(f"Initializing ONNX Reranker pool instance {i+1}/{_POOL_SIZE}...")
+            log.info(f"Initializing ONNX Reranker pool instance {i+1}/{_POOL_SIZE} (num_threads={num_threads})...")
             instance = ONNXReranker(
-                model_folder=settings.onnx_model_cache_path,
-                batch_size=settings.rerank_batch_size,
-                max_length=settings.rerank_max_length,
-                num_threads=2
-            )
-            _RERANKER_POOL.append(instance)
-    return _RERANKER_POOL
-
-def rerank_subquery(args):
-    pool_idx, query_str, docs_content = args
-    pool = get_reranker_pool()
-    reranker_instance = pool[pool_idx % len(pool)]
-    return reranker_instance.rerank(query_str, docs_content)
-
-
-def get_reranker():
-    """
-    Lazy loader for the Reranker.
-    Ensures initialization happens INSIDE the worker process, avoiding deadlocks.
-    """
-    global _RERANKER_INSTANCE
-    if _RERANKER_INSTANCE is None:
-        try:
-            log.info("Initializing ONNX Reranker (Lazy Load)...")
-            num_threads = min(os.cpu_count() or 2, settings.max_reranker_thread) 
-            log.info(f"Using {num_threads} threads...")
-
-            _RERANKER_INSTANCE = ONNXReranker(
                 model_folder=settings.onnx_model_cache_path,
                 batch_size=settings.rerank_batch_size,
                 max_length=settings.rerank_max_length,
                 num_threads=num_threads
             )
-            log.info("✓ Reranker initialized successfully.")
-        except Exception as e:
-            log.error(f"✗ Failed to lazy load Reranker: {e}")
-            _RERANKER_INSTANCE = False # Mark as failed so we don't retry every time
-            
-    return _RERANKER_INSTANCE if _RERANKER_INSTANCE is not False else None
+            _RERANKER_POOL.append(instance)
+    return _RERANKER_POOL
+
 
 
 
