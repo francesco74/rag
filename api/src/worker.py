@@ -375,25 +375,45 @@ def embed_for_concept_lookup(query):
     )
     return result.embeddings[0].values
 
-def expand_standalone_with_aliases(standalone_query, aliases, task_id="UNKNOWN"):
-    aliases_str = ", ".join(aliases)
-    
-    prompt = load_prompt_template("expand_with_alias").format(
-        aliases_str=aliases_str,
-        standalone_query=standalone_query,
-        max_sub_queries=settings.max_sub_queries
+def format_verified_concepts(concepts):
+    """
+    Formatta i concetti trovati nel dizionario per l'iniezione nel prompt
+    del rewriter, nel formato "Concept: alias1, alias2, ...", una riga per
+    concetto. Stringa vuota se non ci sono concetti (il prompt gestisce il
+    caso esplicitamente).
+    """
+    if not concepts:
+        return ""
+    return "\n".join(
+        f"{c['concept']}: {', '.join(c['aliases'])}"
+        for c in concepts if c.get("concept") and c.get("aliases")
     )
-    
-    try:
-        raw = get_llm_provider().generate_json(settings.query_rewriter_model_name, prompt, temperature=0.2, max_tokens=settings.answer_max_tokens)
-        data = safe_json_parse(raw, task_id)
-        return data.get("search_queries", [standalone_query])
-    except Exception as e:
-        log.error(f"[{task_id}] Errore nell'espansione alias: {e}. Fallback su query standalone.")
-        return [standalone_query]
 
-def transform_query(history, query, task_id="UNKNOWN"):
-    """Transform conversational query into standalone query + search facets + keywords."""
+
+def collect_concept_aliases(concepts):
+    """Unione (deduplicata) di tutti gli alias dei concetti trovati, per le keyword testuali."""
+    seen = set()
+    out = []
+    for c in concepts:
+        for a in c.get("aliases", []):
+            if a not in seen:
+                seen.add(a)
+                out.append(a)
+    return out
+
+
+def transform_query(history, query, task_id="UNKNOWN", verified_concepts=None):
+    """
+    Transform conversational query into standalone query + search facets + keywords.
+
+    verified_concepts: lista di concetti dal dizionario Qdrant (output di
+    get_concepts_by_similarity). Se presenti, vengono iniettati nel prompt
+    come vocabolario autoritativo: il rewriter li usa direttamente per la
+    decomposizione geografica (comuni verificati invece che indovinati) e
+    per l'espansione tematica, in un'unica chiamata — eliminando la vecchia
+    catena rewrite -> lookup -> seconda chiamata di espansione -> 
+    riconciliazione in Python.
+    """
     log.info(f"[{task_id}] [REWRITER] Avvio analisi query: '{query}'")
 
     if not history:
@@ -406,10 +426,15 @@ def transform_query(history, query, task_id="UNKNOWN"):
         ])
         log.debug(f"[{task_id}] [REWRITER] History iniettata (elementi: {len(history)})")
 
+    verified_concepts_str = format_verified_concepts(verified_concepts or [])
+    if verified_concepts_str:
+        log.debug(f"[{task_id}] [REWRITER] Concetti verificati iniettati:\n{verified_concepts_str}")
+
     prompt = load_prompt_template("query_rewriter").format(
         history_str=history_str,
         query=query,
-        max_sub_queries=settings.max_sub_queries
+        max_sub_queries=settings.max_sub_queries,
+        verified_concepts_str=verified_concepts_str
     )
 
     try:
@@ -479,6 +504,89 @@ def resolve_citations(answer_html: str, index_to_item: dict) -> str:
     return re.sub(pattern, replace_match, answer_html)
 
 
+# ==============================================================================
+# 5bis. WINDOWED TRUNCATION — ritaglio del parent centrato sui child che hanno
+# fatto match, invece di un taglio cieco dall'inizio del documento.
+# ==============================================================================
+# Quanti child (per parent) teniamo come "ancore" per il windowing. Tenerne
+# più di uno permette di coprire casi in cui più frammenti dello stesso
+# documento sono stati rilevanti per query diverse.
+SNIPPETS_PER_PARENT = 3
+# Lunghezza dell'ancora usata per localizzare lo snippet dentro il parent:
+# corta a sufficienza da tollerare piccole differenze di whitespace/normalizzazione
+# tra come il child è stato salvato e come appare dentro il testo del parent.
+SNIPPET_ANCHOR_LEN = 80
+
+
+def extract_relevant_window(content: str, matched_snippets: list, budget: int, task_id: str = "UNKNOWN") -> str:
+    """
+    Se il parent intero sta nel budget, nessun problema. Altrimenti, invece di
+    tagliare ciecamente i primi `budget` caratteri (rischiando di perdere
+    proprio il passaggio che ha fatto vincere questo parent al retrieval),
+    proviamo a localizzare i child/snippet che hanno fatto match e ritagliamo
+    una finestra centrata su di loro.
+
+    Fallback in cascata se la localizzazione fallisce (es. child normalizzato
+    diversamente dal parent in fase di ingestion): torna al comportamento
+    precedente (troncamento dall'inizio), mai un'eccezione.
+    """
+    if len(content) <= budget:
+        return content
+
+    if not matched_snippets:
+        log.debug(f"[{task_id}] [WINDOW] Nessuno snippet disponibile: fallback a troncamento dall'inizio.")
+        return content[:budget]
+
+    spans = []
+    for snippet in matched_snippets:
+        if not snippet:
+            continue
+        anchor = " ".join(snippet.split())[:SNIPPET_ANCHOR_LEN]
+        if not anchor:
+            continue
+        idx = content.find(anchor)
+        if idx == -1:
+            # Tentativo più permissivo: normalizza anche il documento (whitespace)
+            # prima di cercare. Approssimato (gli indici non combaciano più 1:1
+            # coi caratteri originali), ma preferibile a non trovare nulla.
+            normalized = " ".join(content.split())
+            idx_norm = normalized.find(anchor)
+            if idx_norm != -1:
+                idx = idx_norm
+        if idx != -1:
+            spans.append((idx, idx + len(snippet)))
+
+    if not spans:
+        log.debug(f"[{task_id}] [WINDOW] Nessuno snippet localizzato nel parent: fallback a troncamento dall'inizio.")
+        return content[:budget]
+
+    # Una finestra di margine per ogni ancora trovata, poi merge di quelle sovrapposte.
+    spans.sort()
+    margin = max(200, budget // (2 * len(spans)))
+    windows = [(max(0, s - margin), min(len(content), e + margin)) for s, e in spans]
+
+    merged = [windows[0]]
+    for s, e in windows[1:]:
+        last_s, last_e = merged[-1]
+        if s <= last_e:
+            merged[-1] = (last_s, max(last_e, e))
+        else:
+            merged.append((s, e))
+
+    pieces = [content[s:e] for s, e in merged]
+    result = "\n[...]\n".join(pieces)
+
+    if len(result) > budget:
+        result = result[:budget]
+
+    log.debug(
+        f"[{task_id}] [WINDOW] Finestra costruita da {len(spans)} snippet localizzati, "
+        f"{len(merged)} blocchi dopo merge, {len(result)}/{budget} chars usati "
+        f"(vs {len(content)} chars totali nel parent)."
+    )
+    return result
+
+
 def generate_answer(query, rich_context, topic_id):
     formatted_chunks = []
     curr_len = 0
@@ -501,8 +609,14 @@ def generate_answer(query, rich_context, topic_id):
         for idx, item in enumerate(rich_context, start=1):
             content = item['content']
             if len(content) > budget_per_parent:
-                log.debug(f"Parent '{item['source']}' (rif. [{idx}]) troncato: {len(content)} → {budget_per_parent} chars.")
-                content = content[:budget_per_parent]
+                original_len = len(content)
+                content = extract_relevant_window(
+                    content, item.get('matched_snippets', []), budget_per_parent
+                )
+                log.debug(
+                    f"Parent '{item['source']}' (rif. [{idx}]) ridotto: "
+                    f"{original_len} → {len(content)} chars (windowed su child match)."
+                )
 
             # NOTA: l'header espone al modello SOLO un indice numerico, mai il
             # filename. Il modello non può più scrivere/storpiare un nome file:
@@ -988,6 +1102,9 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
         # ==========================================================
         parent_chunk_vectors: dict[str, list] = {}
         parent_best_score: dict[str, float] = {}
+        # NEW: fino a SNIPPETS_PER_PARENT child (contenuto + score) per parent,
+        # usati da generate_answer per il windowing invece del troncamento cieco.
+        parent_top_snippets: dict[str, list] = {}
 
         for chunks in top_chunks_per_query:
             for chunk in chunks:
@@ -1001,6 +1118,13 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
                 vec = getattr(chunk, "vector", None)
                 if vec is not None:
                     parent_chunk_vectors.setdefault(pid, []).append(np.asarray(vec))
+
+                chunk_content = chunk.payload.get("content", "") if chunk.payload else ""
+                if chunk_content:
+                    snippets = parent_top_snippets.setdefault(pid, [])
+                    snippets.append({"content": chunk_content, "score": score})
+                    snippets.sort(key=lambda s: s["score"], reverse=True)
+                    del snippets[SNIPPETS_PER_PARENT:]
 
         parent_centroids = {
             pid: np.mean(vecs, axis=0) for pid, vecs in parent_chunk_vectors.items()
@@ -1255,12 +1379,16 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
                     log.debug(f"Metadata non parsabile per parent_id={p_doc.get('id')}: {e}")
 
             if content:
+                matched_snippets = [
+                    s["content"] for s in parent_top_snippets.get(p_doc.get("id"), []) if s.get("content")
+                ]
                 rich_context.append({
                     "content": content,
                     "source": source,
                     "date": doc_date,
                     "file_name": file_name,
                     "sub_topic": sub_topic_id,
+                    "matched_snippets": matched_snippets,
                 })
                 if source not in unique_sources_map:
                     unique_sources_map[source] = {"source": source, "sub_topic": sub_topic_id, "file_name": file_name, "date": doc_date}
@@ -1338,31 +1466,53 @@ def get_all_sub_topics(topic_id):
     finally:
         conn.close()
 
-def get_aliases_by_concept(query_vector, threshold=settings.qdrant_concept_threshold):
+def get_concepts_by_similarity(query_vector, threshold=settings.qdrant_concept_threshold, task_id="UNKNOWN"):
     """
-    Cerca nella collezione Qdrant se la query esprime un concetto 
-    mappato nel nostro dizionario semantico.
+    Ricerca UNICA sul dizionario concettuale: ritorna TUTTI i concetti sopra
+    soglia (fino a settings.qdrant_concept_max_hits), non solo il migliore.
+
+    Sostituisce la vecchia get_aliases_by_concept (limit=1, poi limit=1 per
+    categoria): il problema non era la mancanza di categorie ma il limite a
+    un solo hit — una query che tocca più concetti insieme ("lavoro agile in
+    Garfagnana") li recupera ora tutti in un colpo solo, quanti siano,
+    generalizzando automaticamente a qualunque numero di concetti presenti
+    nel dizionario, senza tassonomia da mantenere nel codice.
+
+    Ritorna una lista di dict: [{"concept": ..., "aliases": [...],
+    "category": ..., "score": ...}], ordinata per score decrescente (ordine
+    nativo di Qdrant). Lista vuota su miss o errore, mai eccezioni.
     """
     if not qdrant_client:
         return []
-        
+
+    max_hits = getattr(settings, "qdrant_concept_max_hits", 5)
+
     try:
         hits = qdrant_client.query_points(
             collection_name=CONCEPT_COLLECTION,
             query=query_vector,
-            limit=1,
+            limit=max_hits,
             score_threshold=threshold
         ).points
-        
-        if hits:
-            aliases = hits[0].payload.get("aliases", [])
-            log.info(f"[CONCEPT HIT] Rilevato concetto '{hits[0].payload.get('concept')}' (score: {hits[0].score:.3f}) -> Alias: {aliases}")
-            return aliases
+
+        concepts = []
+        for hit in hits:
+            payload = hit.payload or {}
+            concepts.append({
+                "concept": payload.get("concept", ""),
+                "aliases": payload.get("aliases", []),
+                "category": payload.get("category", ""),
+                "score": hit.score,
+            })
+
+        if concepts:
+            summary = ", ".join(f"'{c['concept']}' ({c['score']:.3f})" for c in concepts)
+            log.info(f"[{task_id}] [CONCEPT HIT] {len(concepts)} concetti sopra soglia (max {max_hits}): {summary}")
         else:
-            log.debug(f"[CONCEPT MISS]")
-        return []
+            log.debug(f"[{task_id}] [CONCEPT MISS] Nessun concetto sopra soglia {threshold}.")
+        return concepts
     except Exception as e:
-        log.error(f"Errore lookup concettuale su Qdrant: {e}")
+        log.error(f"[{task_id}] Errore lookup concettuale su Qdrant: {e}")
         return []
 
 
@@ -1490,13 +1640,34 @@ def process_rag_query(self, query, history, topic_id, selected_sub_topics=None, 
 
     # ==========================================================
     # QUERY TRANSFORMATION & MULTI-QUERY EXPANSION
+    # (concept-first: il dizionario Qdrant viene interrogato PRIMA del
+    # rewriter, e i concetti trovati vengono passati come vocabolario
+    # autoritativo dentro l'unica chiamata LLM che decide tutto)
     # ==========================================================
     try:
-        # Nota l'aggiunta di task_id qui
-        rewritten_data = transform_query(history, query, task_id)
-        
+        # 1. Lookup concettuale sul testo grezzo (ultimi turni + query corrente):
+        #    nomi di zone e concetti tecnici sono quasi sempre espliciti, quindi
+        #    non serve la risoluzione dei pronomi per trovarli. Nota: euristica —
+        #    su follow-up molto impliciti ("e lì invece?") il lookup può mancare
+        #    il concetto; in quel caso il rewriter ripiega sulle sue regole
+        #    generali, come da prompt.
+        lookup_text = query
+        if history:
+            recent_turns = [msg.get("text", "") for msg in history[-2:]]
+            lookup_text = " ".join(recent_turns + [query])
+
+        verified_concepts = []
+        try:
+            concept_vector = embed_for_concept_lookup(lookup_text)
+            verified_concepts = get_concepts_by_similarity(concept_vector, task_id=task_id)
+        except Exception as ce:
+            log.warning(f"[{task_id}] Lookup concettuale fallito ({ce}): il rewriter procede senza concetti verificati.")
+
+        # 2. Unica chiamata: rewrite + decomposizione + espansione insieme,
+        #    con i concetti verificati come dato di fatto nel prompt.
+        rewritten_data = transform_query(history, query, task_id, verified_concepts=verified_concepts)
+
         standalone_query = rewritten_data.get("standalone_query", query)
-        # Generiamo l'embedding della sola query standalone per capire il concetto
         primary_vector = embed_query(standalone_query)
 
         extracted_keywords = rewritten_data.get("keywords", [])
@@ -1505,19 +1676,9 @@ def process_rag_query(self, query, history, topic_id, selected_sub_topics=None, 
             log.debug(f"[{task_id}] Nessuna keyword restituita, attivo fallback testuale in Python.")
             extracted_keywords = [w.strip("?.,!'\"") for w in standalone_query.split() if len(w) > 3]
 
-        # Verifichiamo SEMANTICAMENTE se la query esprime un concetto nel dizionario
-        concept_vector = embed_for_concept_lookup(standalone_query)
-        db_aliases = get_aliases_by_concept(concept_vector)
-        
-        if db_aliases:
-            # Se c'è un concetto corrispondente, generiamo le sotto-query dedicate
-            search_queries = expand_standalone_with_aliases(standalone_query, db_aliases, task_id)
-            if not search_queries:
-                search_queries = [standalone_query]
-        else:
-            # Altrimenti proseguiamo con il flusso nativo dell'LLM
-            search_queries = rewritten_data.get("search_queries", [standalone_query])
-        
+        search_queries = rewritten_data.get("search_queries", [standalone_query])
+        db_aliases = collect_concept_aliases(verified_concepts)
+
         if standalone_query not in search_queries:
                     search_queries.insert(0, standalone_query)
         vectors_list = embed_queries_batch(search_queries) 
@@ -1526,6 +1687,7 @@ def process_rag_query(self, query, history, topic_id, selected_sub_topics=None, 
     except Exception as e:
         log.warning(f"[{task_id}] [MAIN_TASK] Pipeline di trasformazione caduta: {e}. Uso raw query.")
         standalone_query, search_queries, all_keywords = query, [query], []
+        lookup_text = query  # garantito anche nel fallback: usato dal lookup concettuale in retry
         primary_vector = embed_query(query)  # fallback sul raw query
         vectors_list = [primary_vector]
 
@@ -1643,15 +1805,31 @@ def process_rag_query(self, query, history, topic_id, selected_sub_topics=None, 
                         "text": f"La ricerca precedente per '{standalone_query}' non ha prodotto documenti validi. Riformula completamente la query usando sinonimi o concetti più ampi per esplorare un'angolazione semantica diversa."
                     })
                     
-                    # 2. Riusiamo la funzione strutturata (JSON Mode + Facets + Keywords)
-                    retry_data = transform_query(retry_history, query, f"{task_id}-RETRY")
+                    # 2. Lookup concettuale anche in retry, ma sul lookup_text
+                    #    GREZZO del primo giro (history + query originale
+                    #    dell'utente), NON sulla standalone_query del tentativo
+                    #    fallito: se il fallimento era dovuto proprio a una
+                    #    riformulazione distorta, ripartire da quella
+                    #    propagherebbe l'errore anche nel lookup. Il testo
+                    #    originale dell'utente è immune da errori di rewrite.
+                    retry_concepts = []
+                    try:
+                        retry_concept_vector = embed_for_concept_lookup(lookup_text)
+                        retry_concepts = get_concepts_by_similarity(retry_concept_vector, task_id=f"{task_id}-RETRY")
+                    except Exception as ce:
+                        log.warning(f"[{task_id}-RETRY] Lookup concettuale fallito ({ce}): retry senza concetti verificati.")
+
+                    retry_data = transform_query(retry_history, query, f"{task_id}-RETRY", verified_concepts=retry_concepts)
                     
                     standalone_query = retry_data.get("standalone_query", query)
-                    search_queries = retry_data.get("search_queries", [standalone_query])
                     extracted_keywords = retry_data.get("keywords", [])
                     
                     if not extracted_keywords:
                         extracted_keywords = [w.strip("?.,!'\"") for w in standalone_query.split() if len(w) > 3]
+
+                    search_queries = retry_data.get("search_queries", [standalone_query])
+                    extracted_keywords = list(set(extracted_keywords + collect_concept_aliases(retry_concepts)))
+
                     if standalone_query not in search_queries:
                         search_queries.insert(0, standalone_query)
                     

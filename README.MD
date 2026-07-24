@@ -12,23 +12,14 @@ Le intelligenze artificiali tradizionali rispondono alle domande basandosi solo 
 
 Il nostro sistema avanzato supera questo limite comportandosi come un istruttore amministrativo o uno studente brillante che affronta un **esame a libro aperto**:
 
-* 
 **Assenza di cieca fiducia:** Il sistema non risponde attingendo a una memoria astratta o generica.
 
-
-* 
 **Interrogazione dell'archivio:** Ricevuto il quesito, interroga istantaneamente l'archivio digitale e la biblioteca dell'Ente (delibere, regolamenti, determine).
 
-
-* 
 **Estrazione puntuale:** Identifica ed estrae i passaggi, i paragrafi e gli articoli esatti e più pertinenti al caso.
 
-
-* 
 **Sintesi documentata:** Presenta all'IA solo questi estratti ufficiali per farle redigere una sintesi chiara, accurata e direttamente verificabile.
 
-
-* 
 **Trasparenza sui limiti:** Se un'informazione non è presente all'interno dei documenti aziendali, l'assistente lo dichiara esplicitamente in chat evitando qualsiasi tipo di invenzione.
 
 
@@ -61,17 +52,11 @@ Prima di poter rispondere alle domande, il sistema deve "studiare" ed elaborare 
 
 Per preservare la massima velocità di ricerca senza smarrire il filo logico a causa della frammentazione dei testi (*chunking*), il sistema implementa la tecnologia *Parent Document Retriever*, strutturando l'archivio su due livelli integrati:
 
-* 
 **I "Figli" (I frammenti di ricerca):** Il documento viene spezzato in piccolissimi frammenti di poche righe ciascuno, sui quali viene effettuata la ricerca semantica. Questi frammenti garantiscono una precisione millimetrica e fungono da indice analitico ultra-veloce.
 
-
-* 
 **I "Genitori" (Il Documento Padre):** Il sistema conserva l'intero atto amministrativo, la pagina completa o l'articolo di legge originale in un archivio sicuro.
 
-
-* 
 **La logica di ricongiungimento:** Quando l'utente pone una domanda, il sistema individua in un lampo il frammento "Figlio" rilevante e recupera automaticamente l'intero "Documento Padre" di riferimento da passare all'IA. Questo garantisce al modello un quadro informativo coerente, azzerando le interpretazioni errate dovute alla decontestualizzazione delle frasi.
-
 
 
 ## 3. Capacità dell'Architettura e Limiti dei Sistemi RAG Standard
@@ -162,7 +147,7 @@ Il frontend dell'applicazione è stato interamente sviluppato per offrire ai dip
 
 **Rilevamento Automatico della Lingua:** L'interfaccia rileva la lingua del browser dell'utente (es. italiano o inglese) e si adatta automaticamente, consentendo comunque la modifica manuale immediata tramite l'icona della bandierina nella barra superiore.
 
-**Accessibilità e Benessere Visivo (3 Temi ed Alto Contrasto):** Per prevenire l'affaticamento visivo e garantire l'uso in ogni condizione ambientale, l'app offre tre configurazioni visive, modificabili anche tramite la scorciatoia da tastiera `Alt + T`:
+**Accessibilità e Benessere Visivo (3 Temi ed Alto Contrasto):** Per prevenire l'affaticamento visivo e garantire l'uso in ogni condizione ambientale, l'app offre tre configurazioni visive, modificabili anche tramite la scorciatoia da tastiera (`Alt + T`):
 
 
 *Tema Chiaro:* Ottimizzato per ambienti di lavoro molto illuminati.

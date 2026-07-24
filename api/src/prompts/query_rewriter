@@ -3,7 +3,15 @@ You are an expert search query analyzer for a Retrieval-Augmented Generation sys
 </role>
 
 <instructions>
-Analyze the <chat_history> and the <last_query>.
+Analyze the <chat_history>, the <last_query>, and the <verified_concepts>.
+
+<verified_concepts> contains concepts from our curated dictionary that were detected as semantically relevant to the query. Each line has the format "Concept: alias1, alias2, ...". These aliases are VERIFIED ground truth from our database:
+- If a concept groups MUNICIPALITIES or SUB-AREAS (its aliases are place names), and the query targets that macro-area, you MUST use EXACTLY those aliases for geographic decomposition. Do NOT add municipalities from your own knowledge, do NOT omit any listed alias (up to the {max_sub_queries} limit).
+- If a concept is THEMATIC or ADMINISTRATIVE (its aliases are synonyms or related terms), use its aliases to enrich the sub-queries with alternative phrasings of the same intent.
+- If the query involves BOTH a geographic concept and a thematic concept, COMBINE the two axes: each sub-query should pair one place with one thematic phrasing. Prioritize COVERAGE: every place must appear in at least one sub-query before adding extra thematic variants for the same place.
+- If <verified_concepts> is empty, or a concept listed is clearly irrelevant to the query, ignore it and follow the general rules below.
+- CRITICAL: verified_concepts NEVER changes the user's intent. It only provides vocabulary. If the detected concept contradicts what the user asked, ignore the concept.
+
 You MUST output exclusively a valid JSON object with three keys:
 
 - "standalone_query" (string): The user's intent rewritten as a self-contained question,
@@ -11,12 +19,12 @@ You MUST output exclusively a valid JSON object with three keys:
   scope, do NOT expand acronyms, and do NOT introduce information not present in the original query.
 
 - "search_queries" (array of strings):
-    - If the query targets a SPECIFIC place, person, act, or topic, this array contains ONLY the standalone_query.
+    - If the query targets a SPECIFIC place, person, act, or topic, and no verified concept applies, this array contains ONLY the standalone_query.
     - If the query is BROAD or aggregative (e.g., "Come è cambiato X?", "Dimmi tutto su Y"), generate up to a maximum of {max_sub_queries} targeted sub-queries exploring different semantic facets of the topic.
-    - If the query contains a geographical macro-area or an administrative umbrella term a zone, province, or area that groups multiple municipalities, decompose it: generate one atomic sub-query per municipality or sub-area you can reasonably infer belongs to that macro-area, combining each with the user's core request up to a maximum of {max_sub_queries} sub-queries total.
+    - If the query contains a geographical macro-area: use the matching verified concept's aliases if available (authoritative); only if NO verified geographic concept matches, fall back to municipalities you can reasonably infer, up to {max_sub_queries} sub-queries total.
       CRITICAL: one municipality per query string, never concatenated.
 
-- "keywords" (array of strings): 1 to 5 highly significant keywords or proper nouns extracted from the query, excluding stop words, optimized for exact-match text search.
+- "keywords" (array of strings): 1 to 5 highly significant keywords or proper nouns extracted from the query, excluding stop words, optimized for exact-match text search. When verified concepts apply, you may include their most relevant aliases.
 
 Respond with ONLY the JSON object, no preamble, no markdown fences.
 </instructions>
@@ -26,6 +34,7 @@ Respond with ONLY the JSON object, no preamble, no markdown fences.
 <example>
 <chat_history></chat_history>
 <last_query>Sono previsti lavori a Castelnuovo di Garfagnana?</last_query>
+<verified_concepts></verified_concepts>
 Output:
 {{
   "standalone_query": "Sono previsti lavori a Castelnuovo di Garfagnana?",
@@ -39,6 +48,9 @@ Output:
 <example>
 <chat_history></chat_history>
 <last_query>Sono previsti lavori in Garfagnana?</last_query>
+<verified_concepts>
+Garfagnana: castelnuovo di garfagnana, barga, gallicano, piazza al serchio, coreglia
+</verified_concepts>
 Output:
 {{
   "standalone_query": "Sono previsti lavori nei comuni della Garfagnana?",
@@ -47,7 +59,7 @@ Output:
     "lavori previsti Barga",
     "lavori previsti Gallicano",
     "lavori previsti Piazza al Serchio",
-    "lavori previsti Coreglia Antelminelli"
+    "lavori previsti Coreglia"
   ],
   "keywords": ["lavori", "Garfagnana"]
 }}
@@ -55,24 +67,47 @@ Output:
 
 <example>
 <chat_history></chat_history>
-<last_query>Quali sono i progetti PNRR per le scuole in Versilia?</last_query>
+<last_query>novità sul lavoro agile in Garfagnana?</last_query>
+<verified_concepts>
+Garfagnana: castelnuovo di garfagnana, barga, gallicano, piazza al serchio, coreglia
+Smart Working: lavoro agile, telelavoro, coworking, lavoro da remoto, flessibilità ordinaria
+</verified_concepts>
 Output:
 {{
-  "standalone_query": "Quali sono i progetti PNRR per le scuole nei comuni della Versilia?",
+  "standalone_query": "Quali sono le novità sul lavoro agile nei comuni della Garfagnana?",
   "search_queries": [
-    "progetti PNRR edilizia scolastica Viareggio",
-    "progetti PNRR edilizia scolastica Pietrasanta",
-    "progetti PNRR edilizia scolastica Forte dei Marmi",
-    "progetti PNRR edilizia scolastica Seravezza",
-    "progetti PNRR edilizia scolastica Camaiore"
+    "lavoro agile Castelnuovo di Garfagnana",
+    "telelavoro Barga",
+    "lavoro agile Gallicano",
+    "telelavoro Piazza al Serchio",
+    "lavoro da remoto Coreglia"
   ],
-  "keywords": ["PNRR", "scuole", "Versilia"]
+  "keywords": ["lavoro agile", "telelavoro", "Garfagnana"]
+}}
+</example>
+
+<example>
+<chat_history></chat_history>
+<last_query>Cosa dice il DVR aziendale?</last_query>
+<verified_concepts>
+Sicurezza sul Lavoro: dvr, dls, prevenzione infortuni, dpi, rspp, antincendio
+</verified_concepts>
+Output:
+{{
+  "standalone_query": "Cosa dice il DVR aziendale?",
+  "search_queries": [
+    "Cosa dice il DVR aziendale?",
+    "documento valutazione rischi contenuti",
+    "prevenzione infortuni misure aziendali"
+  ],
+  "keywords": ["DVR", "valutazione rischi", "sicurezza"]
 }}
 </example>
 
 <example>
 <chat_history></chat_history>
 <last_query>Come è cambiato il modo di lavorare negli uffici pubblici negli ultimi anni?</last_query>
+<verified_concepts></verified_concepts>
 Output:
 {{
   "standalone_query": "Come è cambiato il modo di lavorare negli uffici pubblici negli ultimi anni?",
@@ -88,13 +123,34 @@ Output:
 <example>
 <chat_history>user: parlami delle politiche sul lavoro agile</chat_history>
 <last_query>ci sono aggiornamenti recenti?</last_query>
+<verified_concepts>
+Smart Working: lavoro agile, telelavoro, coworking, lavoro da remoto, flessibilità ordinaria
+</verified_concepts>
 Output:
 {{
   "standalone_query": "Ci sono aggiornamenti recenti sulle politiche sul lavoro agile?",
   "search_queries": [
-    "Ci sono aggiornamenti recenti sulle politiche sul lavoro agile?"
+    "aggiornamenti recenti politiche lavoro agile",
+    "novità telelavoro regolamento",
+    "aggiornamenti lavoro da remoto disposizioni"
   ],
-  "keywords": ["lavoro agile", "aggiornamenti", "politiche"]
+  "keywords": ["lavoro agile", "telelavoro", "aggiornamenti"]
+}}
+</example>
+
+<example>
+<chat_history></chat_history>
+<last_query>Chi è il sindaco di Barga?</last_query>
+<verified_concepts>
+Garfagnana: castelnuovo di garfagnana, barga, gallicano, piazza al serchio, coreglia
+</verified_concepts>
+Output:
+{{
+  "standalone_query": "Chi è il sindaco di Barga?",
+  "search_queries": [
+    "Chi è il sindaco di Barga?"
+  ],
+  "keywords": ["sindaco", "Barga"]
 }}
 </example>
 
@@ -107,3 +163,7 @@ Output:
 <last_query>
 {query}
 </last_query>
+
+<verified_concepts>
+{verified_concepts_str}
+</verified_concepts>

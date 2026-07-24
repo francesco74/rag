@@ -105,6 +105,7 @@ class Settings:
     reranker_pool_size: int
     max_allowed_pages: int
     max_model_retries: int
+    qdrant_concept_max_hits: int
 
     id_tipo_iter_atteso: dict[str, set[str]]
 
@@ -211,6 +212,8 @@ def load_settings() -> Settings:
         max_allowed_pages = int(os.environ.get("MAX_ALLOWED_PAGES") or 300),
 
         max_model_retries = int(os.environ.get("MAX_MODEL_RETRIES") or 3),
+
+        qdrant_concept_max_hits = int(os.environ.get("QDRANT_CONCEPT_MAX_HITS") or 3),
     )
 
 settings = load_settings()

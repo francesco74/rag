@@ -3,7 +3,7 @@ import logging
 import os
 from dotenv import load_dotenv
 from qdrant_client import QdrantClient, models
-import genai
+from google import genai  # stesso SDK e stesso pattern client di worker.py
 from common.config import settings
 from common.db_logger import MySQLLogHandler, get_db_connection, init_db_pool
 
@@ -18,30 +18,69 @@ INPUT_FILE_PATH = "concepts.txt"
 EMBEDDING_MODEL = "gemini-embedding-001"
 
 def init_services():
-    """Inizializza le connessioni a Qdrant e Gemini."""
-    # Configura Gemini
+    """
+    Inizializza le connessioni a Qdrant e Gemini.
+
+    Usa lo stesso SDK e lo stesso pattern (genai.Client) di worker.py:
+    prima questo script usava `import genai` + `genai.configure(...)` +
+    `genai.embed_content(...)` — l'API del vecchio SDK deprecato
+    (google-generativeai), diversa da quella usata a runtime dal worker
+    (google-genai, client-based). Anche se i due SDK avessero prodotto
+    vettori numericamente identici a parità di modello/parametri, avere
+    ingestion e query-time su client diversi è un rischio inutile per un
+    meccanismo — il dizionario concettuale — che si basa interamente sulla
+    comparabilità via cosine similarity tra i due.
+    """
     api_llm_key = settings.api_llm_key
     if not api_llm_key:
         raise ValueError("API_LLM_KEY non trovata nelle variabili d'ambiente!")
-    genai.configure(api_key=api_llm_key)
+    genai_client = genai.Client(api_key=api_llm_key)
 
-    # Configura Qdrant
-    return QdrantClient(host=settings.qdrant_host, port=settings.qdrant_port)
+    qdrant = QdrantClient(host=settings.qdrant_host, port=settings.qdrant_port)
+    return qdrant, genai_client
 
 def parse_and_clean_file(file_path):
-    """Legge il file di testo, ignora commenti/righe vuote e pulisce i dati."""
+    """
+    Legge il file di testo, ignora righe vuote e pulisce i dati.
+
+    Le intestazioni di sezione (righe che iniziano con '#', es.
+    "# --- DIZIONARIO DEI CONCETTI GEOGRAFICI ---") non vengono più scartate
+    come puro commento: definiscono la CATEGORIA dei concetti che seguono,
+    fino alla prossima intestazione. Questo permette a worker.py di
+    interrogare il dizionario in modo scoped (es. "solo concetti geografici"),
+    invece di un'unica ricerca su tutta la collection che mescola zone
+    geografiche e concetti amministrativi/tecnici nello stesso spazio
+    vettoriale.
+
+    "geografico" è l'unica categoria con un trattamento speciale a valle (in
+    worker.py, per evitare di ri-applicare una decomposizione per comune che
+    il rewriter ha già fatto da sé): qualunque altra intestazione diventa
+    semplicemente "amministrativo". Aggiungere nuove sezioni al file (es.
+    "# --- CONCETTI TURISTICI ---") non richiede modifiche al codice: finché
+    non contengono la parola "geografic", rientrano automaticamente nel
+    bucket "amministrativo".
+    """
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"Il file di input '{file_path}' non esiste!")
 
     parsed_concepts = []
-    
+    current_category = "amministrativo"  # default prudente se il file non ha intestazioni
+
     with open(file_path, "r", encoding="utf-8") as f:
         for line_num, line in enumerate(f, 1):
             line = line.strip()
-            # Salta righe vuote o commenti
-            if not line or line.startswith("#"):
+
+            if not line:
                 continue
-                
+
+            if line.startswith("#"):
+                header_text = line.strip("# -").strip().lower()
+                if "geografic" in header_text:
+                    current_category = "geografico"
+                elif header_text:
+                    current_category = "amministrativo"
+                continue
+
             if ":" not in line:
                 log.warning(f"Riga {line_num} ignorata (formato non valido, manca il separatore ':'): '{line}'")
                 continue
@@ -58,7 +97,8 @@ def parse_and_clean_file(file_path):
                 
             parsed_concepts.append({
                 "concept": concept,
-                "aliases": aliases
+                "aliases": aliases,
+                "category": current_category,
             })
             
     return parsed_concepts
@@ -79,10 +119,11 @@ def reset_qdrant_collection(client):
     log.info("Configurazione indici di payload...")
     client.create_payload_index(CONCEPT_COLLECTION, "concept", models.PayloadSchemaType.KEYWORD)
     client.create_payload_index(CONCEPT_COLLECTION, "aliases", models.PayloadSchemaType.KEYWORD)
+    client.create_payload_index(CONCEPT_COLLECTION, "category", models.PayloadSchemaType.KEYWORD)
 
 def main():
     try:
-        client = init_services()
+        client, genai_client = init_services()
         
         # 1. Parsing e pulizia del file di testo
         log.info(f"Lettura e pulizia del file: {INPUT_FILE_PATH}...")
@@ -103,18 +144,18 @@ def main():
         for item in concepts_data:
             concept = item["concept"]
             aliases = item["aliases"]
+            category = item["category"]
             
             # Strategia di Embedding: fondiamo il concetto con i suoi alias per dare 
             # all'embedding la massima densità semantica possibile.
             text_to_embed = f"{concept}: {', '.join(aliases)}"
             
-            result = genai.embed_content(
+            result = genai_client.models.embed_content(
                 model=EMBEDDING_MODEL,
-                content=text_to_embed,
-                task_type="SEMANTIC_SIMILARITY",
-                output_dimensionality=768
+                contents=text_to_embed,
+                config=dict(task_type="SEMANTIC_SIMILARITY", output_dimensionality=768)
             )
-            vector = result['embedding']
+            vector = result.embeddings[0].values
             
             # Creazione del punto Qdrant strutturato
             point = models.PointStruct(
@@ -122,11 +163,12 @@ def main():
                 vector=vector,
                 payload={
                     "concept": concept,
-                    "aliases": aliases
+                    "aliases": aliases,
+                    "category": category,
                 }
             )
             points.append(point)
-            log.info(f"✓ Pronto: '{concept}' con {len(aliases)} alias correlati.")
+            log.info(f"✓ Pronto: '{concept}' ({category}) con {len(aliases)} alias correlati.")
 
         # 4. Upsert finale in blocco (Batch)
         log.info(f"Caricamento di {len(points)} punti su Qdrant...")
