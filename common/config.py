@@ -79,6 +79,7 @@ class Settings:
     rerank_batch_size: int
     rerank_max_length: int
     answer_max_tokens: int
+    grader_max_tokens: int
     qdrant_syntactic_size: int
     qdrant_semantic_size: int
     qdrant_semantic_threshold: float
@@ -110,6 +111,7 @@ class Settings:
     id_tipo_iter_atteso: dict[str, set[str]]
 
     answer_thinking_level: str
+    grader_thinking_level: str
 
 
 def load_settings() -> Settings:
@@ -172,6 +174,7 @@ def load_settings() -> Settings:
         rerank_max_length = int(os.environ.get("RERANK_MAX_LENGTH") or 512),
         qdrant_concept_threshold = float(os.environ.get("QDRANT_CONCEPT_THRESHOLD") or 0.80),
         answer_max_tokens = int(os.environ.get("ANSWER_MAX_TOKENS") or  4096),
+        grader_max_tokens = int(os.environ.get("GRADER_MAX_TOKENS") or  32),
 
         allow_general_knowledge = _parse_bool(os.environ.get("ALLOW_GENERAL_KNOWLEDGE"), default=True),
 
@@ -200,7 +203,8 @@ def load_settings() -> Settings:
                   "parent_index", "child_index", "file_name", "_ingestion_error", "_ingestion_id", "content_hash"},
 
         max_reranker_thread = int(os.environ.get("MAX_RERANKER_THREAD") or 2),
-        answer_thinking_level = os.environ.get("ANSWER_THINKING_LEVEL") or None,
+        answer_thinking_level = os.environ.get("ANSWER_THINKING_LEVEL") or 'low',
+        grader_thinking_level = os.environ.get("GRADER_THINKING_LEVEL") or 'minimal',
 
         reranker_pool_size = int(os.environ.get("RERANKER_POOL_SIZE") or 1),
 

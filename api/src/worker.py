@@ -523,12 +523,18 @@ def extract_relevant_window(content: str, matched_snippets: list, budget: int, t
     Se il parent intero sta nel budget, nessun problema. Altrimenti, invece di
     tagliare ciecamente i primi `budget` caratteri (rischiando di perdere
     proprio il passaggio che ha fatto vincere questo parent al retrieval),
-    proviamo a localizzare i child/snippet che hanno fatto match e ritagliamo
-    una finestra centrata su di loro.
+    ritagliamo una finestra centrata sui child/snippet che hanno fatto match.
 
-    Fallback in cascata se la localizzazione fallisce (es. child normalizzato
-    diversamente dal parent in fase di ingestion): torna al comportamento
-    precedente (troncamento dall'inizio), mai un'eccezione.
+    Localizzazione a tre livelli, in ordine di affidabilità:
+    1. OFFSET dal payload (start_char/end_char, popolati dal backfill o
+       dall'ingestion): esatti e gratuiti. Un sanity check (l'ancora dello
+       snippet deve comparire nel testo puntato dagli offset) protegge dal
+       caso di parent modificato dopo il calcolo degli offset.
+    2. Ricerca testuale dell'ancora nel parent (comportamento precedente).
+    3. Fallback finale: troncamento dall'inizio, mai un'eccezione.
+
+    matched_snippets: lista di dict {content, score, start_char?, end_char?}.
+    Per retrocompatibilità accetta anche semplici stringhe.
     """
     if len(content) <= budget:
         return content
@@ -538,12 +544,38 @@ def extract_relevant_window(content: str, matched_snippets: list, budget: int, t
         return content[:budget]
 
     spans = []
+    offset_hits = 0
     for snippet in matched_snippets:
-        if not snippet:
+        # Retrocompatibilità: snippet può essere una stringa o un dict
+        if isinstance(snippet, str):
+            snippet_text, s_char, e_char = snippet, None, None
+        else:
+            snippet_text = snippet.get("content", "")
+            s_char = snippet.get("start_char")
+            e_char = snippet.get("end_char")
+
+        if not snippet_text:
             continue
-        anchor = " ".join(snippet.split())[:SNIPPET_ANCHOR_LEN]
+        anchor = " ".join(snippet_text.split())[:SNIPPET_ANCHOR_LEN]
         if not anchor:
             continue
+
+        # Livello 1: offset dal payload, con sanity check
+        if (
+            s_char is not None and e_char is not None
+            and 0 <= s_char < e_char <= len(content)
+        ):
+            window_text_norm = " ".join(content[s_char:e_char].split())
+            if anchor[:40] in window_text_norm:
+                spans.append((s_char, e_char))
+                offset_hits += 1
+                continue
+            log.debug(
+                f"[{task_id}] [WINDOW] Offset ({s_char},{e_char}) non combaciano col contenuto "
+                f"(parent modificato dopo il backfill?): fallback a ricerca testuale."
+            )
+
+        # Livello 2: ricerca testuale dell'ancora (comportamento precedente)
         idx = content.find(anchor)
         if idx == -1:
             # Tentativo più permissivo: normalizza anche il documento (whitespace)
@@ -554,7 +586,7 @@ def extract_relevant_window(content: str, matched_snippets: list, budget: int, t
             if idx_norm != -1:
                 idx = idx_norm
         if idx != -1:
-            spans.append((idx, idx + len(snippet)))
+            spans.append((idx, idx + len(snippet_text)))
 
     if not spans:
         log.debug(f"[{task_id}] [WINDOW] Nessuno snippet localizzato nel parent: fallback a troncamento dall'inizio.")
@@ -580,7 +612,8 @@ def extract_relevant_window(content: str, matched_snippets: list, budget: int, t
         result = result[:budget]
 
     log.debug(
-        f"[{task_id}] [WINDOW] Finestra costruita da {len(spans)} snippet localizzati, "
+        f"[{task_id}] [WINDOW] Finestra costruita da {len(spans)} snippet "
+        f"({offset_hits} via offset, {len(spans) - offset_hits} via ricerca testuale), "
         f"{len(merged)} blocchi dopo merge, {len(result)}/{budget} chars usati "
         f"(vs {len(content)} chars totali nel parent)."
     )
@@ -682,8 +715,19 @@ def grade_answer(query, context_snippet, answer):
         context_snippet=context_snippet,
         answer=answer
     )
+    # PRIMA: max_tokens=5 hardcoded, nessun thinking_level. Con un modello che
+    # conta i token di "thinking" sullo stesso budget dell'output
+    # (gemini-3.1-flash-lite), 5 token bastano perché il ragionamento da solo
+    # esaurisca il budget, troncando "YES"/"NO" prima ancora che venga scritto
+    # (finish_reason=MAX_TOKENS, output_tokens=1). settings.grader_max_tokens
+    # e settings.grader_thinking_level vanno aggiunti a common/config.py,
+    # stesso pattern di settings.answer_max_tokens/answer_thinking_level.
     raw = get_llm_provider().generate_text(
-        settings.grader_model_name, grader_prompt, temperature=0.0, max_tokens=5
+        settings.grader_model_name,
+        grader_prompt,
+        temperature=0.0,
+        max_tokens=settings.grader_max_tokens,
+        thinking_level=settings.grader_thinking_level,
     )
     result = raw.strip().upper()
     log.info(f"Grader response: '{result}'")
@@ -1122,7 +1166,15 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
                 chunk_content = chunk.payload.get("content", "") if chunk.payload else ""
                 if chunk_content:
                     snippets = parent_top_snippets.setdefault(pid, [])
-                    snippets.append({"content": chunk_content, "score": score})
+                    snippets.append({
+                        "content": chunk_content,
+                        "score": score,
+                        # Popolati dal backfill (backfill_chunk_offsets.py) o
+                        # dall'ingestion futura; None se assenti — in quel caso
+                        # extract_relevant_window ripiega sulla ricerca testuale.
+                        "start_char": chunk.payload.get("start_char"),
+                        "end_char": chunk.payload.get("end_char"),
+                    })
                     snippets.sort(key=lambda s: s["score"], reverse=True)
                     del snippets[SNIPPETS_PER_PARENT:]
 
@@ -1380,7 +1432,7 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
 
             if content:
                 matched_snippets = [
-                    s["content"] for s in parent_top_snippets.get(p_doc.get("id"), []) if s.get("content")
+                    s for s in parent_top_snippets.get(p_doc.get("id"), []) if s.get("content")
                 ]
                 rich_context.append({
                     "content": content,
