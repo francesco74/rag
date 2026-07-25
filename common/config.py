@@ -104,6 +104,8 @@ class Settings:
 
     max_reranker_thread: int
     reranker_pool_size: int
+    cpu_limit: int
+    celery_concurrency: int
     max_allowed_pages: int
     max_model_retries: int
     qdrant_concept_max_hits: int
@@ -207,6 +209,24 @@ def load_settings() -> Settings:
         grader_thinking_level = os.environ.get("GRADER_THINKING_LEVEL") or 'MINIMAL',
 
         reranker_pool_size = int(os.environ.get("RERANKER_POOL_SIZE") or 1),
+
+        # Core assegnati al pod (resources.limits.cpu nel deployment K8s), NON
+        # letti da os.cpu_count() come unica fonte: quest'ultimo, in un
+        # container Kubernetes, riflette i core del nodo host, non il CPU
+        # limit imposto via CFS quota/period. Va impostato esplicitamente in
+        # CPU_LIMIT nel ConfigMap, allineato al valore numerico di
+        # resources.limits.cpu del pod worker (es. "4" -> CPU_LIMIT=4).
+        # Se non impostato, ripiega su os.cpu_count() (i core della macchina)
+        # come approssimazione — corretto in locale, sovrastimato in K8s.
+        cpu_limit = int(os.environ.get("CPU_LIMIT") or os.cpu_count() or 1),
+
+        # Deve combaciare col valore passato a --concurrency nel comando Celery
+        # del deployment. Serve a get_reranker_pool() per capire quanti processi
+        # Celery condividono gli stessi core (cpu_limit): senza questo, ogni
+        # processo dimensionerebbe il proprio pool di reranker assumendo di
+        # avere tutti i core del pod per sé, sovrasottoscrivendo quando più
+        # processi fanno reranking nello stesso momento.
+        celery_concurrency = int(os.environ.get("CELERY_CONCURRENCY") or 1),
 
         id_tipo_iter_atteso = {
             "decreto_presidenziale": _parse_set(os.environ.get("ID_TIPO_ITER_DECRETO_PRESIDENZIALE"), default={"8"}),

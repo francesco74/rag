@@ -862,6 +862,7 @@ def setup_periodic_tasks(sender, **kwargs):
 def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_sub_topics,
                      metadata_filters, include_undated=True,
                      semantic_size=None, semantic_threshold=None, mmr_lambda=1.0,
+                     exclude_parent_ids=None,
                      task_id="UNKNOWN"):
     """
     Recupera, fonde e riordina i chunk dal Vector DB in modo sicuro.
@@ -870,6 +871,11 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
         dai profili di retry per allargare progressivamente la recall.
     mmr_lambda: peso rilevanza/diversità nella redistribuzione degli slot liberi.
         1.0 = comportamento identico a prima dell'introduzione di MMR.
+    exclude_parent_ids: set di parent_id da escludere del tutto dalla selezione
+        (usato dall'ultimo tentativo di fallback, per non riproporre parent
+        già passati al generatore in un tentativo precedente e già falliti).
+        L'esclusione avviene PRIMA della quota/MMR, così il budget di parent
+        non viene sprecato su candidati che verrebbero comunque scartati.
     """
     if not qdrant_client:
         log.error("Qdrant client not available! Retrieval aborted.")
@@ -1158,10 +1164,16 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
         # usati da generate_answer per il windowing invece del troncamento cieco.
         parent_top_snippets: dict[str, list] = {}
 
+        exclude_parent_ids = exclude_parent_ids or set()
+        excluded_count = 0
+
         for chunks in top_chunks_per_query:
             for chunk in chunks:
                 pid = chunk.payload.get("parent_id") if chunk.payload else None
                 if not pid:
+                    continue
+                if pid in exclude_parent_ids:
+                    excluded_count += 1
                     continue
                 score = getattr(chunk, "score", 0.0) or 0.0
                 if pid not in parent_best_score or score > parent_best_score[pid]:
@@ -1185,6 +1197,9 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
                     })
                     snippets.sort(key=lambda s: s["score"], reverse=True)
                     del snippets[SNIPPETS_PER_PARENT:]
+
+        if exclude_parent_ids:
+            log.info(f"[{task_id}] [EXCLUDE] {excluded_count} chunk scartati (parent già usati in tentativi precedenti: {len(exclude_parent_ids)}).")
 
         parent_centroids = {
             pid: np.mean(vecs, axis=0) for pid, vecs in parent_chunk_vectors.items()
@@ -1451,7 +1466,10 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
                     "matched_snippets": matched_snippets,
                 })
                 if source not in unique_sources_map:
-                    unique_sources_map[source] = {"source": source, "sub_topic": sub_topic_id, "file_name": file_name, "date": doc_date}
+                    unique_sources_map[source] = {
+                        "source": source, "sub_topic": sub_topic_id, "file_name": file_name,
+                        "date": doc_date, "parent_id": p_doc.get("id"),
+                    }
  
         log.info(f"=== Retrieval completata. Parent al generatore: {len(rich_context)} ===")
         retrieval_stats["n_parents_final"] = len(rich_context)
@@ -1469,13 +1487,35 @@ def get_reranker_pool():
     invece di contendersi un'unica sessione condivisa tra tutti i thread.
 
     num_threads per istanza è calcolato dividendo i core disponibili per la
-    dimensione del pool, invece di un valore fisso: con un pool più grande,
-    ogni istanza usa meno thread intra-op, evitando di sovra-allocare i core
-    quando più istanze girano in parallelo.
+    dimensione del pool. I core disponibili vengono letti da
+    settings.cpu_limit (il resources.limits.cpu del pod, es. "2"), NON da
+    os.cpu_count(): quest'ultimo, in un container Kubernetes, riflette i
+    core del nodo host — i CPU limit di Kubernetes si applicano via CFS
+    quota/period, non modificano l'affinity mask che os.cpu_count() legge.
+    Su un pod limitato a 2 core ma su un nodo da 8, os.cpu_count() avrebbe
+    fatto sovrastimare di 4 volte i thread assegnabili per istanza.
+    Se settings.cpu_limit non è impostato esplicitamente (CPU_LIMIT), il
+    fallback su os.cpu_count() avviene già in config.py — qui arriva sempre
+    un intero valido. Da preferire comunque sempre CPU_LIMIT esplicito in
+    un pod Kubernetes, dove os.cpu_count() riflette i core del nodo host.
+
+    I core disponibili vengono inoltre divisi per settings.celery_concurrency
+    (deve combaciare col --concurrency del comando Celery nel deployment):
+    i core del pod si dividono tra TUTTI i processi Celery concorrenti, non
+    solo tra le istanze del pool all'interno di un singolo processo. Senza
+    questo, ogni processo dimensionerebbe il proprio pool assumendo di avere
+    tutti i core del pod per sé, sovrasottoscrivendo quando più processi
+    fanno reranking nello stesso momento.
     """
     global _RERANKER_POOL
     if not _RERANKER_POOL:
-        num_threads = max(1, (os.cpu_count() or 2) // max(1, _POOL_SIZE))
+        total_cores = settings.cpu_limit
+        cores_per_process = max(1, total_cores // max(1, settings.celery_concurrency))
+        num_threads = max(1, cores_per_process // max(1, _POOL_SIZE))
+        log.info(
+            f"Core totali pod: {total_cores}, concorrenza Celery: {settings.celery_concurrency} "
+            f"-> {cores_per_process} core per processo, {num_threads} thread per istanza del pool."
+        )
         for i in range(_POOL_SIZE):
             log.info(f"Initializing ONNX Reranker pool instance {i+1}/{_POOL_SIZE} (num_threads={num_threads})...")
             instance = ONNXReranker(
@@ -1773,6 +1813,11 @@ def process_rag_query(self, query, history, topic_id, selected_sub_topics=None, 
             **profile_kwargs(0, task_id=task_id)
         )
         attempts_metrics.append({"attempt": 0, "standalone_query": standalone_query, **retrieval_stats})
+
+        # Parent già mostrati al generatore, accumulati tra i tentativi: usato
+        # dall'ultimo fallback (dopo max_model_retries) per non riproporre
+        # parent già passati e già giudicati insoddisfacenti.
+        used_parent_ids = {s["parent_id"] for s in sources if s.get("parent_id")}
     except Exception as e:
         log.error(f"[{task_id}] Vector DB Retrieval failed: {e}", exc_info=True)
         return {"error": "Database Error", "message": "Errore durante il recupero dei documenti.", "status": "failed"}
@@ -1790,7 +1835,7 @@ def process_rag_query(self, query, history, topic_id, selected_sub_topics=None, 
             log.debug(f"[{task_id}] Context empty. Breaking loop.")
             break
         else:
-            log.debug(f"Contesto da passare alla generazione: {context[:1500]}")
+            log.debug(f"Contesto da passare alla generazione: {str(context)[:1500]}")
 
         # A. Generazione (JSON Mode)
         try:
@@ -1888,11 +1933,53 @@ def process_rag_query(self, query, history, topic_id, selected_sub_topics=None, 
                         **profile_kwargs(attempt, task_id=task_id)
                     )
                     attempts_metrics.append({"attempt": attempt, "standalone_query": standalone_query, **retrieval_stats})
+                    used_parent_ids |= {s["parent_id"] for s in sources if s.get("parent_id")}
                 except Exception as e:
                     log.error(f"[{task_id}] Retry infrastructure failed: {e}", exc_info=True)
                     break  # Usciamo usando l'ultima answer generata
             else:
-                log.warning(f"[{task_id}] Max retries exhausted. Returning best effort answer.")
+                log.warning(f"[{task_id}] Max retries esauriti. Tento un ultimo fallback senza riformulazione, escludendo {len(used_parent_ids)} parent già usati.")
+                try:
+                    final_context, final_sources, final_stats = retrieve_chunks(
+                        search_queries,
+                        vectors_list,
+                        extracted_keywords,
+                        topic_id,
+                        selected_sub_topics,
+                        metadata_filters,
+                        include_undated,
+                        exclude_parent_ids=used_parent_ids,
+                        task_id=f"{task_id}-FALLBACK",
+                        **profile_kwargs(settings.max_model_retries - 1, task_id=task_id)
+                    )
+                    attempts_metrics.append({"attempt": "fallback", "standalone_query": standalone_query, **final_stats})
+
+                    if not final_context:
+                        log.info(f"[{task_id}] [FALLBACK] Nessun parent nuovo trovato dopo l'esclusione. Nessun ulteriore tentativo possibile.")
+                    else:
+                        context, sources = final_context, final_sources
+                        gen_result = generate_answer(standalone_query, context, topic_id)
+                        is_found = gen_result.get("is_found", False)
+                        answer = gen_result.get("answer", "")
+                        log.debug(f"[{task_id}] [FALLBACK] Risposta generata: {answer[:500]}... | is_found: {is_found}")
+
+                        if not is_found:
+                            is_satisfactory = False
+                        elif gen_result.get("is_general_knowledge"):
+                            is_satisfactory = settings.allow_general_knowledge
+                        else:
+                            try:
+                                context_snippet = "\n\n".join(
+                                    f"[{item.get('source', '')}]\n{item.get('content', '')}" for item in context
+                                )
+                                is_satisfactory = grade_answer(standalone_query, context_snippet, answer)
+                            except Exception as ge:
+                                log.error(f"[{task_id}] [FALLBACK] Grader LLM failed (non-blocking): {ge}. Defaulting to YES.")
+                                is_satisfactory = True
+
+                        log.info(f"[{task_id}] [FALLBACK] Esito ultimo tentativo: is_satisfactory={is_satisfactory}.")
+                except Exception as fe:
+                    log.error(f"[{task_id}] [FALLBACK] Ultimo tentativo fallito: {fe}", exc_info=True)
 
     # ==========================================================
     # FEEDBACK NEGATIVO AUTOMATICO
