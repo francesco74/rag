@@ -12,7 +12,7 @@ Analyze the <chat_history>, the <last_query>, and the <verified_concepts>.
 - If <verified_concepts> is empty, or a concept listed is clearly irrelevant to the query, ignore it and follow the general rules below.
 - CRITICAL: verified_concepts NEVER changes the user's intent. It only provides vocabulary. If the detected concept contradicts what the user asked, ignore the concept.
 
-You MUST output exclusively a valid JSON object with three keys:
+You MUST output exclusively a valid JSON object with four keys:
 
 - "standalone_query" (string): The user's intent rewritten as a self-contained question,
   resolving any pronouns or references to previous messages. Do NOT change geographical
@@ -23,6 +23,20 @@ You MUST output exclusively a valid JSON object with three keys:
     - If the query is BROAD or aggregative (e.g., "Come è cambiato X?", "Dimmi tutto su Y"), generate up to a maximum of {max_sub_queries} targeted sub-queries exploring different semantic facets of the topic.
     - If the query contains a geographical macro-area: use the matching verified concept's aliases if available (authoritative); only if NO verified geographic concept matches, fall back to municipalities you can reasonably infer, up to {max_sub_queries} sub-queries total.
       CRITICAL: one municipality per query string, never concatenated.
+
+- "coverage_targets" (array of strings): the DISTINCT ENTITIES the final answer
+  must account for, one per entry, written in their canonical human-readable form
+  (e.g. "Barga", not "lavori previsti Barga"). This is the checklist the answer
+  generator will use to declare explicitly which entities it found nothing for.
+    - Populate it ONLY when the query aggregates over several distinct entities
+      (municipalities, offices, bodies, named items) — whether the user listed
+      them explicitly or a geographic verified concept expanded them.
+    - Leave it EMPTY ([]) when the query targets a single entity, or when the
+      decomposition is purely THEMATIC (synonyms and rephrasings of one intent).
+      "telelavoro" and "lavoro agile" are two ways of saying the same thing, not
+      two entities to be covered separately.
+    - Never invent entities that are neither in the query nor in the verified
+      concepts.
 
 - "keywords" (array of strings): 1 to 5 highly significant keywords or proper nouns extracted from the query, excluding stop words, optimized for exact-match text search. When verified concepts apply, you may include their most relevant aliases.
 
@@ -41,6 +55,7 @@ Output:
   "search_queries": [
     "Sono previsti lavori a Castelnuovo di Garfagnana?"
   ],
+  "coverage_targets": [],
   "keywords": ["lavori", "Castelnuovo", "Garfagnana"]
 }}
 </example>
@@ -61,6 +76,7 @@ Output:
     "lavori previsti Piazza al Serchio",
     "lavori previsti Coreglia"
   ],
+  "coverage_targets": ["Castelnuovo di Garfagnana", "Barga", "Gallicano", "Piazza al Serchio", "Coreglia"],
   "keywords": ["lavori", "Garfagnana"]
 }}
 </example>
@@ -82,6 +98,7 @@ Output:
     "telelavoro Piazza al Serchio",
     "lavoro da remoto Coreglia"
   ],
+  "coverage_targets": ["Castelnuovo di Garfagnana", "Barga", "Gallicano", "Piazza al Serchio", "Coreglia"],
   "keywords": ["lavoro agile", "telelavoro", "Garfagnana"]
 }}
 </example>
@@ -100,6 +117,7 @@ Output:
     "documento valutazione rischi contenuti",
     "prevenzione infortuni misure aziendali"
   ],
+  "coverage_targets": [],
   "keywords": ["DVR", "valutazione rischi", "sicurezza"]
 }}
 </example>
@@ -116,6 +134,7 @@ Output:
     "nuove modalità lavorative settore pubblico",
     "evoluzione orari e flessibilità uffici pubblici"
   ],
+  "coverage_targets": [],
   "keywords": ["uffici pubblici", "modalità lavoro", "flessibilità"]
 }}
 </example>
@@ -134,6 +153,7 @@ Output:
     "novità telelavoro regolamento",
     "aggiornamenti lavoro da remoto disposizioni"
   ],
+  "coverage_targets": [],
   "keywords": ["lavoro agile", "telelavoro", "aggiornamenti"]
 }}
 </example>
@@ -150,6 +170,7 @@ Output:
   "search_queries": [
     "Chi è il sindaco di Barga?"
   ],
+  "coverage_targets": [],
   "keywords": ["sindaco", "Barga"]
 }}
 </example>

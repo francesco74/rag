@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -8,6 +9,12 @@ from dotenv import load_dotenv
 import socket
 
 load_dotenv()
+
+# I guardrail sotto scattano a import-time, PRIMA che Celery configuri il
+# logging. I record di livello WARNING senza handler finiscono comunque su
+# stderr tramite logging.lastResort, quindi restano visibili nei log del pod:
+# una configurazione incoerente non passa mai sotto silenzio.
+_log = logging.getLogger("CONFIG")
 
 def _parse_bool(value: str | None, default: bool = False) -> bool:
     """Helper DRY per il parsing uniforme dei booleani dalle variabili d'ambiente."""
@@ -78,7 +85,18 @@ class Settings:
     rerank_truncate: int
     rerank_batch_size: int
     rerank_max_length: int
-    answer_max_tokens: int
+    # None = nessun tetto esplicito: si usa il massimo del modello. È il default.
+    # Un numero qui sarebbe una copia locale di un dato che appartiene al
+    # vendor e che diverge in silenzio al primo cambio di
+    # ANSWER_GENERATOR_MODEL_NAME. Impostalo solo se hai una ragione specifica
+    # per limitare la lunghezza della risposta (non il costo: i token si pagano
+    # a consumo, e un troncamento costa PIÙ di una risposta lunga, perché il
+    # primo tentativo è inutilizzabile e va rigenerato tutto).
+    answer_max_tokens: Optional[int]
+    # Resta un intero: qui il tetto NON è una capability da inseguire ma un
+    # circuit breaker. Il grader emette un JSON di quattro campi, il rewriter
+    # una lista di sottoquery: se uno dei due entra in loop di ripetizione,
+    # senza tetto genera fino al soffitto del modello e lo paghi tutto.
     grader_max_tokens: int
     qdrant_syntactic_size: int
     qdrant_semantic_size: int
@@ -86,8 +104,56 @@ class Settings:
     qdrant_concept_threshold: float
     max_context_chars: int
     max_sub_queries: int
-    parent_budget_ratio: float
     onnx_model_cache_path: str
+
+    # --- Allocazione del contesto per sottoquery -------------------------------
+    # Governano come MAX_CONTEXT_CHARS viene ripartito tra le sottoquery generate
+    # dal rewriter (es. un comune per sottoquery). Tarando questi tre valori si
+    # ottengono tre politiche diverse SENZA toccare il codice:
+    #
+    #   Politica          FLOOR   CAP     WEIGHT   Comportamento
+    #   ----------------  ------  ------  -------  --------------------------------
+    #   Rigida            1.00    1.00    none     Parti uguali. Nessuna sottoquery
+    #                                              può essere sacrificata, nemmeno
+    #                                              se il suo materiale è debole.
+    #   Morbida (default) 0.60    0.40    best     60% diviso equamente (nessuno
+    #                                              sotto una soglia minima), 40%
+    #                                              pesato sulla rilevanza trovata.
+    #   Anti-monopolio    0.00    0.35    best     Tutto sullo score, ma nessuna
+    #                                              sottoquery oltre il 35% del
+    #                                              contesto totale.
+    #
+    # ATTENZIONE sul peso: gli score del cross-encoder NON sono nativamente
+    # confrontabili tra sottoquery diverse (il reranker valuta la coppia
+    # query-documento, quindi due formulazioni diverse producono distribuzioni
+    # su scale diverse). La pesatura va letta come euristica di priorità, non
+    # come misura assoluta di importanza. Se in rag_metrics vedi che le
+    # sottoquery in coda restano cronicamente sotto-servite, la mossa corretta
+    # è ALZARE context_floor_ratio, non ritoccare il peso.
+    context_floor_ratio: float
+    context_cap_ratio: float
+    context_score_weight: str
+
+    # Sforamento tollerato (frazione di max_context_chars) per includere un
+    # documento INTERO invece di finestrarlo per pochi caratteri. Non può mai
+    # servire ad aggiungere un parent NUOVO: solo a completarne uno già
+    # selezionato. Viene usato solo dopo aver esaurito l'avanzo del water-filling.
+    context_overflow_ratio: float
+    # Tetto invalicabile, espresso come FRAZIONE di max_context_chars anziché in
+    # caratteri assoluti. Un tetto assoluto è una bomba a orologeria: basta che
+    # qualcuno alzi MAX_CONTEXT_CHARS senza ricordarsi di alzare anche il tetto
+    # e build_context comincia a scartare in silenzio la maggior parte dei
+    # parent recuperati (con MAX_CONTEXT_CHARS=150000 e un tetto fermo a 45000
+    # si perdevano 17 parent su 24, cioè quasi tutto il lavoro di retrieval e
+    # reranking già pagato). Legandolo al valore base, l'incoerenza non è più
+    # nemmeno rappresentabile.
+    context_hard_cap_ratio: float
+    # DERIVATO, non letto da env: int(max_context_chars * (1 + ratio)).
+    # Resta un campo a sé perché è ciò che il worker legge davvero.
+    context_hard_cap_chars: int
+    # Dove arretrare il taglio per non spezzare il testo a metà parola/frase:
+    # 'sentence' | 'paragraph' | 'none'. Costo zero, nessuna espansione.
+    context_snap_boundary: str
 
     min_prob_threshold: float
     parents_per_query: int
@@ -122,7 +188,81 @@ def load_settings() -> Settings:
 
     allowed_origins_raw = os.environ.get("ALLOWED_ORIGINS")
     allowed_origins = allowed_origins_raw.split(",") if allowed_origins_raw else ["*"]
-    
+
+    # =========================================================================
+    # VALORI INTERDIPENDENTI
+    # Calcolati qui, prima della costruzione della dataclass, perché il valore
+    # di uno vincola quello di un altro: passarli inline nel costruttore
+    # renderebbe impossibile validarli l'uno contro l'altro.
+    # =========================================================================
+
+    # --- Contesto: il tetto insegue il budget --------------------------------
+    max_context_chars = int(os.environ.get("MAX_CONTEXT_CHARS") or 30000)
+    context_overflow_ratio = float(os.environ.get("CONTEXT_OVERFLOW_RATIO") or 0.15)
+    context_hard_cap_ratio = float(os.environ.get("CONTEXT_HARD_CAP_RATIO") or 0.20)
+
+    # Il tetto deve stare SOPRA l'espansione consentita in fase di allocazione.
+    # allocate_context_budget calcola il proprio soffitto come
+    #     min(budget * (1 + overflow_ratio), hard_cap_chars)
+    # quindi un hard cap più basso dell'overflow taglierebbe SOTTO ciò che è
+    # già stato allocato: build_context si troverebbe a scartare parent a cui
+    # era stato appena assegnato del budget — di nuovo il bug che questa
+    # modifica elimina, solo per un'altra strada.
+    if context_hard_cap_ratio < context_overflow_ratio:
+        _log.warning(
+            "CONTEXT_HARD_CAP_RATIO (%.2f) è inferiore a CONTEXT_OVERFLOW_RATIO (%.2f): "
+            "il tetto taglierebbe sotto l'allocazione. Allineato a %.2f.",
+            context_hard_cap_ratio, context_overflow_ratio, context_overflow_ratio,
+        )
+        context_hard_cap_ratio = context_overflow_ratio
+
+    # round() e non int(): la troncatura darebbe 114999 per 100000 * 1.15, che
+    # in un log è solo rumore ma fa perdere tempo a chi cerca di capire perché
+    # il tetto non è il numero tondo che si aspettava.
+    context_hard_cap_chars = int(round(max_context_chars * (1 + context_hard_cap_ratio)))
+
+    # --- Token di risposta: nessun tetto, per scelta ------------------------
+    # Non passando max_tokens al provider, il tetto è quello del modello per
+    # definizione: non c'è nessuna costante da tenere allineata a mano e
+    # cambiare modello non richiede di ricordarsi niente. Il vecchio
+    # ANSWER_MAX_TOKENS_HARD_CAP è stato rimosso: era già inerte in produzione
+    # (con ANSWER_MAX_TOKENS=16384 la guardia "max_tokens < hard_cap" era
+    # sempre falsa, quindi il retry sul troncamento non poteva scattare).
+    # Vuoto, "0" o "auto" -> None. Un intero resta rispettato, per chi ha una
+    # ragione specifica per limitare la lunghezza della risposta.
+    _answer_tokens_raw = (os.environ.get("ANSWER_MAX_TOKENS") or "").strip().lower()
+    if _answer_tokens_raw in ("", "0", "auto", "none", "model"):
+        answer_max_tokens = None
+    else:
+        try:
+            answer_max_tokens = int(_answer_tokens_raw)
+            if answer_max_tokens <= 0:
+                answer_max_tokens = None
+        except ValueError:
+            _log.warning(
+                "ANSWER_MAX_TOKENS=%r non è un intero valido: uso il massimo del modello.",
+                _answer_tokens_raw,
+            )
+            answer_max_tokens = None
+
+    # --- Reranker: il pool non può essere più piccolo dei thread -------------
+    # process_single_rerank pesca l'istanza con round-robin su q_idx: se le
+    # istanze sono meno dei thread concorrenti, due thread finiscono sulla
+    # STESSA InferenceSession, che è ORT_SEQUENTIAL — si serializzano sullo
+    # stesso budget di calcolo invece di raddoppiarlo, cioè esattamente il
+    # problema per cui il pool era stato introdotto.
+    max_reranker_thread = int(os.environ.get("MAX_RERANKER_THREAD") or 2)
+    reranker_pool_size = int(os.environ.get("RERANKER_POOL_SIZE") or 1)
+
+    if reranker_pool_size < max_reranker_thread:
+        _log.warning(
+            "RERANKER_POOL_SIZE (%d) è inferiore a MAX_RERANKER_THREAD (%d): i thread in "
+            "eccesso condividerebbero una sessione ONNX sequenziale, serializzandosi. "
+            "Pool allineato a %d istanze (verificare che CPU_LIMIT sia adeguato).",
+            reranker_pool_size, max_reranker_thread, max_reranker_thread,
+        )
+        reranker_pool_size = max_reranker_thread
+
     return Settings(
         http_timeout_seconds=int(os.getenv("HTTP_TIMEOUT_SECONDS") or 300),
         data_folder=Path(os.getenv("DATA_FOLDER") or Path(__file__).parent.resolve()),
@@ -175,8 +315,12 @@ def load_settings() -> Settings:
         rerank_batch_size = int(os.environ.get("RERANK_BATCH_SIZE") or  4),
         rerank_max_length = int(os.environ.get("RERANK_MAX_LENGTH") or 512),
         qdrant_concept_threshold = float(os.environ.get("QDRANT_CONCEPT_THRESHOLD") or 0.80),
-        answer_max_tokens = int(os.environ.get("ANSWER_MAX_TOKENS") or  4096),
-        grader_max_tokens = int(os.environ.get("GRADER_MAX_TOKENS") or  32),
+        answer_max_tokens = answer_max_tokens,
+        # Il grader ora restituisce un JSON strutturato (verdict/reason/
+        # missing_targets/note), non più "YES"/"NO": 32 token si troncavano
+        # sistematicamente. Su modelli che contano il thinking sullo stesso
+        # budget (gemini-3.1-flash-lite) serve margine abbondante.
+        grader_max_tokens = int(os.environ.get("GRADER_MAX_TOKENS") or 256),
 
         allow_general_knowledge = _parse_bool(os.environ.get("ALLOW_GENERAL_KNOWLEDGE"), default=True),
 
@@ -184,9 +328,18 @@ def load_settings() -> Settings:
         qdrant_semantic_size = int(os.environ.get("QDRANT_SEMANTIC_SIZE") or 30),
 
         qdrant_semantic_threshold = float(os.environ.get("QDRANT_SEMANTIC_THRESHOLD") or 0.60),
-        max_context_chars = int(os.environ.get("MAX_CONTEXT_CHARS") or 30000),
+        max_context_chars = max_context_chars,
         max_sub_queries = int(os.environ.get("MAX_SUB_QUERIES") or 5),
-        parent_budget_ratio =float(os.environ.get("PARENT_BUDGET_RATIO") or 0.80),
+
+        # Vedi la tabella delle tre politiche nel commento sulla dataclass.
+        context_floor_ratio = float(os.environ.get("CONTEXT_FLOOR_RATIO") or 0.60),
+        context_cap_ratio = float(os.environ.get("CONTEXT_CAP_RATIO") or 0.40),
+        context_score_weight = (os.environ.get("CONTEXT_SCORE_WEIGHT") or "best").lower(),
+
+        context_overflow_ratio = context_overflow_ratio,
+        context_hard_cap_ratio = context_hard_cap_ratio,
+        context_hard_cap_chars = context_hard_cap_chars,
+        context_snap_boundary = (os.environ.get("CONTEXT_SNAP_BOUNDARY") or "sentence").lower(),
 
         min_prob_threshold = float(os.environ.get("MIN_PROB_THRESHOLD") or 0.02),
         parents_per_query = int(os.environ.get("PARENTS_PER_QUERY") or 4),
@@ -204,11 +357,11 @@ def load_settings() -> Settings:
         protected_keys = {"topic_id", "sub_topic_id", "source", "parent_id", "content",
                   "parent_index", "child_index", "file_name", "_ingestion_error", "_ingestion_id", "content_hash"},
 
-        max_reranker_thread = int(os.environ.get("MAX_RERANKER_THREAD") or 2),
+        max_reranker_thread = max_reranker_thread,
         answer_thinking_level = os.environ.get("ANSWER_THINKING_LEVEL") or 'LOW',
         grader_thinking_level = os.environ.get("GRADER_THINKING_LEVEL") or 'MINIMAL',
 
-        reranker_pool_size = int(os.environ.get("RERANKER_POOL_SIZE") or 1),
+        reranker_pool_size = reranker_pool_size,
 
         # Core assegnati al pod (resources.limits.cpu nel deployment K8s), NON
         # letti da os.cpu_count() come unica fonte: quest'ultimo, in un

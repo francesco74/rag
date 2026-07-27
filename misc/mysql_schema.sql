@@ -103,22 +103,22 @@
       INDEX idx_created_at (created_at)
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
--- ==============================================================================
+--  ==============================================================================
 -- QUERY DI ESEMPIO PER L'ANALISI
 -- ==============================================================================
-
+ 
 -- 1. Quante query su 100 arrivano a ciascun numero di tentativi (cache hit esclusi)
 -- SELECT total_attempts, COUNT(*) AS n, ROUND(100.0 * COUNT(*) / SUM(COUNT(*)) OVER (), 1) AS pct
 -- FROM rag_metrics
 -- WHERE cache_hit = FALSE AND created_at > NOW() - INTERVAL 7 DAY
 -- GROUP BY total_attempts;
-
+ 
 -- 2. Tasso di cache hit nel tempo
 -- SELECT DATE(created_at) AS day, AVG(cache_hit) AS cache_hit_rate, COUNT(*) AS n
 -- FROM rag_metrics
 -- GROUP BY DATE(created_at)
 -- ORDER BY day DESC;
-
+ 
 -- 3. Quante volte MMR sceglie un parent "penalizzato" (segnale di redistribuzione
 --    che sta comunque scegliendo qualcosa di simile a ciò che ha già in quota)
 -- SELECT
@@ -126,12 +126,29 @@
 --   AVG(JSON_EXTRACT(attempt, '$.n_mmr_penalized') / NULLIF(JSON_EXTRACT(attempt, '$.n_mmr_candidates'), 0)) AS penalized_ratio
 -- FROM rag_metrics, JSON_TABLE(attempts_detail, '$[*]' COLUMNS (attempt JSON PATH '$')) AS jt
 -- GROUP BY attempt_n;
-
+ 
 -- 4. Query non soddisfacenti anche dopo tutti i retry (candidate per audit manuale)
 -- SELECT task_id, topic_id, query_preview, total_attempts, duration_ms, created_at
 -- FROM rag_metrics
 -- WHERE is_satisfactory = FALSE AND cache_hit = FALSE
 -- ORDER BY created_at DESC
 -- LIMIT 50;
-
-
+ 
+ 
+ 
+-- 5. Motivi di fallimento piu' frequenti (richiede il verdetto strutturato)
+-- SELECT JSON_UNQUOTE(JSON_EXTRACT(attempt, '$.grader_reason')) AS reason, COUNT(*) AS n
+-- FROM rag_metrics, JSON_TABLE(attempts_detail, '$[*]' COLUMNS (attempt JSON PATH '$')) AS jt
+-- WHERE cache_hit = FALSE AND created_at > NOW() - INTERVAL 30 DAY
+-- GROUP BY reason ORDER BY n DESC;
+ 
+-- 6. Entita' cronicamente scoperte: se una compare spesso, verificare se i suoi
+--    documenti sono stati indicizzati (problema di ingestion) oppure se ci sono
+--    ma il retrieval non li aggancia (problema di soglie).
+-- SELECT target, COUNT(*) AS n
+-- FROM rag_metrics,
+--      JSON_TABLE(attempts_detail, '$[*]' COLUMNS (missing JSON PATH '$.missing_targets')) AS jt,
+--      JSON_TABLE(jt.missing, '$[*]' COLUMNS (target VARCHAR(255) PATH '$')) AS t
+-- WHERE created_at > NOW() - INTERVAL 30 DAY
+-- GROUP BY target ORDER BY n DESC LIMIT 20;
+ 

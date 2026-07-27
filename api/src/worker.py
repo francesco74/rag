@@ -81,8 +81,17 @@ celery_app.conf.update(
     task_acks_late=True,
     task_reject_on_worker_lost=True,
     worker_max_tasks_per_child=100,  # Restart worker after 100 tasks
-    worker_max_memory_per_child=2000000, # 2GB limit
+    worker_max_memory_per_child=2400000, # 2GB limit
     worker_hijack_root_logger=False,
+    # Secondi che Celery concede a un processo appena forkato per segnalare
+    # "UP". Il default è 4.0 e NON basta più: init_worker_process carica il
+    # pool ONNX (tokenizer + sessione per ciascuna istanza, ~6.9s misurati),
+    # quindi ogni processo di rimpiazzo veniva ucciso con SIGKILL a 3.97s
+    # esatti e il worker entrava in crash loop infinito — visibile nei log
+    # come "Timed out waiting for UP message from <ForkProcess(...)>".
+    # Va tenuto sopra il tempo di init peggiore, con margine: è un limite di
+    # sicurezza contro i processi nati morti, non una manopola di performance.
+    worker_proc_alive_timeout=60.0,
 )
 
 # ==============================================================================
@@ -102,9 +111,26 @@ def init_worker_process(**kwargs):
     try:
         init_db_pool()  # Inizializza il pool globalmente
 
-        qdrant_client = QdrantClient(host=settings.qdrant_host, port=settings.qdrant_port)
+        qdrant_client = QdrantClient(
+            host=settings.qdrant_host,
+            port=settings.qdrant_port,
+            # Il default della libreria è 5s. Le vector search con group_by
+            # impiegavano 4,1-4,9s: si viaggiava sul filo, e la prima che
+            # sforava perdeva l'INTERA sottoquery (safe_vector_search cattura
+            # l'eccezione e restituisce una lista vuota, senza retry), con il
+            # comune corrispondente assente dalla risposta finale.
+            timeout=10,
+        )
         embedding_client = genai.Client(api_key=settings.api_llm_key)
         init_llm_provider()
+
+        # Il pool ONNX viene costruito QUI, non alla prima query. Era lazy
+        # dentro retrieve_chunks: i ~6,7s di caricamento (tokenizer + sessione,
+        # per ogni istanza, in serie) finivano dentro la latenza percepita
+        # dall'utente che aveva la sfortuna di essere il primo a interrogare il
+        # processo appena forkato. Post-fork è il punto giusto: prima del fork
+        # la sessione ONNX non sarebbe ereditabile in sicurezza.
+        get_reranker_pool()
 
         log.info("✓ Resources successfully initialized for this process.")
     except Exception as e:
@@ -447,23 +473,34 @@ def transform_query(history, query, task_id="UNKNOWN", verified_concepts=None):
         standalone = data.get("standalone_query", query)
         searches   = data.get("search_queries", [query])
         keywords   = data.get("keywords", [])
+        # Entità distinte che la risposta deve coprire (comuni, enti, oggetti).
+        # Vuota quando la domanda non è aggregativa. Il .get con default
+        # garantisce la retrocompatibilità con prompt di rewriter più vecchi.
+        coverage   = data.get("coverage_targets", []) or []
 
         log.info(
             f"[{task_id}] [REWRITER] ✓ Query processata. "
-            f"Standalone: '{standalone}' | Facets: {len(searches)} | Keywords: {len(keywords)}"
+            f"Standalone: '{standalone}' | Facets: {len(searches)} | Keywords: {len(keywords)} | "
+            f"Coverage: {len(coverage)}"
         )
 
         log.debug(f"Standalone query: {standalone}")
         log.debug(f"Query individuate: {searches}")
         log.debug(f"Keywords: {keywords}")
-        return {"standalone_query": standalone, "search_queries": searches, "keywords": keywords}
+        log.debug(f"Coverage targets: {coverage}")
+        return {
+            "standalone_query": standalone,
+            "search_queries": searches,
+            "keywords": keywords,
+            "coverage_targets": coverage,
+        }
 
     except Exception as e:
         log.warning(
             f"[{task_id}] [REWRITER] ✗ Fallimento critico: {e}. Attivazione fallback (query raw).",
             exc_info=True
         )
-        return {"standalone_query": query, "search_queries": [query], "keywords": []}
+        return {"standalone_query": query, "search_queries": [query], "keywords": [], "coverage_targets": []}
 
 
 def resolve_citations(answer_html: str, index_to_item: dict) -> str:
@@ -504,9 +541,22 @@ def resolve_citations(answer_html: str, index_to_item: dict) -> str:
 
 
 # ==============================================================================
-# 5bis. WINDOWED TRUNCATION — ritaglio del parent centrato sui child che hanno
-# fatto match, invece di un taglio cieco dall'inizio del documento.
+# 5bis. COSTRUZIONE DEL CONTESTO
+#
+# Tre stadi, in quest'ordine:
+#   1. compute_core_spans()        — dove stanno, dentro il parent, i child che
+#                                    hanno fatto match. Sono INCOMPRIMIBILI.
+#   2. allocate_context_budget()   — quanti caratteri spettano a ciascun parent,
+#                                    con equità garantita tra le sottoquery.
+#   3. render_parent_window()      — ritaglio effettivo: i core sopravvivono
+#                                    sempre, a cedere sono i margini.
+#
+# Il principio è che il budget si spende sui contenuti che il retrieval ha
+# giudicato rilevanti, non sul testo di contorno; e che nessuna sottoquery può
+# monopolizzare il contesto solo perché il suo comune ha più documenti a
+# catalogo.
 # ==============================================================================
+
 # Quanti child (per parent) teniamo come "ancore" per il windowing. Tenerne
 # più di uno permette di coprire casi in cui più frammenti dello stesso
 # documento sono stati rilevanti per query diverse.
@@ -516,42 +566,74 @@ SNIPPETS_PER_PARENT = 3
 # tra come il child è stato salvato e come appare dentro il testo del parent.
 SNIPPET_ANCHOR_LEN = 80
 
+# Marcatore esplicito al posto del vecchio "[...]". NON è cosmetica: serve a
+# impedire che il modello legga due passaggi distanti come contigui e ci
+# costruisca sopra un nesso che nel documento non esiste. Su atti
+# amministrativi, dove un comma può essere separato dalla sua deroga da venti
+# pagine, il rischio è concreto.
+OMISSION_MARKER = "\n[... porzione di documento omessa ...]\n"
 
-def extract_relevant_window(content: str, matched_snippets: list, budget: int, task_id: str = "UNKNOWN") -> str:
+# Se non riusciamo a localizzare nessuno snippet dentro il parent, questo è il
+# minimo che gli garantiamo comunque (troncamento dall'inizio).
+FALLBACK_MIN_CHARS = 600
+
+# Terminatori di frase/paragrafo per lo "snap": arretriamo il taglio fino al
+# confine più vicino DENTRO il budget, quindi a costo zero.
+_SENTENCE_END_RE = re.compile(r"[.!?;:»)\]]\s")
+_PARAGRAPH_END_RE = re.compile(r"\n\s*\n")
+
+
+def _whitespace_tolerant_find(content: str, anchor: str):
     """
-    Se il parent intero sta nel budget, nessun problema. Altrimenti, invece di
-    tagliare ciecamente i primi `budget` caratteri (rischiando di perdere
-    proprio il passaggio che ha fatto vincere questo parent al retrieval),
-    ritagliamo una finestra centrata sui child/snippet che hanno fatto match.
+    Cerca `anchor` dentro `content` tollerando differenze di whitespace, e
+    restituisce (start, end) come indici VALIDI SU `content`, oppure None.
 
-    Localizzazione a tre livelli, in ordine di affidabilità:
-    1. OFFSET dal payload (start_char/end_char, popolati dal backfill o
-       dall'ingestion): esatti e gratuiti. Un sanity check (l'ancora dello
-       snippet deve comparire nel testo puntato dagli offset) protegge dal
-       caso di parent modificato dopo il calcolo degli offset.
-    2. Ricerca testuale dell'ancora nel parent (comportamento precedente).
-    3. Fallback finale: troncamento dall'inizio, mai un'eccezione.
+    Sostituisce il vecchio fallback che cercava dentro
+    `" ".join(content.split())` e poi usava l'indice trovato come se fosse un
+    indice del testo originale: la normalizzazione collassa gli spazi, quindi
+    lo scarto cresce con la quantità di whitespace e su un documento pieno di
+    tabulazioni la finestra poteva slittare di centinaia di caratteri,
+    centrandosi sul punto sbagliato.
+    """
+    tokens = anchor.split()
+    if not tokens:
+        return None
+    pattern = r"\s+".join(re.escape(t) for t in tokens)
+    try:
+        m = re.search(pattern, content)
+    except re.error:
+        return None
+    return (m.start(), m.end()) if m else None
+
+
+def compute_core_spans(content: str, matched_snippets: list, task_id: str = "UNKNOWN") -> list:
+    """
+    Localizza dentro il parent i child che hanno fatto match e restituisce una
+    lista ordinata e deduplicata di dict {start, end, score}: sono i "core",
+    le porzioni di testo che NON devono mai essere sacrificate.
+
+    Localizzazione a due livelli, in ordine di affidabilità:
+      1. OFFSET dal payload (start_char/end_char, popolati dal backfill o
+         dall'ingestion): esatti e gratuiti. Un sanity check (l'ancora deve
+         comparire nel testo puntato dagli offset) protegge dal caso di parent
+         modificato dopo il calcolo degli offset.
+      2. Ricerca dell'ancora tollerante ai whitespace sul testo ORIGINALE.
 
     matched_snippets: lista di dict {content, score, start_char?, end_char?}.
     Per retrocompatibilità accetta anche semplici stringhe.
     """
-    if len(content) <= budget:
-        return content
-
-    if not matched_snippets:
-        log.debug(f"[{task_id}] [WINDOW] Nessuno snippet disponibile: fallback a troncamento dall'inizio.")
-        return content[:budget]
-
     spans = []
     offset_hits = 0
-    for snippet in matched_snippets:
+
+    for snippet in matched_snippets or []:
         # Retrocompatibilità: snippet può essere una stringa o un dict
         if isinstance(snippet, str):
-            snippet_text, s_char, e_char = snippet, None, None
+            snippet_text, s_char, e_char, score = snippet, None, None, 0.0
         else:
             snippet_text = snippet.get("content", "")
             s_char = snippet.get("start_char")
             e_char = snippet.get("end_char")
+            score = snippet.get("score", 0.0) or 0.0
 
         if not snippet_text:
             continue
@@ -566,7 +648,7 @@ def extract_relevant_window(content: str, matched_snippets: list, budget: int, t
         ):
             window_text_norm = " ".join(content[s_char:e_char].split())
             if anchor[:40] in window_text_norm:
-                spans.append((s_char, e_char))
+                spans.append({"start": s_char, "end": e_char, "score": score})
                 offset_hits += 1
                 continue
             log.debug(
@@ -574,28 +656,436 @@ def extract_relevant_window(content: str, matched_snippets: list, budget: int, t
                 f"(parent modificato dopo il backfill?): fallback a ricerca testuale."
             )
 
-        # Livello 2: ricerca testuale dell'ancora (comportamento precedente)
-        idx = content.find(anchor)
-        if idx == -1:
-            # Tentativo più permissivo: normalizza anche il documento (whitespace)
-            # prima di cercare. Approssimato (gli indici non combaciano più 1:1
-            # coi caratteri originali), ma preferibile a non trovare nulla.
-            normalized = " ".join(content.split())
-            idx_norm = normalized.find(anchor)
-            if idx_norm != -1:
-                idx = idx_norm
-        if idx != -1:
-            spans.append((idx, idx + len(snippet_text)))
+        # Livello 2: ricerca tollerante ai whitespace, indici sempre coerenti
+        found = _whitespace_tolerant_find(content, anchor)
+        if found:
+            start, _ = found
+            # L'ancora è solo il PREFISSO dello snippet: il core si estende per
+            # tutta la lunghezza dello snippet originale, non solo dell'ancora.
+            end = min(len(content), start + len(snippet_text))
+            spans.append({"start": start, "end": end, "score": score})
 
     if not spans:
-        log.debug(f"[{task_id}] [WINDOW] Nessuno snippet localizzato nel parent: fallback a troncamento dall'inizio.")
-        return content[:budget]
+        return []
 
-    # Una finestra di margine per ogni ancora trovata, poi merge di quelle sovrapposte.
-    spans.sort()
-    margin = max(200, budget // (2 * len(spans)))
-    windows = [(max(0, s - margin), min(len(content), e + margin)) for s, e in spans]
+    # Merge dei core sovrapposti: lo score del blocco unito è il massimo dei suoi.
+    spans.sort(key=lambda s: s["start"])
+    merged = [spans[0]]
+    for s in spans[1:]:
+        last = merged[-1]
+        if s["start"] <= last["end"]:
+            last["end"] = max(last["end"], s["end"])
+            last["score"] = max(last["score"], s["score"])
+        else:
+            merged.append(s)
 
+    log.debug(
+        f"[{task_id}] [WINDOW] {len(merged)} core individuati "
+        f"({offset_hits} via offset, {len(spans) - offset_hits} via ricerca testuale)."
+    )
+    return merged
+
+
+def estimate_parent_needs(content: str, core_spans: list) -> tuple:
+    """
+    Restituisce (need_min, need_full) per un parent.
+
+    need_min  = spazio sotto il quale si perde informazione che il retrieval
+                aveva giudicato rilevante: la somma dei core più i marcatori
+                di omissione che li separano.
+    need_full = il documento intero.
+
+    Sono i due numeri su cui lavora l'allocatore: garantisce need_min a tutti
+    PRIMA di far crescere chiunque verso need_full.
+    """
+    need_full = len(content)
+    if not core_spans:
+        return min(need_full, FALLBACK_MIN_CHARS), need_full
+    core_total = sum(s["end"] - s["start"] for s in core_spans)
+    core_total += len(OMISSION_MARKER) * (len(core_spans) - 1)
+    return min(core_total, need_full), need_full
+
+
+def _water_fill(demands: list, budget: int) -> tuple:
+    """
+    Ripartizione max-min fair (water-filling) di `budget` tra richieste eterogenee.
+
+    Tutti ricevono una quota uguale; chi chiede MENO della propria quota prende
+    solo ciò che gli serve e RESTITUISCE l'avanzo, che viene ridistribuito a chi
+    è ancora insoddisfatto. Si itera fino a convergenza.
+
+    È il meccanismo che elimina lo spreco del vecchio calcolo a tetto fisso, in
+    cui un parent lungo 900 caratteri con quota 1875 lasciava 975 caratteri che
+    nessuno raccoglieva mentre altri parent venivano troncati.
+
+    Restituisce (allocazioni, budget_residuo).
+    """
+    n = len(demands)
+    alloc = [0] * n
+    if n == 0 or budget <= 0:
+        return alloc, max(0, budget)
+
+    pending = set(range(n))
+    remaining = budget
+
+    while pending and remaining > 0:
+        share = remaining // len(pending)
+        if share <= 0:
+            break
+        satisfied = [i for i in pending if demands[i] <= share]
+        if not satisfied:
+            # Nessuno si accontenta della quota: la spartiamo e chiudiamo.
+            for i in pending:
+                alloc[i] += share
+                remaining -= share
+            break
+        for i in satisfied:
+            alloc[i] += demands[i]
+            remaining -= demands[i]
+            pending.discard(i)
+
+    return alloc, max(0, remaining)
+
+
+def _subquery_quotas(group_scores: list, total_budget: int, task_id: str = "UNKNOWN") -> list:
+    """
+    Quota di caratteri per ciascuna sottoquery, secondo la politica configurata
+    (vedi la tabella delle tre politiche in common/config.py).
+
+        quota = floor_equamente_diviso + resto_pesato_sulla_rilevanza
+        quota = min(quota, cap)     # tetto anti-monopolio
+
+    L'eccedenza tagliata dal cap viene ridistribuita alle sottoquery non ancora
+    al tetto, così nessun carattere si perde per strada.
+    """
+    n = len(group_scores)
+    if n == 0:
+        return []
+
+    floor_ratio = max(0.0, min(1.0, settings.context_floor_ratio))
+    floor_pool = total_budget * floor_ratio
+    weighted_pool = total_budget - floor_pool
+    base = floor_pool / n
+
+    if settings.context_score_weight == "none" or weighted_pool <= 0:
+        weights = [1.0 / n] * n
+    else:
+        raw = [max(0.0, s) for s in group_scores]
+        tot = sum(raw)
+        weights = [r / tot for r in raw] if tot > 0 else [1.0 / n] * n
+
+    quotas = [base + weighted_pool * w for w in weights]
+
+    # Tetto anti-monopolio, con ridistribuzione iterativa dell'eccedenza.
+    cap_ratio = settings.context_cap_ratio
+    if 0 < cap_ratio < 1.0 and n > 1:
+        cap = total_budget * cap_ratio
+        for _ in range(4):
+            excess = sum(q - cap for q in quotas if q > cap)
+            if excess <= 1:
+                break
+            quotas = [min(q, cap) for q in quotas]
+            free_idx = [i for i, q in enumerate(quotas) if q < cap - 1]
+            if not free_idx:
+                break
+            free_weight = sum(weights[i] for i in free_idx) or len(free_idx)
+            for i in free_idx:
+                share = (weights[i] / free_weight) if free_weight else (1 / len(free_idx))
+                quotas[i] = min(cap, quotas[i] + excess * share)
+
+    quotas = [int(q) for q in quotas]
+    log.debug(f"[{task_id}] [ALLOC] Quote per sottoquery: {quotas} (floor={floor_ratio}, cap={cap_ratio}).")
+    return quotas
+
+
+def allocate_context_budget(items: list, total_budget: int, task_id: str = "UNKNOWN") -> tuple:
+    """
+    Assegna a ciascun parent il proprio budget di caratteri, garantendo che ogni
+    sottoquery contribuisca al contesto finale.
+
+    Cascata, nell'ordine deciso:
+      FASE A — ogni parent riceve almeno need_min (i suoi core), dentro la quota
+               della propria sottoquery.
+      FASE B — l'avanzo del water-filling (il budget che le sottoquery povere non
+               riescono a consumare) va a chi è ancora in deficit.
+      FASE C — se serve ancora, si sfora max_context_chars fino a
+               context_overflow_ratio, comunque entro context_hard_cap_chars.
+      FASE D — solo se anche questo non basta, il parent riceve meno di need_min
+               e render_parent_window() scarterà il core con lo score più basso,
+               loggando un WARNING: è il segnale che SNIPPETS_PER_PARENT o il
+               budget vanno ritarati per quel topic.
+      FASE E — con quello che resta, i parent crescono verso need_full (margini
+               di contesto attorno ai core).
+      FASE F — completamento: un documento che sfora di poco (<= overflow_ratio)
+               viene preso INTERO invece che finestrato. L'espansione non può
+               mai servire ad aggiungere un parent nuovo, solo a completarne uno
+               già selezionato.
+
+    Restituisce (allocazioni, stats).
+    """
+    n = len(items)
+    if n == 0:
+        return [], {}
+
+    # --- raggruppamento per sottoquery, preservando l'ordine di apparizione ---
+    groups = {}
+    for i, it in enumerate(items):
+        groups.setdefault(it.get("query_idx", 0), []).append(i)
+    group_keys = list(groups.keys())
+
+    if settings.context_score_weight == "mean":
+        group_scores = [
+            sum(items[i].get("score", 0.0) for i in groups[g]) / len(groups[g])
+            for g in group_keys
+        ]
+    else:  # 'best' (default) — meno sensibile alla numerosità dei documenti
+        group_scores = [max(items[i].get("score", 0.0) for i in groups[g]) for g in group_keys]
+
+    quotas = _subquery_quotas(group_scores, total_budget, task_id=task_id)
+
+    need_min = [it["need_min"] for it in items]
+    need_full = [it["need_full"] for it in items]
+    alloc = [0] * n
+
+    # --- FASE A: need_min dentro la quota di gruppo ---------------------------
+    leftover_pool = 0
+    for gi, g in enumerate(group_keys):
+        idxs = groups[g]
+        sub_alloc, leftover = _water_fill([need_min[i] for i in idxs], quotas[gi])
+        for k, i in enumerate(idxs):
+            alloc[i] = sub_alloc[k]
+        leftover_pool += leftover
+
+    # --- FASE B: avanzo globale ai parent ancora sotto need_min ---------------
+    deficit_idx = [i for i in range(n) if alloc[i] < need_min[i]]
+    if deficit_idx and leftover_pool > 0:
+        deficits = [need_min[i] - alloc[i] for i in deficit_idx]
+        got, leftover_pool = _water_fill(deficits, leftover_pool)
+        for k, i in enumerate(deficit_idx):
+            alloc[i] += got[k]
+        log.info(
+            f"[{task_id}] [ALLOC] Avanzo redistribuito a {len(deficit_idx)} parent sotto il minimo vitale."
+        )
+
+    # --- FASE C: overflow controllato, entro l'hard cap -----------------------
+    ceiling = min(
+        int(total_budget * (1 + settings.context_overflow_ratio)),
+        settings.context_hard_cap_chars,
+    )
+    n_expanded = 0
+    deficit_idx = [i for i in range(n) if alloc[i] < need_min[i]]
+    if deficit_idx:
+        headroom = ceiling - sum(alloc)
+        if headroom > 0:
+            deficits = [need_min[i] - alloc[i] for i in deficit_idx]
+            got, _ = _water_fill(deficits, headroom)
+            for k, i in enumerate(deficit_idx):
+                if got[k] > 0:
+                    alloc[i] += got[k]
+                    n_expanded += 1
+            log.info(
+                f"[{task_id}] [ALLOC] Espansione oltre max_context_chars per garantire i core: "
+                f"{sum(alloc)}/{total_budget} chars (tetto {ceiling})."
+            )
+
+    # --- FASE D: deficit residuo → sacrificio di uno snippet (rumoroso) -------
+    still_short = [i for i in range(n) if alloc[i] < need_min[i]]
+    if still_short:
+        log.warning(
+            f"[{task_id}] [ALLOC] {len(still_short)} parent restano sotto il minimo vitale anche "
+            f"dopo espansione: verrà scartato lo snippet meno rilevante. Valutare di ridurre "
+            f"SNIPPETS_PER_PARENT o di alzare MAX_CONTEXT_CHARS per questo topic."
+        )
+
+    # --- FASE E: crescita verso need_full con il budget residuo ---------------
+    used = sum(alloc)
+    growth_pool = max(0, total_budget - used)
+    if growth_pool > 0:
+        # Prima dentro il gruppo (equità), poi il residuo globalmente.
+        for gi, g in enumerate(group_keys):
+            idxs = groups[g]
+            group_used = sum(alloc[i] for i in idxs)
+            group_pool = max(0, quotas[gi] - group_used)
+            group_pool = min(group_pool, growth_pool)
+            if group_pool <= 0:
+                continue
+            extra = [max(0, need_full[i] - alloc[i]) for i in idxs]
+            got, back = _water_fill(extra, group_pool)
+            for k, i in enumerate(idxs):
+                alloc[i] += got[k]
+            growth_pool -= (group_pool - back)
+
+        # Residuo globale, in due giri. Il primo rispetta il tetto
+        # anti-monopolio: se più sottoquery hanno ancora fame, nessuna può
+        # sfondare context_cap_ratio approfittando dell'avanzo altrui.
+        # Il secondo giro serve solo quando NESSUN altro è in grado di
+        # assorbire quel budget (tipicamente perché tutti gli altri hanno già
+        # ricevuto i loro documenti INTERI): a quel punto lasciarlo inutilizzato
+        # sarebbe uno spreco senza vittime, non un monopolio.
+        if growth_pool > 0:
+            cap = int(total_budget * settings.context_cap_ratio) if 0 < settings.context_cap_ratio < 1 else None
+            for capped_round in (True, False):
+                if growth_pool <= 0:
+                    break
+                extra = []
+                for i in range(n):
+                    want = max(0, need_full[i] - alloc[i])
+                    if capped_round and cap is not None:
+                        g = items[i].get("query_idx", 0)
+                        group_used = sum(alloc[j] for j in groups[g])
+                        want = min(want, max(0, cap - group_used))
+                    extra.append(want)
+                if not any(extra):
+                    continue
+                got, growth_pool = _water_fill(extra, growth_pool)
+                for i in range(n):
+                    alloc[i] += got[i]
+
+    # --- FASE F: completamento dei documenti che sforano di poco --------------
+    n_completed = 0
+    used = sum(alloc)
+    gaps = sorted(
+        (i for i in range(n) if alloc[i] < need_full[i]),
+        key=lambda i: need_full[i] - alloc[i],
+    )
+    for i in gaps:
+        gap = need_full[i] - alloc[i]
+        tolerance = max(1, int(need_full[i] * settings.context_overflow_ratio))
+        if gap <= tolerance and used + gap <= ceiling:
+            alloc[i] += gap
+            used += gap
+            n_completed += 1
+
+    if n_completed:
+        log.info(
+            f"[{task_id}] [ALLOC] {n_completed} parent inclusi INTERI grazie all'overflow "
+            f"(sforamento <= {settings.context_overflow_ratio:.0%}); totale {used} chars."
+        )
+
+    stats = {
+        "n_groups": len(group_keys),
+        "quotas": quotas,
+        "allocated_total": sum(alloc),
+        "n_expanded": n_expanded,
+        "n_completed": n_completed,
+        "n_below_min": len(still_short),
+        "ceiling": ceiling,
+    }
+    return alloc, stats
+
+
+def _snap_start(content: str, pos: int, limit: int) -> int:
+    """
+    Sposta l'inizio della finestra IN AVANTI fino al confine di frase/paragrafo
+    più vicino, senza mai superare `limit` (l'inizio del core, che è intoccabile).
+    Costo zero: si restringe, non si espande.
+    """
+    mode = settings.context_snap_boundary
+    if mode == "none" or pos <= 0 or pos >= limit:
+        return pos
+    window = content[pos:limit]
+    rx = _PARAGRAPH_END_RE if mode == "paragraph" else _SENTENCE_END_RE
+    m = rx.search(window)
+    if m:
+        return pos + m.end()
+    return pos
+
+
+def _snap_end(content: str, pos: int, limit: int) -> int:
+    """
+    Arretra la fine della finestra fino all'ultimo confine di frase/paragrafo,
+    senza mai scendere sotto `limit` (la fine del core).
+    """
+    mode = settings.context_snap_boundary
+    if mode == "none" or pos >= len(content) or pos <= limit:
+        return pos
+    window = content[limit:pos]
+    rx = _PARAGRAPH_END_RE if mode == "paragraph" else _SENTENCE_END_RE
+    last = None
+    for m in rx.finditer(window):
+        last = m
+    if last:
+        return limit + last.end()
+    return pos
+
+
+def render_parent_window(content: str, core_spans: list, budget: int, task_id: str = "UNKNOWN") -> str:
+    """
+    Costruisce il testo effettivo del parent entro `budget` caratteri.
+
+    Regola fondamentale: i CORE (i child che hanno fatto match) sono
+    incomprimibili, i MARGINI attorno a loro sono comprimibili. Se un parent ha
+    un chunk rilevante all'inizio e uno alla fine, teniamo entrambi separandoli
+    con OMISSION_MARKER, invece di sacrificarne uno: quel documento è
+    probabilmente il più informativo del lotto, e mutilarlo sarebbe il peggior
+    uso possibile del budget.
+
+    Non tronca MAI a metà di un blocco: se lo spazio non basta, scarta per
+    intero il core con lo score più basso (ultima risorsa, già segnalata a
+    WARNING dall'allocatore).
+    """
+    if len(content) <= budget:
+        return content
+
+    if not core_spans:
+        log.debug(f"[{task_id}] [WINDOW] Nessun core localizzato: troncamento dall'inizio con snap.")
+        cut = _snap_end(content, budget, 0)
+        return content[:cut]
+
+    # Se i soli core non ci stanno, sacrifichiamo i meno rilevanti — mai un
+    # taglio a metà blocco.
+    cores = sorted(core_spans, key=lambda s: s["start"])
+    while len(cores) > 1:
+        core_total = sum(c["end"] - c["start"] for c in cores)
+        core_total += len(OMISSION_MARKER) * (len(cores) - 1)
+        if core_total <= budget:
+            break
+        weakest = min(cores, key=lambda c: c["score"])
+        cores.remove(weakest)
+        log.warning(
+            f"[{task_id}] [WINDOW] Budget insufficiente per tutti i core: scartato uno snippet "
+            f"(score={weakest['score']:.4f}). Restano {len(cores)} core."
+        )
+
+    core_total = sum(c["end"] - c["start"] for c in cores)
+    separators = len(OMISSION_MARKER) * (len(cores) - 1)
+
+    # Il margine è ciò che AVANZA dopo aver messo al sicuro i core, distribuito
+    # equamente sui blocchi (metà prima, metà dopo). Sostituisce il vecchio
+    # margin = max(200, budget // (2 * len(spans))), che veniva calcolato prima
+    # di sapere se i core ci stavano.
+    margin_pool = max(0, budget - core_total - separators)
+
+    # Espansione iterativa del margine. Un core a inizio o fine documento non
+    # può crescere da entrambi i lati, e nella prima versione quello spazio
+    # andava semplicemente perso (su un parent con core agli estremi si
+    # arrivava a usare meno della metà del budget). Qui ricalcoliamo cosa è
+    # stato davvero consumato e rioffriamo il resto a chi può ancora crescere.
+    def _expand(pool):
+        per_side = pool // (2 * len(cores)) if cores else 0
+        wins = []
+        for c in cores:
+            start = _snap_start(content, max(0, c["start"] - per_side), c["start"])
+            end = _snap_end(content, min(len(content), c["end"] + per_side), c["end"])
+            wins.append((start, end))
+        return wins
+
+    windows = _expand(margin_pool)
+    for _ in range(3):
+        used = sum(e - s for s, e in windows) + separators
+        slack = budget - used
+        # Ci fermiamo quando l'avanzo è irrilevante o quando l'ultima
+        # iterazione non ha prodotto alcun guadagno (tutti i core già al
+        # confine del documento).
+        if slack < 200:
+            break
+        candidate = _expand(margin_pool + slack)
+        if sum(e - s for s, e in candidate) <= sum(e - s for s, e in windows):
+            break
+        margin_pool += slack
+        windows = candidate
+
+    # Merge dei blocchi che dopo l'espansione dei margini si toccano.
     merged = [windows[0]]
     for s, e in windows[1:]:
         last_s, last_e = merged[-1]
@@ -605,132 +1095,414 @@ def extract_relevant_window(content: str, matched_snippets: list, budget: int, t
             merged.append((s, e))
 
     pieces = [content[s:e] for s, e in merged]
-    result = "\n[...]\n".join(pieces)
+    result = OMISSION_MARKER.join(pieces)
 
-    if len(result) > budget:
-        result = result[:budget]
+    # Se lo snap ha allargato oltre il previsto, rimuoviamo margine invece di
+    # tagliare il risultato a caratteri (che spezzerebbe l'ultimo blocco).
+    if len(result) > budget and len(merged) == 1:
+        s, e = merged[0]
+        core_end = max(c["end"] for c in cores)
+        result = content[s:max(core_end, e - (len(result) - budget))]
 
     log.debug(
-        f"[{task_id}] [WINDOW] Finestra costruita da {len(spans)} snippet "
-        f"({offset_hits} via offset, {len(spans) - offset_hits} via ricerca testuale), "
-        f"{len(merged)} blocchi dopo merge, {len(result)}/{budget} chars usati "
-        f"(vs {len(content)} chars totali nel parent)."
+        f"[{task_id}] [WINDOW] {len(cores)} core, {len(merged)} blocchi dopo merge, "
+        f"{len(result)}/{budget} chars usati (parent originale: {len(content)} chars)."
     )
     return result
 
 
-def generate_answer(query, rich_context, topic_id):
-    formatted_chunks = []
-    curr_len = 0
+def build_context(rich_context, task_id="UNKNOWN"):
+    """
+    Assembla il contesto testuale per il generatore e restituisce
+    (context_str, index_to_item, stats).
+
+    L'ordine degli item è quello deciso da retrieve_chunks (round-robin tra
+    sottoquery): se qualcosa deve cadere per esaurimento budget, cade la coda di
+    TUTTE le sottoquery, non un comune intero.
+    """
     n_parents = len(rich_context)
-    index_to_item = {}
-
     if n_parents == 0:
-        context_str = ""
-    else:
-        theoretical_budget_per_parent = settings.max_context_chars // (settings.parents_per_query * settings.max_sub_queries)
-        cap_per_parent = int(theoretical_budget_per_parent / settings.parent_budget_ratio)
-        budget_per_parent = min(settings.max_context_chars // n_parents, cap_per_parent)
+        return "", {}, {}
 
-        log.debug(
-            f"Budget per parent: {budget_per_parent} chars "
-            f"(teorico={theoretical_budget_per_parent}, cap={cap_per_parent}, "
-            f"parent effettivi={n_parents})."
-        )
+    # --- 1. header: costruiti PRIMA, così il loro costo è sottratto dal budget
+    # invece di sforare silenziosamente come accadeva prima (il vecchio codice
+    # contava gli header solo nel break finale, non nel budget per parent).
+    headers = []
+    for idx, item in enumerate(rich_context, start=1):
+        parts = [str(idx)]
+        if item.get("sub_topic"):
+            parts.append(f"Ambito: {item['sub_topic']}")
+        # Provenienza della RICERCA, non del contenuto: il prompt istruisce il
+        # modello a verificarla nel testo prima di attribuire il documento.
+        if item.get("retrieved_by"):
+            parts.append(f"Rif. ricerca: {'; '.join(item['retrieved_by'])}")
+        parts.append(f"Date: {item.get('date') or 'unknown'}")
+        headers.append("[" + " | ".join(parts) + "]\n")
 
-        for idx, item in enumerate(rich_context, start=1):
-            content = item['content']
-            if len(content) > budget_per_parent:
-                original_len = len(content)
-                content = extract_relevant_window(
-                    content, item.get('matched_snippets', []), budget_per_parent
-                )
-                log.debug(
-                    f"Parent '{item['source']}' (rif. [{idx}]) ridotto: "
-                    f"{original_len} → {len(content)} chars (windowed su child match)."
-                )
+    header_cost = sum(len(h) for h in headers) + 2 * n_parents  # "\n\n" tra i blocchi
+    budget = max(1000, settings.max_context_chars - header_cost)
 
-            # NOTA: l'header espone al modello SOLO un indice numerico, mai il
-            # filename. Il modello non può più scrivere/storpiare un nome file:
-            # può solo riferirsi a "idx", che viene poi risolto in modo
-            # deterministico da resolve_citations() usando index_to_item.
-            header = f"[{idx}"
-            if item.get('date'):
-                header += f" | Date: {item['date']}"
-            else:
-                header += f" | Date: unknown"
-            header += "]"
+    # --- 2. core spans e fabbisogni
+    for item in rich_context:
+        content = item.get("content", "")
+        spans = compute_core_spans(content, item.get("matched_snippets", []), task_id=task_id)
+        item["_core_spans"] = spans
+        need_min, need_full = estimate_parent_needs(content, spans)
+        item["need_min"] = need_min
+        item["need_full"] = need_full
 
-            chunk = f"{header}\n{content}\n\n"
+    # --- 3. allocazione equa tra sottoquery
+    alloc, alloc_stats = allocate_context_budget(rich_context, budget, task_id=task_id)
 
-            if curr_len + len(chunk) > settings.max_context_chars:
-                log.warning(
-                    f"Budget complessivo raggiunto ({curr_len}/{settings.max_context_chars} chars). "
-                    f"{n_parents - len(formatted_chunks)} parent scartati."
-                )
-                break
+    # --- 4. rendering
+    formatted_chunks = []
+    index_to_item = {}
+    curr_len = 0
+    hard_cap = settings.context_hard_cap_chars
 
-            formatted_chunks.append(chunk)
-            curr_len += len(chunk)
-            index_to_item[idx] = item
+    for pos, (idx, item) in enumerate(enumerate(rich_context, start=1)):
+        content = item.get("content", "")
+        item_budget = alloc[pos]
+        if item_budget <= 0:
+            log.debug(f"[{task_id}] Parent [{idx}] senza budget assegnato: escluso dal contesto.")
+            continue
 
-        context_str = "".join(formatted_chunks)
+        rendered = render_parent_window(content, item.get("_core_spans", []), item_budget, task_id=task_id)
+        chunk = f"{headers[pos]}{rendered}\n\n"
 
+        if curr_len + len(chunk) > hard_cap:
+            log.warning(
+                f"[{task_id}] Hard cap raggiunto ({curr_len}/{hard_cap} chars): "
+                f"{n_parents - len(formatted_chunks)} parent scartati."
+            )
+            break
+
+        formatted_chunks.append(chunk)
+        curr_len += len(chunk)
+        index_to_item[idx] = item
+        # Caratteri REALMENTE finiti nel contesto per questo parent, header
+        # incluso: è l'unico numero che serve per capire come il budget è stato
+        # speso davvero. Va registrato qui perché dopo il windowing il dato non
+        # è più ricostruibile dall'item.
+        item["_rendered_chars"] = len(chunk)
+
+    # --- 5. osservabilità: l'allocazione effettiva, per sottoquery
+    # 'chars' contava need_full, cioè il fabbisogno TEORICO del parent, non i
+    # caratteri effettivamente renderizzati: su un documento finestrato i due
+    # numeri divergono di parecchio (9455 richiesti contro 7403 usati, nei log)
+    # e la somma per sottoquery poteva superare il contesto reale, rendendo la
+    # riga inservibile proprio quando serviva, cioè per capire chi si era preso
+    # il budget.
+    per_query = {}
+    for idx, item in index_to_item.items():
+        q = item.get("query_idx", 0)
+        entry = per_query.setdefault(q, {"query": item.get("query_text", ""), "parents": 0, "chars": 0})
+        entry["parents"] += 1
+        entry["chars"] += item.get("_rendered_chars", 0)
     log.info(
-        f"Contesto finale: {len(formatted_chunks)}/{n_parents} parent, "
-        f"{curr_len}/{settings.max_context_chars} chars utilizzati."
+        f"[{task_id}] [ALLOC] Contesto: {len(index_to_item)}/{n_parents} parent, "
+        f"{curr_len} chars (budget {settings.max_context_chars}, tetto {alloc_stats.get('ceiling')}, "
+        f"hard cap {hard_cap}). Ripartizione per sottoquery: "
+        + " | ".join(
+            f"#{q}({v['parents']} parent, {v['chars']} chars)"
+            for q, v in sorted(per_query.items())
+        )
     )
 
-    prompt_file  = get_topic_prompt(topic_id)
-    prompt_tmpl  = load_prompt_template(prompt_file)
-    prompt       = prompt_tmpl.format(context_str=context_str, query=query)
+    stats = {**alloc_stats, "context_chars": curr_len, "n_parents_in_context": len(index_to_item)}
+    return "".join(formatted_chunks), index_to_item, stats
 
-    log.info(f"Generating structured answer for topic '{topic_id}'")
-    log.debug(f"Context size: {len(context_str)} chars")
-    log.debug(f"Context  {context_str[:500]}...")
 
-    raw = get_llm_provider().generate_json(settings.answer_generator_model_name, prompt, max_tokens=settings.answer_max_tokens, thinking_level=settings.answer_thinking_level )
-    log.debug(f"Raw response:\n{raw[:500]}...")
+def generate_answer(query, rich_context, topic_id, search_queries=None,
+                    coverage_targets=None, task_id="UNKNOWN"):
+    """
+    Genera la risposta finale.
+
+    search_queries / coverage_targets: le facce in cui il rewriter ha scomposto
+    la domanda e le entità da coprire. PRIMA non venivano passate, e questo
+    rendeva la RULE FOR PARTIAL CONTEXT del prompt di fatto inapplicabile: la
+    standalone_query è deliberatamente generica ("Sono previsti lavori nei
+    comuni della Garfagnana?"), quindi il modello non aveva alcuna lista di
+    entità da confrontare col contesto e non poteva dichiarare le assenze.
+
+    Restituisce anche used_sources / used_parent_ids: le fonti REALMENTE entrate
+    nel prompt, non tutte quelle recuperate.
+    """
+    context_str, index_to_item, ctx_stats = build_context(rich_context, task_id=task_id)
+
+    # Fonti effettive: derivate da index_to_item, mai dal pool di retrieval.
+    # Deduplicate per `source`, ma i parent_id sono raccolti TUTTI (vedi nota su
+    # used_parent_ids: servono interi al fallback per escludere davvero ciò che
+    # il generatore ha già visto).
+    used_sources = {}
+    used_parent_ids = set()
+    for item in index_to_item.values():
+        src = item.get("source", "Fonte_Sconosciuta")
+        if item.get("parent_id"):
+            used_parent_ids.add(item["parent_id"])
+        if src not in used_sources:
+            used_sources[src] = {
+                "source": src,
+                "sub_topic": item.get("sub_topic", ""),
+                "file_name": item.get("file_name", ""),
+                "date": item.get("date"),
+                "parent_id": item.get("parent_id"),
+            }
+
+    facets = [q for q in (search_queries or []) if q]
+    targets = [t for t in (coverage_targets or []) if t]
+
+    prompt_file = get_topic_prompt(topic_id)
+    prompt_tmpl = load_prompt_template(prompt_file)
+    fmt_kwargs = {
+        "context_str": context_str,
+        "query": query,
+        "search_facets_str": "\n".join(f"- {f}" for f in facets),
+        "coverage_targets_str": ", ".join(targets),
+    }
+    try:
+        prompt = prompt_tmpl.format(**fmt_kwargs)
+    except KeyError as e:
+        # Retrocompatibilità: prompt di topic che non conoscono i nuovi
+        # placeholder continuano a funzionare invariati.
+        log.debug(f"[{task_id}] Prompt '{prompt_file}' senza placeholder {e}: uso il formato legacy.")
+        prompt = prompt_tmpl.format(context_str=context_str, query=query)
+
+    log.info(f"[{task_id}] Generating structured answer for topic '{topic_id}'")
+    log.debug(f"[{task_id}] Context size: {len(context_str)} chars | facets={len(facets)} | targets={targets}")
+
+    # Budget di OUTPUT (distinto da quello di input): con settings.answer_max_tokens
+    # a None il parametro non viene passato affatto al provider, quindi il tetto è
+    # quello del modello per definizione — nessuna costante da tenere allineata.
+    #
+    # Qui NON c'è retry, ed è deliberato. Il vecchio raddoppio era già codice
+    # morto in produzione (con ANSWER_MAX_TOKENS pari all'hard cap la guardia era
+    # sempre falsa) e al soffitto del modello non esiste comunque nessun numero
+    # più grande da chiedere: ritentare significherebbe solo ripagare per intero
+    # un contesto da decine di migliaia di token per ottenere lo stesso esito.
+    # Il troncamento smette quindi di essere un caso da gestire e diventa un
+    # ALLARME, con in log i dati che servono a capire su quale leva agire.
+    max_tokens = settings.answer_max_tokens
+    raw, meta = get_llm_provider().generate_json(
+        settings.answer_generator_model_name, prompt,
+        max_tokens=max_tokens,
+        thinking_level=settings.answer_thinking_level,
+        with_meta=True,
+    )
+    if meta.get("truncated"):
+        thinking_tokens = meta.get("thinking_tokens")
+        output_tokens = meta.get("output_tokens")
+        # Le due cause richiedono interventi opposti: se a saturare il budget è
+        # stato il thinking, la leva è ANSWER_THINKING_LEVEL; se invece l'output
+        # visibile era davvero enorme, il problema sta a monte (troppi parent in
+        # contesto, o un prompt che non impone sintesi) e abbassare il thinking
+        # non servirebbe a niente.
+        if thinking_tokens and output_tokens and thinking_tokens > output_tokens:
+            causa = (
+                f"il thinking ha prodotto più token dell'output visibile "
+                f"({thinking_tokens} vs {output_tokens}): abbassare ANSWER_THINKING_LEVEL "
+                f"(attuale: {settings.answer_thinking_level})"
+            )
+        else:
+            causa = (
+                "l'output visibile ha saturato il budget del modello: ridurre il "
+                "materiale da sintetizzare (PARENTS_PER_QUERY, MAX_CONTEXT_CHARS) "
+                "o rendere il prompt più stringente sulla sintesi"
+            )
+        log.error(
+            f"[{task_id}] Risposta TRONCATA (finish_reason={meta.get('finish_reason')}, "
+            f"budget={'modello' if max_tokens is None else max_tokens}, "
+            f"thinking_tokens={thinking_tokens}, output_tokens={output_tokens}, "
+            f"contesto={len(context_str)} chars su {len(index_to_item)} parent). "
+            f"Probabile causa: {causa}."
+        )
+
+    log.debug(f"[{task_id}] Raw response:\n{raw[:500]}...")
+
+    base_result = {
+        "used_sources": list(used_sources.values()),
+        "used_parent_ids": used_parent_ids,
+        "context_str": context_str,
+        "context_stats": ctx_stats,
+    }
 
     try:
-        result_data = safe_json_parse(raw, task_id=topic_id)
+        result_data = safe_json_parse(raw, task_id=task_id)
         raw_answer = str(result_data.get("answer", ""))
         resolved_answer = resolve_citations(raw_answer, index_to_item)
         return {
+            **base_result,
             "is_found": bool(result_data.get("is_found", True)),
             "is_general_knowledge": bool(result_data.get("is_general_knowledge", False)),
             "answer": resolved_answer,
+            # Risposta PRIMA della risoluzione delle citazioni: conserva i
+            # riferimenti numerici ([3]), gli stessi che numerano i blocchi del
+            # contesto. È questa che va data al grader: la versione risolta
+            # contiene filename, che nel contesto non compaiono da nessuna parte,
+            # rendendo le citazioni non verificabili.
+            "raw_answer": raw_answer,
         }
     except json.JSONDecodeError as e:
-        log.error(f"Generazione JSON fallita: {e}. Output grezzo: {raw}")
-        return {"is_found": True, "is_general_knowledge": False, "answer": raw.strip()}
-    
+        log.error(f"[{task_id}] Generazione JSON fallita: {e}. Output grezzo: {raw}")
+        return {**base_result, "is_found": True, "is_general_knowledge": False,
+                "answer": raw.strip(), "raw_answer": raw.strip()}
 
-def grade_answer(query, context_snippet, answer):
-    """Ask the grader model whether the answer is satisfactory. Returns True/False."""
-    grader_tmpl   = load_prompt_template("grader")
-    grader_prompt = grader_tmpl.format(
-        query=query,
-        context_snippet=context_snippet,
-        answer=answer
-    )
-    # PRIMA: max_tokens=5 hardcoded, nessun thinking_level. Con un modello che
-    # conta i token di "thinking" sullo stesso budget dell'output
-    # (gemini-3.1-flash-lite), 5 token bastano perché il ragionamento da solo
-    # esaurisca il budget, troncando "YES"/"NO" prima ancora che venga scritto
-    # (finish_reason=MAX_TOKENS, output_tokens=1). settings.grader_max_tokens
-    # e settings.grader_thinking_level vanno aggiunti a common/config.py,
-    # stesso pattern di settings.answer_max_tokens/answer_thinking_level.
-    raw = get_llm_provider().generate_text(
+def grade_answer(query, context_snippet, answer, coverage_targets=None,
+                 is_general_knowledge=False, task_id="UNKNOWN"):
+    """
+    Valuta la risposta e restituisce un dict:
+        {"ok": bool, "reason": str, "missing_targets": list, "note": str}
+
+    Il grader boccia SOLO due casi: "grounding" (afferma come tratto dai
+    documenti qualcosa che il contesto non sostiene) e "no_answer" (nessuna
+    informazione utile). La copertura parziale NON è un fallimento: se per un
+    comune non risultano documenti, dirlo è la risposta corretta, non un
+    difetto. missing_targets viene raccolto per sola diagnostica e finisce in
+    rag_metrics, dove sui volumi distingue un problema di ingestion (documenti
+    mai indicizzati) da uno di soglie (presenti ma non agganciati).
+
+    context_snippet DEVE essere il context_str realmente passato al generatore,
+    non i content integrali: giudicare su un testo più ampio di quello che
+    l'autore aveva davanti produce sia falsi negativi (retry inutili su
+    informazioni che erano state finestrate) sia falsi positivi (il grader
+    trova la prova che mancava al generatore e valida un'affermazione non
+    ancorata — cioè è cieco proprio sul caso che dovrebbe intercettare).
+
+    FAIL-OPEN: qualunque output non interpretabile vale PASS, coerentemente col
+    trattamento delle eccezioni. Prima l'incoerenza era silenziosa e costosa:
+    un'eccezione dava is_satisfactory=True, ma una stringa vuota (tipica del
+    troncamento con max_tokens=32) falliva startswith("YES") e bruciava un
+    tentativo di retry.
+    """
+    targets = [t for t in (coverage_targets or []) if t]
+    grader_tmpl = load_prompt_template("grader")
+
+    fmt_kwargs = {
+        "query": query,
+        "context_snippet": context_snippet,
+        "answer": answer,
+        "coverage_targets_str": ", ".join(targets),
+        "is_general_knowledge": "true" if is_general_knowledge else "false",
+    }
+    try:
+        grader_prompt = grader_tmpl.format(**fmt_kwargs)
+    except KeyError as e:
+        # Retrocompatibilità con il grader.txt legacy (solo query/context/answer).
+        log.debug(f"[{task_id}] [GRADER] Prompt senza placeholder {e}: uso il formato legacy.")
+        grader_prompt = grader_tmpl.format(
+            query=query, context_snippet=context_snippet, answer=answer
+        )
+
+    raw = get_llm_provider().generate_json(
         settings.grader_model_name,
         grader_prompt,
         temperature=0.0,
         max_tokens=settings.grader_max_tokens,
         thinking_level=settings.grader_thinking_level,
     )
-    result = raw.strip().upper()
-    log.info(f"Grader response: '{result}'")
-    return result.startswith("YES")
+
+    result = {"ok": True, "reason": "ok", "missing_targets": [], "note": ""}
+    text = (raw or "").strip()
+
+    if not text:
+        log.warning(f"[{task_id}] [GRADER] Output vuoto: fail-open, risposta accettata.")
+        result["note"] = "grader output vuoto"
+        return result
+
+    try:
+        data = safe_json_parse(text, task_id=task_id)
+        verdict = str(data.get("verdict", "PASS")).strip().upper()
+        result["ok"] = verdict != "FAIL"
+        result["reason"] = str(data.get("reason", "ok")).strip().lower() or "ok"
+        raw_missing = data.get("missing_targets") or []
+        if isinstance(raw_missing, list):
+            result["missing_targets"] = [str(m) for m in raw_missing if m]
+        result["note"] = str(data.get("note", ""))[:300]
+    except Exception:
+        # Fallback sul contratto testuale precedente (YES/NO), così un
+        # grader.txt non aggiornato continua a funzionare.
+        upper = text.upper()
+        if upper.startswith("NO"):
+            result.update(ok=False, reason="grounding", note="verdetto legacy NO")
+        elif upper.startswith("YES"):
+            result["note"] = "verdetto legacy YES"
+        else:
+            log.warning(f"[{task_id}] [GRADER] Output non interpretabile ({text[:120]}): fail-open.")
+            result["note"] = "output non interpretabile"
+
+    # La copertura è diagnostica: non può mai ribaltare il verdetto.
+    if result["reason"] == "coverage":
+        log.debug(f"[{task_id}] [GRADER] reason='coverage' ignorata: la copertura parziale non è un fallimento.")
+        result.update(ok=True, reason="ok")
+
+    log.info(
+        f"[{task_id}] [GRADER] verdict={'PASS' if result['ok'] else 'FAIL'} "
+        f"reason={result['reason']} missing={result['missing_targets']} note='{result['note']}'"
+    )
+    return result
+
+
+def evaluate_generation(gen_result, query, coverage_targets=None, task_id="UNKNOWN"):
+    """
+    Valutazione unificata di una risposta generata. Restituisce
+    (is_satisfactory, reason, missing_targets). Usata sia dal loop principale
+    sia dal fallback finale, che prima ne avevano due copie divergenti.
+
+    reason ∈ {"ok", "not_found", "grounding", "no_answer", "general_knowledge"}
+    e guida il messaggio iniettato nel retry: riformulare in modo ampio ha senso
+    quando la ricerca ha fallito, non quando i documenti c'erano ma erano
+    insufficienti su un aspetto specifico.
+
+    NOTA sul flag is_general_knowledge: NON è più una scorciatoia che salta il
+    grader. Il flag di `atti` si alza anche quando la risposta è ancorata al 95%
+    ai documenti e contiene un solo esempio suggerito in fondo: far uscire
+    l'INTERA risposta dal controllo di grounding lasciava senza verifica proprio
+    le risposte miste — le più esposte al rischio di confondere ciò che il
+    documento dice con ciò che il modello sa — e poi le metteva in cache
+    semantica, dove venivano riproposte ad altri utenti senza essere mai state
+    controllate. Ora il grader vede sempre la risposta, e sa distinguere un
+    suggerimento dichiarato (legittimo) da un fatto attribuito ai documenti ma
+    assente dal contesto (allucinazione).
+    """
+    if not gen_result.get("is_found", False):
+        log.info(f"[{task_id}] Model explicitly flagged is_found=False.")
+        return False, "not_found", []
+
+    is_gk = bool(gen_result.get("is_general_knowledge"))
+
+    try:
+        verdict = grade_answer(
+            query,
+            gen_result.get("context_str", ""),
+            # Risposta grezza: i riferimenti numerici sono verificabili contro
+            # il contesto numerato; i filename della versione risolta no.
+            gen_result.get("raw_answer") or gen_result.get("answer", ""),
+            coverage_targets=coverage_targets,
+            is_general_knowledge=is_gk,
+            task_id=task_id,
+        )
+    except Exception as e:
+        log.error(f"[{task_id}] Grader LLM failed (non-blocking): {e}. Fail-open.")
+        verdict = {"ok": True, "reason": "ok", "missing_targets": [], "note": "grader exception"}
+
+    missing = verdict.get("missing_targets", [])
+
+    if not verdict["ok"]:
+        return False, verdict["reason"], missing
+
+    # Il grader ha promosso la risposta. Resta la policy sulla conoscenza
+    # generale: se non è ammessa si torna nel loop per un altro tentativo di
+    # retrieval, con i profili progressivamente più permissivi (semantic_size
+    # più ampio, soglia più bassa). Se il modello ha dovuto ricorrere a
+    # conoscenza esterna perché il contesto era povero, allargare la recall è
+    # esattamente la mossa giusta.
+    if is_gk and not settings.allow_general_knowledge:
+        log.warning(
+            f"[{task_id}] Conoscenza generale non ammessa (ALLOW_GENERAL_KNOWLEDGE=false): nuovo tentativo."
+        )
+        return False, "general_knowledge", missing
+
+    return True, "ok", missing
 
 
 # ==============================================================================
@@ -884,10 +1656,20 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
     semantic_size = semantic_size or settings.qdrant_semantic_size
     semantic_threshold = semantic_threshold if semantic_threshold is not None else settings.qdrant_semantic_threshold
 
+    # I vettori dei chunk servono SOLO a costruire i centroid-per-parent usati
+    # da MMR. Con mmr_lambda=1.0 (il profilo del tentativo 0, cioè il caso
+    # normale) select_with_mmr va in bypass e i centroidi vengono buttati senza
+    # essere mai letti: li si pagava due volte, in trasferimento di rete e in
+    # calcolo. Ogni gruppo trasporta un embedding gemini da 3072 dimensioni
+    # serializzato in JSON — su 30 gruppi × 6 sottoquery è il motivo per cui le
+    # search sfioravano il timeout.
+    needs_vectors = mmr_lambda < 1.0
+
     log.info(f"=== Inizio Retrieval per topic '{topic_id}' ===")
     log.info(
         f"[{task_id}] [RETRIEVAL_PARAMS] semantic_size={semantic_size}, "
-        f"semantic_threshold={semantic_threshold:.3f}, mmr_lambda={mmr_lambda}."
+        f"semantic_threshold={semantic_threshold:.3f}, mmr_lambda={mmr_lambda}, "
+        f"with_vectors={needs_vectors}."
     )
     log.debug(f"Search Queries: {search_queries} | Keywords: {keywords}")
     
@@ -982,7 +1764,7 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
                     limit=semantic_size,
                     score_threshold=semantic_threshold,
                     query_filter=models.Filter(must=must_conditions),
-                    with_vectors=True  # necessario per costruire i centroid-per-parent usati da MMR
+                    with_vectors=needs_vectors  # centroid-per-parent: solo se MMR è attivo
                 )
                 points = [group.hits[0] for group in res.groups if group.hits]
                 log.debug(f"Vector search #{idx} returned {len(points)} grouped hits.")
@@ -1015,7 +1797,7 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
                         limit=target_size * 2,  # batch ampio per compensare i duplicati scartati
                         offset=next_offset,
                         with_payload=True,
-                        with_vectors=True  # necessario per costruire i centroid-per-parent usati da MMR
+                        with_vectors=needs_vectors  # centroid-per-parent: solo se MMR è attivo
                     )
                     iterations += 1
 
@@ -1160,6 +1942,10 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
         # ==========================================================
         parent_chunk_vectors: dict[str, list] = {}
         parent_best_score: dict[str, float] = {}
+        # Tutte le sottoquery che hanno recuperato quel parent (non solo quella
+        # che se lo aggiudica in quota): serve per l'header del contesto, dove
+        # dichiariamo al modello la PROVENIENZA della ricerca.
+        parent_retrieved_by: dict[str, set] = {}
         # NEW: fino a SNIPPETS_PER_PARENT child (contenuto + score) per parent,
         # usati da generate_answer per il windowing invece del troncamento cieco.
         parent_top_snippets: dict[str, list] = {}
@@ -1167,7 +1953,7 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
         exclude_parent_ids = exclude_parent_ids or set()
         excluded_count = 0
 
-        for chunks in top_chunks_per_query:
+        for q_idx, chunks in enumerate(top_chunks_per_query):
             for chunk in chunks:
                 pid = chunk.payload.get("parent_id") if chunk.payload else None
                 if not pid:
@@ -1175,13 +1961,15 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
                 if pid in exclude_parent_ids:
                     excluded_count += 1
                     continue
+                parent_retrieved_by.setdefault(pid, set()).add(q_idx)
                 score = getattr(chunk, "score", 0.0) or 0.0
                 if pid not in parent_best_score or score > parent_best_score[pid]:
                     parent_best_score[pid] = score
 
-                vec = getattr(chunk, "vector", None)
-                if vec is not None:
-                    parent_chunk_vectors.setdefault(pid, []).append(np.asarray(vec))
+                if needs_vectors:
+                    vec = getattr(chunk, "vector", None)
+                    if vec is not None:
+                        parent_chunk_vectors.setdefault(pid, []).append(np.asarray(vec))
 
                 chunk_content = chunk.payload.get("content", "") if chunk.payload else ""
                 if chunk_content:
@@ -1191,7 +1979,7 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
                         "score": score,
                         # Popolati dal backfill (backfill_chunk_offsets.py) o
                         # dall'ingestion futura; None se assenti — in quel caso
-                        # extract_relevant_window ripiega sulla ricerca testuale.
+                        # compute_core_spans ripiega sulla ricerca testuale.
                         "start_char": chunk.payload.get("start_char"),
                         "end_char": chunk.payload.get("end_char"),
                     })
@@ -1201,15 +1989,25 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
         if exclude_parent_ids:
             log.info(f"[{task_id}] [EXCLUDE] {excluded_count} chunk scartati (parent già usati in tentativi precedenti: {len(exclude_parent_ids)}).")
 
-        parent_centroids = {
-            pid: np.mean(vecs, axis=0) for pid, vecs in parent_chunk_vectors.items()
-        }
-
-        n_missing_vectors = sum(1 for pid in parent_best_score if pid not in parent_centroids)
-        log.info(
-            f"[{task_id}] {MMR_LOG_TAG} Centroid calcolati per {len(parent_centroids)} parent "
-            f"(su {len(parent_best_score)} parent candidati; {n_missing_vectors} senza vettore disponibile)."
-        )
+        if needs_vectors:
+            parent_centroids = {
+                pid: np.mean(vecs, axis=0) for pid, vecs in parent_chunk_vectors.items()
+            }
+            n_missing_vectors = sum(1 for pid in parent_best_score if pid not in parent_centroids)
+            log.info(
+                f"[{task_id}] {MMR_LOG_TAG} Centroid calcolati per {len(parent_centroids)} parent "
+                f"(su {len(parent_best_score)} parent candidati; {n_missing_vectors} senza vettore disponibile)."
+            )
+        else:
+            # Dizionario vuoto e non None: la redistribuzione più sotto filtra
+            # già i pid privi di centroid ("if pid in parent_centroids"), quindi
+            # con MMR in bypass il ramo degrada da solo a ranking puro senza
+            # bisogno di un secondo controllo su mmr_lambda.
+            parent_centroids = {}
+            log.debug(
+                f"[{task_id}] {MMR_LOG_TAG} mmr_lambda={mmr_lambda}: centroidi non calcolati "
+                f"(vettori non richiesti a Qdrant)."
+            )
 
         # ==========================================================
         # 4. QUOTA GARANTITA PER SOTTOQUERY
@@ -1312,7 +2110,12 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
                             "vector": None,
                         })
 
-            if n_skipped_no_vector:
+            # Il WARNING ha senso solo se i vettori li AVEVAMO chiesti e non sono
+            # arrivati (anomalia vera). Con MMR in bypass non li abbiamo chiesti
+            # affatto: segnalarlo come mancanza produrrebbe un allarme su ogni
+            # singolo candidato di ogni richiesta del caso normale, che è il modo
+            # più rapido per insegnare a chi legge i log a ignorare i WARNING.
+            if n_skipped_no_vector and needs_vectors:
                 log.warning(
                     f"[{task_id}] {MMR_LOG_TAG} {n_skipped_no_vector} parent candidati alla "
                     f"redistribuzione senza vettore disponibile (inclusi comunque, senza "
@@ -1366,16 +2169,34 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
         }
 
         # ==========================================================
-        # 6. POOL FINALE — ordine FIFO per sottoquery
+        # 6. POOL FINALE — ordine ROUND-ROBIN tra sottoquery
+        #
+        # PRIMA: concatenazione a blocchi (tutti i parent della sottoquery 0,
+        # poi quelli della 1, ...). Quando il budget del contesto si esauriva,
+        # a cadere era sempre la coda — cioè l'ULTIMO comune per intero. E la
+        # sottoquery 0 era privilegiata due volte, essendo la standalone_query
+        # e ricevendo in appendice tutti i keyword_hits.
+        #
+        # ORA: rank 0 di ogni sottoquery, poi rank 1, ecc. Se qualcosa deve
+        # cadere, cade la coda di TUTTE le sottoquery. Serve anche al modello,
+        # che vede subito la diversità dei territori invece di una lunga
+        # sequenza omogenea sul primo.
         # ==========================================================
         final_parent_ids_ordered: list[str] = []
         seen_final: set[str] = set()
- 
-        for selected_pids in quota_per_query:
-            for pid in selected_pids:
+        # Sottoquery "proprietaria" di ogni parent, per l'equità nell'allocatore.
+        pid_to_query_idx: dict[str, int] = {}
+
+        max_depth = max((len(q) for q in quota_per_query), default=0)
+        for rank in range(max_depth):
+            for q_idx, selected_pids in enumerate(quota_per_query):
+                if rank >= len(selected_pids):
+                    continue
+                pid = selected_pids[rank]
                 if pid not in seen_final:
                     final_parent_ids_ordered.append(pid)
                     seen_final.add(pid)
+                    pid_to_query_idx[pid] = q_idx
  
         if not final_parent_ids_ordered:
             log.warning("Nessun parent_id estratto da nessuna sottoquery.")
@@ -1454,16 +2275,32 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
                     log.debug(f"Metadata non parsabile per parent_id={p_doc.get('id')}: {e}")
 
             if content:
+                pid = p_doc.get("id")
                 matched_snippets = [
-                    s for s in parent_top_snippets.get(p_doc.get("id"), []) if s.get("content")
+                    s for s in parent_top_snippets.get(pid, []) if s.get("content")
+                ]
+                q_idx = pid_to_query_idx.get(pid, 0)
+                # Testi delle sottoquery che hanno recuperato questo parent:
+                # è PROVENIENZA della ricerca, non attribuzione del contenuto.
+                retrieved_by = [
+                    search_queries[i]
+                    for i in sorted(parent_retrieved_by.get(pid, {q_idx}))
+                    if i < len(search_queries)
                 ]
                 rich_context.append({
+                    "parent_id": pid,
                     "content": content,
                     "source": source,
                     "date": doc_date,
                     "file_name": file_name,
                     "sub_topic": sub_topic_id,
                     "matched_snippets": matched_snippets,
+                    # Chi ha "vinto" questo parent in quota: è l'asse su cui
+                    # l'allocatore garantisce l'equità del contesto.
+                    "query_idx": q_idx,
+                    "query_text": search_queries[q_idx] if q_idx < len(search_queries) else "",
+                    "retrieved_by": retrieved_by,
+                    "score": parent_best_score.get(pid, 0.0),
                 })
                 if source not in unique_sources_map:
                     unique_sources_map[source] = {
@@ -1758,6 +2595,7 @@ def process_rag_query(self, query, history, topic_id, selected_sub_topics=None, 
             extracted_keywords = [w.strip("?.,!'\"") for w in standalone_query.split() if len(w) > 3]
 
         search_queries = rewritten_data.get("search_queries", [standalone_query])
+        coverage_targets = rewritten_data.get("coverage_targets", [])
         db_aliases = collect_concept_aliases(verified_concepts)
 
         if standalone_query not in search_queries:
@@ -1768,6 +2606,7 @@ def process_rag_query(self, query, history, topic_id, selected_sub_topics=None, 
     except Exception as e:
         log.warning(f"[{task_id}] [MAIN_TASK] Pipeline di trasformazione caduta: {e}. Uso raw query.")
         standalone_query, search_queries, all_keywords = query, [query], []
+        coverage_targets = []
         lookup_text = query  # garantito anche nel fallback: usato dal lookup concettuale in retry
         primary_vector = embed_query(query)  # fallback sul raw query
         vectors_list = [primary_vector]
@@ -1814,10 +2653,18 @@ def process_rag_query(self, query, history, topic_id, selected_sub_topics=None, 
         )
         attempts_metrics.append({"attempt": 0, "standalone_query": standalone_query, **retrieval_stats})
 
-        # Parent già mostrati al generatore, accumulati tra i tentativi: usato
+        # Parent già MOSTRATI al generatore, accumulati tra i tentativi: usato
         # dall'ultimo fallback (dopo max_model_retries) per non riproporre
         # parent già passati e già giudicati insoddisfacenti.
-        used_parent_ids = {s["parent_id"] for s in sources if s.get("parent_id")}
+        #
+        # PRIMA veniva derivato da `sources`, che è deduplicata per `source` e
+        # conserva un solo parent_id per documento: se un atto contribuiva con
+        # 3 parent ne veniva registrato 1, e gli altri 2 rientravano indisturbati
+        # nel contesto del fallback, vanificandone in buona parte lo scopo.
+        # ORA viene popolato da generate_answer con i parent REALMENTE finiti nel
+        # prompt: un parent recuperato ma mai mostrato non è stato giudicato da
+        # nessuno e resta legittimamente candidabile.
+        used_parent_ids = set()
     except Exception as e:
         log.error(f"[{task_id}] Vector DB Retrieval failed: {e}", exc_info=True)
         return {"error": "Database Error", "message": "Errore durante il recupero dei documenti.", "status": "failed"}
@@ -1828,6 +2675,10 @@ def process_rag_query(self, query, history, topic_id, selected_sub_topics=None, 
     attempt = 0
     answer = None
     is_satisfactory = False
+    # Inizializzati qui: restano definiti anche se il loop esce subito per
+    # contesto vuoto, e vengono letti dopo il loop per applicare la policy.
+    fail_reason = "ok"
+    missing_targets = []
 
     while attempt < settings.max_model_retries and not is_satisfactory:
         if not context:
@@ -1839,44 +2690,33 @@ def process_rag_query(self, query, history, topic_id, selected_sub_topics=None, 
 
         # A. Generazione (JSON Mode)
         try:
-            gen_result = generate_answer(standalone_query, context, topic_id)
+            gen_result = generate_answer(
+                standalone_query, context, topic_id,
+                search_queries=search_queries,
+                coverage_targets=coverage_targets,
+                task_id=task_id,
+            )
             is_found = gen_result.get("is_found", False)
             answer = gen_result.get("answer", "")
+
+            # Le fonti mostrate all'utente sono SOLO quelle realmente entrate nel
+            # prompt: prima si elencavano tutti i parent recuperati, comprese le
+            # fonti scartate per esaurimento budget e mai lette dal modello.
+            sources = gen_result.get("used_sources", sources)
+            used_parent_ids |= gen_result.get("used_parent_ids", set())
 
             log.debug(f"Risposta generata: {answer[:500]}... | is_found: {is_found}")
         except Exception as e:
             log.error(f"[{task_id}] Answer generation API failed: {e}", exc_info=True)
             return {"error": "Generation Failed", "message": "Impossibile elaborare la risposta.", "status": "failed"}
 
-        # B. Logica Fail-Fast
-        if not is_found:
-            log.info(f"[{task_id}] Model explicitly flagged is_found=False. Skipping Grader.")
-            log.debug(f"[{task_id}] Model answer: {answer}")
-            is_satisfactory = False
-
-        elif gen_result.get("is_general_knowledge"):
-            if settings.allow_general_knowledge:
-                log.info(f"[{task_id}] Answer based on general knowledge (allowed). Skipping Grader.")
-                is_satisfactory = True
-            else:
-                # Il modello ha sforato i limiti: forza il retry senza sprecare una chiamata al grader
-                log.warning(f"[{task_id}] Answer based on general knowledge but ALLOW_GENERAL_KNOWLEDGE=false. Forcing retry.")
-                is_satisfactory = False
-
-        else:
-            # Risposta ancorata al contesto: valutazione normale
-            try:
-                if isinstance(context, list):
-                    context_snippet = "\n\n".join(
-                        f"[{item.get('source', '')}]\n{item.get('content', '')}"
-                        for item in context
-                    )
-                else:
-                    context_snippet = str(context)
-                is_satisfactory = grade_answer(standalone_query, context_snippet, answer)
-            except Exception as e:
-                log.error(f"[{task_id}] Grader LLM failed (non-blocking): {e}. Defaulting to YES.")
-                is_satisfactory = True
+        # B. Valutazione unificata (fail-fast + grader + policy)
+        is_satisfactory, fail_reason, missing_targets = evaluate_generation(
+            gen_result, standalone_query, coverage_targets=coverage_targets, task_id=task_id
+        )
+        if attempts_metrics:
+            attempts_metrics[-1]["grader_reason"] = fail_reason
+            attempts_metrics[-1]["missing_targets"] = missing_targets
 
         # D. Gestione Retry Fallimento
         if not is_satisfactory:
@@ -1884,11 +2724,36 @@ def process_rag_query(self, query, history, topic_id, selected_sub_topics=None, 
             if attempt < settings.max_model_retries:
                 log.warning(f"[{task_id}] Answer unsatisfactory. Retrying ({attempt}/{settings.max_model_retries}) with full pipeline...")
                 try:
-                    # 1. Iniettiamo un "falso" messaggio di sistema nella history per forzare l'LLM a cambiare approccio
+                    # 1. Iniettiamo un "falso" messaggio di sistema nella history per forzare l'LLM a cambiare approccio.
+                    #    Il messaggio dipende dal MOTIVO del fallimento: dire al
+                    #    rewriter che "la ricerca non ha prodotto documenti validi"
+                    #    quando invece i documenti c'erano ma erano insufficienti su
+                    #    un aspetto lo spinge ad allontanarsi dalla formulazione
+                    #    originale, mentre servirebbe restare sul punto e scavare.
+                    if fail_reason == "general_knowledge":
+                        retry_instruction = (
+                            f"La risposta precedente per '{standalone_query}' ha dovuto ricorrere a conoscenza "
+                            f"esterna perché i documenti recuperati non coprivano tutti gli aspetti richiesti. "
+                            f"Mantieni la stessa intenzione e lo stesso ambito, ma cerca documenti più specifici "
+                            f"sugli aspetti rimasti scoperti."
+                        )
+                    elif fail_reason == "grounding":
+                        retry_instruction = (
+                            f"La risposta precedente per '{standalone_query}' conteneva affermazioni non "
+                            f"sostenute dai documenti recuperati. Mantieni l'intenzione originale ma cerca "
+                            f"documenti che trattino l'argomento in modo più diretto e verificabile."
+                        )
+                    else:
+                        retry_instruction = (
+                            f"La ricerca precedente per '{standalone_query}' non ha prodotto documenti validi. "
+                            f"Riformula completamente la query usando sinonimi o concetti più ampi per esplorare "
+                            f"un'angolazione semantica diversa."
+                        )
+
                     retry_history = history.copy() if history else []
                     retry_history.append({
-                        "role": "user", 
-                        "text": f"La ricerca precedente per '{standalone_query}' non ha prodotto documenti validi. Riformula completamente la query usando sinonimi o concetti più ampi per esplorare un'angolazione semantica diversa."
+                        "role": "user",
+                        "text": retry_instruction
                     })
                     
                     # 2. Lookup concettuale anche in retry, ma sul lookup_text
@@ -1914,6 +2779,7 @@ def process_rag_query(self, query, history, topic_id, selected_sub_topics=None, 
                         extracted_keywords = [w.strip("?.,!'\"") for w in standalone_query.split() if len(w) > 3]
 
                     search_queries = retry_data.get("search_queries", [standalone_query])
+                    coverage_targets = retry_data.get("coverage_targets", coverage_targets)
                     extracted_keywords = list(set(extracted_keywords + collect_concept_aliases(retry_concepts)))
 
                     if standalone_query not in search_queries:
@@ -1933,7 +2799,8 @@ def process_rag_query(self, query, history, topic_id, selected_sub_topics=None, 
                         **profile_kwargs(attempt, task_id=task_id)
                     )
                     attempts_metrics.append({"attempt": attempt, "standalone_query": standalone_query, **retrieval_stats})
-                    used_parent_ids |= {s["parent_id"] for s in sources if s.get("parent_id")}
+                    # used_parent_ids NON viene più aggiornato qui: lo popola
+                    # generate_answer col contenuto effettivo del prompt.
                 except Exception as e:
                     log.error(f"[{task_id}] Retry infrastructure failed: {e}", exc_info=True)
                     break  # Usciamo usando l'ultima answer generata
@@ -1958,28 +2825,45 @@ def process_rag_query(self, query, history, topic_id, selected_sub_topics=None, 
                         log.info(f"[{task_id}] [FALLBACK] Nessun parent nuovo trovato dopo l'esclusione. Nessun ulteriore tentativo possibile.")
                     else:
                         context, sources = final_context, final_sources
-                        gen_result = generate_answer(standalone_query, context, topic_id)
+                        gen_result = generate_answer(
+                            standalone_query, context, topic_id,
+                            search_queries=search_queries,
+                            coverage_targets=coverage_targets,
+                            task_id=f"{task_id}-FALLBACK",
+                        )
                         is_found = gen_result.get("is_found", False)
                         answer = gen_result.get("answer", "")
+                        sources = gen_result.get("used_sources", sources)
+                        used_parent_ids |= gen_result.get("used_parent_ids", set())
                         log.debug(f"[{task_id}] [FALLBACK] Risposta generata: {answer[:500]}... | is_found: {is_found}")
 
-                        if not is_found:
-                            is_satisfactory = False
-                        elif gen_result.get("is_general_knowledge"):
-                            is_satisfactory = settings.allow_general_knowledge
-                        else:
-                            try:
-                                context_snippet = "\n\n".join(
-                                    f"[{item.get('source', '')}]\n{item.get('content', '')}" for item in context
-                                )
-                                is_satisfactory = grade_answer(standalone_query, context_snippet, answer)
-                            except Exception as ge:
-                                log.error(f"[{task_id}] [FALLBACK] Grader LLM failed (non-blocking): {ge}. Defaulting to YES.")
-                                is_satisfactory = True
+                        is_satisfactory, fail_reason, missing_targets = evaluate_generation(
+                            gen_result, standalone_query,
+                            coverage_targets=coverage_targets,
+                            task_id=f"{task_id}-FALLBACK",
+                        )
+                        if attempts_metrics:
+                            attempts_metrics[-1]["grader_reason"] = fail_reason
+                            attempts_metrics[-1]["missing_targets"] = missing_targets
 
-                        log.info(f"[{task_id}] [FALLBACK] Esito ultimo tentativo: is_satisfactory={is_satisfactory}.")
+                        log.info(f"[{task_id}] [FALLBACK] Esito ultimo tentativo: is_satisfactory={is_satisfactory} (reason={fail_reason}).")
                 except Exception as fe:
                     log.error(f"[{task_id}] [FALLBACK] Ultimo tentativo fallito: {fe}", exc_info=True)
+
+    # ==========================================================
+    # APPLICAZIONE DELLA POLICY SULL'OUTPUT FINALE
+    #
+    # Con ALLOW_GENERAL_KNOWLEDGE=false, esaurire i tentativi lasciando in piedi
+    # una risposta basata su conoscenza generale significherebbe applicare la
+    # policy al giudizio ma non a ciò che l'utente legge: is_satisfactory=False
+    # e, in mano al cittadino, esattamente la risposta che la policy vieta.
+    # ==========================================================
+    if not settings.allow_general_knowledge and fail_reason == "general_knowledge":
+        log.warning(
+            f"[{task_id}] Tentativi esauriti con risposta ancora basata su conoscenza generale: "
+            f"sostituita con il messaggio di risposta non trovata (ALLOW_GENERAL_KNOWLEDGE=false)."
+        )
+        answer = "<p>Non sono riuscito a trovare la risposta nei documenti che ho analizzato.</p>"
 
     # ==========================================================
     # FEEDBACK NEGATIVO AUTOMATICO

@@ -10,6 +10,28 @@ Each provider exposes two operations used by worker.py:
   generate_json(model_name, prompt, temperature, max_tokens) -> str   (raw JSON string)
   generate_text(model_name, prompt, temperature, max_tokens) -> str   (plain text)
 
+max_tokens=None significa "nessun tetto esplicito: usa il massimo del modello".
+Serve alla generazione della risposta, dove la lunghezza è imprevedibile e un
+tetto scritto a mano è solo una costante di vendor che diverge in silenzio al
+primo cambio di modello. NON va usato dove l'output è strutturalmente corto
+(grader, rewriter): lì il tetto non è una capability da inseguire ma un
+circuit breaker contro i loop di ripetizione, e resta impostato.
+Su Gemini e OpenAI il parametro viene semplicemente omesso dalla richiesta.
+Su Anthropic max_tokens è OBBLIGATORIO nella Messages API, quindi lì si ripiega
+su _ANTHROPIC_MAX_TOKENS_FALLBACK: è un vincolo dell'SDK, non una policy.
+
+Entrambe accettano with_meta=True: in quel caso restituiscono la tupla
+(text, meta) dove meta è un dict:
+    {"truncated": bool, "finish_reason": str,
+     "thinking_tokens": int|None, "output_tokens": int|None}
+Serve a generate_answer per accorgersi che il modello ha esaurito il budget di
+output (su Gemini CONDIVISO col thinking) e per capirne il MOTIVO: sapere solo
+"è troncata" non dice se la risposta era genuinamente lunga o se il thinking si
+è mangiato il budget, due situazioni che richiedono interventi opposti. Il flag
+di troncamento è normalizzato qui: ogni SDK lo espone in modo diverso
+(MAX_TOKENS su Gemini, 'length' su OpenAI, 'max_tokens' su Anthropic), ma
+worker.py non deve saperlo.
+
 Retry logic is provider-aware: each provider raises different exceptions
 on rate-limit/overload, and we normalise them into a single LLMRateLimitError
 so worker.py never needs to know which SDK is in use.
@@ -22,6 +44,14 @@ from abc import ABC, abstractmethod
 from common.config import settings
 
 log = logging.getLogger("rag_queue")
+
+# Anthropic è l'unico dei tre provider in cui max_tokens è obbligatorio nella
+# Messages API: non esiste un modo di dire "usa il massimo del modello". Quando
+# il chiamante passa None si ripiega su questo valore. È un dettaglio di
+# implementazione dell'SDK, non una scelta di deployment: per questo è una
+# costante qui e non una variabile d'ambiente — non c'è nessuna decisione
+# operativa da prendere, solo un buco dell'API da tappare.
+_ANTHROPIC_MAX_TOKENS_FALLBACK = 8192
 
 # ==============================================================================
 # PROVIDER REGISTRY
@@ -63,13 +93,27 @@ class LLMProvider(ABC):
 
     @abstractmethod
     def generate_json(self, model_name: str, prompt: str,
-                      temperature: float = 0.1, max_tokens: int = 2048, thinking_level: bool = None) -> str:
-        """Call the model asking for a JSON response. Returns the raw JSON string."""
+                      temperature: float = 0.1, max_tokens: int | None = 2048,
+                      thinking_level: str | None = None,
+                      with_meta: bool = False):
+        """
+        Call the model asking for a JSON response.
+        Returns the raw JSON string, oppure (str, meta) se with_meta=True.
+
+        max_tokens=None -> nessun tetto esplicito (massimo del modello).
+        Il default resta 2048: chi non specifica nulla è un chiamante con
+        output corto e strutturato (rewriter), che il tetto lo vuole.
+        """
 
     @abstractmethod
     def generate_text(self, model_name: str, prompt: str,
-                      temperature: float = 0.0, max_tokens: int = 16, thinking_level: bool = None) -> str:
-        """Call the model asking for a plain-text response. Returns the text string."""
+                      temperature: float = 0.0, max_tokens: int | None = 16,
+                      thinking_level: str | None = None,
+                      with_meta: bool = False):
+        """
+        Call the model asking for a plain-text response.
+        Returns the text string, oppure (str, meta) se with_meta=True.
+        """
 
 
 # ==============================================================================
@@ -94,14 +138,21 @@ class GeminiProvider(LLMProvider):
                 "google-genai package not installed. "
             )
 
-    def _call(self, model_name: str, prompt: str, temperature: float, max_tokens: int, json_mode: bool = False, thinking_level: bool = None) -> str:
+    def _call(self, model_name: str, prompt: str, temperature: float, max_tokens: int | None, json_mode: bool = False,
+              thinking_level: str | None = None, with_meta: bool = False):
         from google.genai import types
 
         # Nel nuovo SDK le configurazioni di generazione passano da GenerateContentConfig
         config_kwargs = {
             "temperature": temperature,
-            "max_output_tokens": max_tokens,
         }
+        # max_output_tokens OMESSO quando None: il modello usa il proprio
+        # massimo. Passare un numero scritto a mano significherebbe mantenere
+        # una copia locale di un dato che appartiene al vendor e che cambia a
+        # ogni cambio di ANSWER_GENERATOR_MODEL_NAME.
+        if max_tokens is not None:
+            config_kwargs["max_output_tokens"] = max_tokens
+
         if json_mode:
             config_kwargs["response_mime_type"] = "application/json"
 
@@ -121,7 +172,24 @@ class GeminiProvider(LLMProvider):
                     config=config
                 )
                 self._log_usage(model_name, response, max_tokens)
-                return response.text
+                if not with_meta:
+                    return response.text
+                # finish_reason normalizzato: MAX_TOKENS significa che il budget
+                # di output (condiviso col thinking) si è esaurito prima che il
+                # modello finisse di scrivere.
+                candidates = getattr(response, "candidates", None)
+                fr = getattr(candidates[0], "finish_reason", None) if candidates else None
+                fr_str = str(fr) if fr is not None else "UNKNOWN"
+                usage = getattr(response, "usage_metadata", None)
+                return response.text, {
+                    "truncated": "MAX_TOKENS" in fr_str,
+                    "finish_reason": fr_str,
+                    # Servono a distinguere "risposta genuinamente lunga" da
+                    # "thinking che ha divorato il budget": senza questi due
+                    # numeri il troncamento resta un evento non diagnosticabile.
+                    "thinking_tokens": getattr(usage, "thoughts_token_count", None) if usage else None,
+                    "output_tokens": getattr(usage, "candidates_token_count", None) if usage else None,
+                }
             except self._rate_limit_exceptions as e:
                 # Il nuovo APIError espone l'attributo 'code' (lo status HTTP).
                 # Intercettiamo i codici 429 (Rate Limit) e 503 (Servizio Non Disponibile/Overload).
@@ -155,13 +223,20 @@ class GeminiProvider(LLMProvider):
             output_tokens = getattr(usage, "candidates_token_count", None) if usage else None
             total_tokens = getattr(usage, "total_token_count", None) if usage else None
 
+            # Con max_tokens=None il budget è quello del modello: stamparlo come
+            # "None" farebbe sembrare un dato mancante invece di una scelta.
+            budget_str = str(max_tokens) if max_tokens is not None else "model_default"
+
             base_msg = (
                 f"[GEMINI_USAGE] model={model_name} finish_reason={finish_reason_str} "
                 f"thinking_tokens={thinking_tokens} output_tokens={output_tokens} "
-                f"total_tokens={total_tokens} max_output_tokens_budget={max_tokens}"
+                f"total_tokens={total_tokens} max_output_tokens_budget={budget_str}"
             )
 
             if "MAX_TOKENS" in finish_reason_str:
+                # La percentuale ha senso solo rispetto a un tetto che abbiamo
+                # imposto noi. Se il budget è quello del modello, la quota di
+                # thinking si legge dai valori assoluti già presenti nel messaggio.
                 thinking_pct = (
                     round(thinking_tokens / max_tokens * 100)
                     if thinking_tokens and max_tokens else None
@@ -177,11 +252,15 @@ class GeminiProvider(LLMProvider):
             # La telemetria non deve mai bloccare il flusso principale.
             log.debug(f"[GEMINI_USAGE] Impossibile leggere usage_metadata: {e}")
 
-    def generate_json(self, model_name: str, prompt: str, temperature: float = 0.1, max_tokens: int = 2048, thinking_level: bool = None) -> str:
-        return self._call(model_name, prompt, temperature, max_tokens, json_mode=True, thinking_level=thinking_level)
+    def generate_json(self, model_name: str, prompt: str, temperature: float = 0.1, max_tokens: int | None = 2048,
+                      thinking_level: str | None = None, with_meta: bool = False):
+        return self._call(model_name, prompt, temperature, max_tokens, json_mode=True,
+                          thinking_level=thinking_level, with_meta=with_meta)
 
-    def generate_text(self, model_name: str, prompt: str, temperature: float = 0.0, max_tokens: int = 16, thinking_level: bool = None) -> str:
-        return self._call(model_name, prompt, temperature, max_tokens, json_mode=False, thinking_level=thinking_level)
+    def generate_text(self, model_name: str, prompt: str, temperature: float = 0.0, max_tokens: int | None = 16,
+                      thinking_level: str | None = None, with_meta: bool = False):
+        return self._call(model_name, prompt, temperature, max_tokens, json_mode=False,
+                          thinking_level=thinking_level, with_meta=with_meta)
 
 
 # ==============================================================================
@@ -199,7 +278,8 @@ class OpenAIProvider(LLMProvider):
         except ImportError:
             raise RuntimeError("openai package not installed.")
 
-    def _call(self, model_name, prompt, temperature, max_tokens, json_mode=False, thinking_level: bool = None):
+    def _call(self, model_name, prompt, temperature, max_tokens, json_mode=False, thinking_level: str | None = None,
+              with_meta: bool = False):
         if thinking_level:
             log.warning ("OpenAIProvider thinking level not used")
 
@@ -207,15 +287,29 @@ class OpenAIProvider(LLMProvider):
             model=model_name,
             messages=[{"role": "user", "content": prompt}],
             temperature=temperature,
-            max_tokens=max_tokens,
         )
+        # Omesso quando None: l'API usa il massimo del modello.
+        if max_tokens is not None:
+            kwargs["max_tokens"] = max_tokens
         if json_mode:
             kwargs["response_format"] = {"type": "json_object"}
 
         def _attempt():
             try:
                 response = self._client.chat.completions.create(**kwargs)
-                return response.choices[0].message.content
+                content = response.choices[0].message.content
+                if not with_meta:
+                    return content
+                fr_str = str(getattr(response.choices[0], "finish_reason", None) or "UNKNOWN")
+                usage = getattr(response, "usage", None)
+                # OpenAI non espone i token di reasoning per i modelli standard:
+                # None è il valore corretto, non un dato mancante.
+                return content, {
+                    "truncated": fr_str == "length",
+                    "finish_reason": fr_str,
+                    "thinking_tokens": None,
+                    "output_tokens": getattr(usage, "completion_tokens", None) if usage else None,
+                }
             except self._RateLimitError as e:
                 raise LLMRateLimitError(str(e)) from e
             except self._APIStatusError as e:
@@ -225,11 +319,15 @@ class OpenAIProvider(LLMProvider):
 
         return _retry_with_backoff(_attempt)
 
-    def generate_json(self, model_name, prompt, temperature=0.1, max_tokens=2048, thinking_level: bool = None):
-        return self._call(model_name, prompt, temperature, max_tokens, json_mode=True, thinking_level = thinking_level)
+    def generate_json(self, model_name, prompt, temperature=0.1, max_tokens: int | None = 2048,
+                      thinking_level: str | None = None, with_meta: bool = False):
+        return self._call(model_name, prompt, temperature, max_tokens, json_mode=True,
+                          thinking_level=thinking_level, with_meta=with_meta)
 
-    def generate_text(self, model_name, prompt, temperature=0.0, max_tokens=16, thinking_level: bool = None):
-        return self._call(model_name, prompt, temperature, max_tokens, json_mode=False, thinking_level = thinking_level)
+    def generate_text(self, model_name, prompt, temperature=0.0, max_tokens: int | None = 16,
+                      thinking_level: str | None = None, with_meta: bool = False):
+        return self._call(model_name, prompt, temperature, max_tokens, json_mode=False,
+                          thinking_level=thinking_level, with_meta=with_meta)
 
 
 # ==============================================================================
@@ -252,9 +350,22 @@ class AnthropicProvider(LLMProvider):
         except ImportError:
             raise RuntimeError("anthropic package not installed.")
 
-    def _call(self, model_name, prompt, temperature, max_tokens, json_mode=False, thinking_level: bool = None):
+    def _call(self, model_name, prompt, temperature, max_tokens, json_mode=False, thinking_level: str | None = None,
+              with_meta: bool = False):
         if thinking_level:
             log.warning ("AnthropicProvider thinking level not used")
+
+        # Unico provider dei tre in cui max_tokens è obbligatorio: qui None non
+        # può essere propagato all'SDK, va risolto. Il log è a livello INFO e
+        # non WARNING perché non è un errore né una configurazione da correggere:
+        # è il comportamento previsto quando si chiede "usa il massimo" a un'API
+        # che quel concetto non lo ha.
+        if max_tokens is None:
+            max_tokens = _ANTHROPIC_MAX_TOKENS_FALLBACK
+            log.info(
+                f"Anthropic richiede max_tokens esplicito: uso il fallback "
+                f"{_ANTHROPIC_MAX_TOKENS_FALLBACK} (modello {model_name})."
+            )
 
         system = (
             "You must reply with valid JSON only. No explanation, no markdown fences."
@@ -272,7 +383,17 @@ class AnthropicProvider(LLMProvider):
                 if system:
                     kwargs["system"] = system
                 response = self._client.messages.create(**kwargs)
-                return response.content[0].text
+                content = response.content[0].text
+                if not with_meta:
+                    return content
+                fr_str = str(getattr(response, "stop_reason", None) or "UNKNOWN")
+                usage = getattr(response, "usage", None)
+                return content, {
+                    "truncated": fr_str == "max_tokens",
+                    "finish_reason": fr_str,
+                    "thinking_tokens": None,
+                    "output_tokens": getattr(usage, "output_tokens", None) if usage else None,
+                }
             except self._RateLimitError as e:
                 raise LLMRateLimitError(str(e)) from e
             except self._APIStatusError as e:
@@ -282,11 +403,15 @@ class AnthropicProvider(LLMProvider):
 
         return _retry_with_backoff(_attempt)
 
-    def generate_json(self, model_name, prompt, temperature=0.1, max_tokens=2048, thinking_level: bool = None):
-        return self._call(model_name, prompt, temperature, max_tokens, json_mode=True, thinking_level=thinking_level)
+    def generate_json(self, model_name, prompt, temperature=0.1, max_tokens: int | None = 2048,
+                      thinking_level: str | None = None, with_meta: bool = False):
+        return self._call(model_name, prompt, temperature, max_tokens, json_mode=True,
+                          thinking_level=thinking_level, with_meta=with_meta)
 
-    def generate_text(self, model_name, prompt, temperature=0.0, max_tokens=16, thinking_level: bool = None):
-        return self._call(model_name, prompt, temperature, max_tokens, json_mode=False, thinking_level=thinking_level)
+    def generate_text(self, model_name, prompt, temperature=0.0, max_tokens: int | None = 16,
+                      thinking_level: str | None = None, with_meta: bool = False):
+        return self._call(model_name, prompt, temperature, max_tokens, json_mode=False,
+                          thinking_level=thinking_level, with_meta=with_meta)
 
 
 # ==============================================================================
