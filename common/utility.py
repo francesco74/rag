@@ -6,6 +6,15 @@ from typing import Optional
 
 _SENTINEL_DATES_ISO = {"0001-01-01"}
 log = logging.getLogger("UTILITY")
+_WS_RE = re.compile(r'(?:&nbsp;|&#160;|\xa0|\s)+')
+
+def normalize_ws(text: str) -> str:
+    """Collassa entità HTML di spaziatura e whitespace ripetuto in un solo
+    spazio. Applicata al momento della query (rerank e rendering), NON in
+    ingestione: i vettori in Qdrant restano calcolati sul testo originale."""
+    if not text:
+        return text
+    return _WS_RE.sub(' ', text).strip()
 
 def clean_iso_date(date_raw: Optional[str]) -> Optional[str]:
     """

@@ -596,7 +596,7 @@ aiolimiter>=1.1.0
 
 # Database & Storage Connectors
 mysql-connector-python>=8.2.0
-qdrant-client>=1.7.0
+qdrant-client>=1.18.0
 
 # AI Models, LLM SDKs & Text Splitting
 google-genai>=0.1.1

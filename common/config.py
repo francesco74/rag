@@ -159,6 +159,7 @@ class Settings:
     parents_per_query: int
 
     mmr_similarity_threshold: float
+    boilerplate_similarity_threshold: float
 
     query_rewriter_model_name: str
     answer_generator_model_name: str
@@ -345,6 +346,7 @@ def load_settings() -> Settings:
         parents_per_query = int(os.environ.get("PARENTS_PER_QUERY") or 4),
 
         mmr_similarity_threshold = float(os.environ.get("MMR_SIMILARITY_THRESHOLD") or 0.92),
+        boilerplate_similarity_threshold = float(os.environ.get("BOILERPLATE_SIMILARITY_THRESHOLD") or 0.55),
 
         query_rewriter_model_name = os.environ.get("QUERY_REWRITER_MODEL_NAME", "gemini-3.1-flash-lite"),
         answer_generator_model_name = os.environ.get("ANSWER_GENERATOR_MODEL_NAME", "gemini-3.5-flash"),
