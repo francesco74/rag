@@ -3,7 +3,7 @@ import logging
 import os
 from dotenv import load_dotenv
 from qdrant_client import QdrantClient, models
-from google import genai  # stesso SDK e stesso pattern client di worker.py
+from common.embedding import init_embedding, embed_for_semantic_query
 from common.config import settings
 from common.db_logger import MySQLLogHandler, get_db_connection, init_db_pool
 
@@ -15,29 +15,27 @@ log = logging.getLogger("populate_concepts")
 # Configurazione Costanti
 CONCEPT_COLLECTION = "conceptual_dictionary"
 INPUT_FILE_PATH = "concepts.txt"
-EMBEDDING_MODEL = "gemini-embedding-001"
 
 def init_services():
     """
-    Inizializza le connessioni a Qdrant e Gemini.
+    Inizializza Qdrant e il client di embedding.
 
-    Usa lo stesso SDK e lo stesso pattern (genai.Client) di worker.py:
-    prima questo script usava `import genai` + `genai.configure(...)` +
-    `genai.embed_content(...)` — l'API del vecchio SDK deprecato
-    (google-generativeai), diversa da quella usata a runtime dal worker
-    (google-genai, client-based). Anche se i due SDK avessero prodotto
-    vettori numericamente identici a parità di modello/parametri, avere
-    ingestion e query-time su client diversi è un rischio inutile per un
-    meccanismo — il dizionario concettuale — che si basa interamente sulla
-    comparabilità via cosine similarity tra i due.
+    L'embedding è centralizzato in embedding.py (init_embedding +
+    embed_for_semantic_query), lo stesso modulo usato a runtime dal worker.
+    In questo modo il dizionario concettuale viene indicizzato con esattamente
+    lo stesso SDK, modello e task_type con cui poi viene interrogato: un
+    requisito non negoziabile, perché il meccanismo si basa interamente sulla
+    comparabilità via cosine similarity fra i due lati.
     """
-    api_llm_key = settings.api_llm_key
-    if not api_llm_key:
+    if not settings.api_llm_key:
         raise ValueError("API_LLM_KEY non trovata nelle variabili d'ambiente!")
-    genai_client = genai.Client(api_key=api_llm_key)
+    # Client di embedding centralizzato in embedding.py (stesso SDK/modello/
+    # parametri del worker): garantisce che i vettori del dizionario siano
+    # confrontabili con quelli calcolati a query-time da embed_for_semantic_query.
+    init_embedding()
 
     qdrant = QdrantClient(host=settings.qdrant_host, port=settings.qdrant_port)
-    return qdrant, genai_client
+    return qdrant
 
 def parse_and_clean_file(file_path):
     """
@@ -123,7 +121,7 @@ def reset_qdrant_collection(client):
 
 def main():
     try:
-        client, genai_client = init_services()
+        client = init_services()
         
         # 1. Parsing e pulizia del file di testo
         log.info(f"Lettura e pulizia del file: {INPUT_FILE_PATH}...")
@@ -149,13 +147,10 @@ def main():
             # Strategia di Embedding: fondiamo il concetto con i suoi alias per dare 
             # all'embedding la massima densità semantica possibile.
             text_to_embed = f"{concept}: {', '.join(aliases)}"
-            
-            result = genai_client.models.embed_content(
-                model=EMBEDDING_MODEL,
-                contents=text_to_embed,
-                config=dict(task_type="SEMANTIC_SIMILARITY", output_dimensionality=768)
-            )
-            vector = result.embeddings[0].values
+
+            # SEMANTIC_SIMILARITY, 768 dim: stessa funzione con cui worker.py
+            # interroga il dizionario, così i vettori sono confrontabili.
+            vector = embed_for_semantic_query(text_to_embed)
             
             # Creazione del punto Qdrant strutturato
             point = models.PointStruct(

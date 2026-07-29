@@ -96,3 +96,31 @@ def embed_for_semantic_query(query):
         config=dict(task_type="SEMANTIC_SIMILARITY", output_dimensionality=768)
     )
     return result.embeddings[0].values
+
+
+async def embed_documents_batch(texts):
+    """Embedding ASINCRONO in batch di DOCUMENTI da indicizzare.
+
+    task_type=RETRIEVAL_DOCUMENT: è il lato "documento" della coppia asimmetrica
+    di Gemini. Il lato "query" a runtime è embed_query() (RETRIEVAL_QUERY): i due
+    task_type sono diversi di proposito e NON vanno scambiati, o il retrieval si
+    degrada silenziosamente.
+
+    Usata dall'ingestione (ingest.py). Qui c'è solo la chiamata all'API sul
+    client condiviso; la politica di ingestione (rate limiting, retry aggressivo)
+    resta a carico del chiamante, che ha requisiti diversi dal path di query.
+
+    Richiede che init_embedding() sia già stata chiamata.
+    """
+    if not texts:
+        return []
+    from google.genai import types
+    response = await embedding_client.aio.models.embed_content(
+        model=EMBEDDING_MODEL,
+        contents=texts,
+        config=types.EmbedContentConfig(
+            task_type="RETRIEVAL_DOCUMENT",
+            output_dimensionality=768,
+        ),
+    )
+    return [emb.values for emb in response.embeddings]

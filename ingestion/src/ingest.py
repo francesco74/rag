@@ -7,10 +7,9 @@ import asyncio
 import json
 import hashlib
 
-# --- NUOVO SDK GOOGLE GENAI ---
-from google import genai
+# --- EMBEDDING (centralizzato in embedding.py) ---
+from common.embedding import init_embedding, embed_documents_batch
 from typeguard import config
-from google.genai import types
 
 # --- VECTOR DB ---
 from qdrant_client import models
@@ -71,8 +70,10 @@ for folder in [DATA_FOLDER, WATCH_FOLDER, PROCESSED_FOLDER, ERROR_FOLDER]:
     folder.mkdir(parents=True, exist_ok=True)
 
 # --- AI & DB Init ---
-ai_client = genai.Client(api_key=settings.api_llm_key)
-EMBEDDING_MODEL_NAME = "gemini-embedding-001"
+# Client di embedding centralizzato in embedding.py (stesso SDK/modello del
+# worker). Lo stesso oggetto client espone sia il path sync sia .aio per l'uso
+# asincrono in embed_documents_batch.
+init_embedding()
 
 qdrant_client = AsyncQdrantClient(
     host=settings.qdrant_host,
@@ -136,20 +137,15 @@ def safe_move_file(src_path, dest_folder):
     stop=stop_after_attempt(20)
 )
 async def async_embed_batch(batch_texts):
-    """Genera embeddings in batch con backoff esponenziale in caso di rate limit."""
+    """Genera embeddings in batch con backoff esponenziale in caso di rate limit.
+
+    La chiamata all'API (modello, RETRIEVAL_DOCUMENT, dimensioni) è centralizzata
+    in embedding.embed_documents_batch; qui restano le politiche specifiche
+    dell'ingestione: rate limiter globale e retry aggressivo."""
     if not batch_texts: return []
     async with GEMINI_LIMITER:
         log.debug(f"Calling Embeddings API for a batch of {len(batch_texts)} chunks...")
-        
-        response = await ai_client.aio.models.embed_content(
-            model=EMBEDDING_MODEL_NAME, 
-            contents=batch_texts, 
-            config=types.EmbedContentConfig(
-                task_type="RETRIEVAL_DOCUMENT",
-                output_dimensionality=768
-            )
-        )
-        return [emb.values for emb in response.embeddings]
+        return await embed_documents_batch(batch_texts)
 
 async def finalize_file_move(file_path, root_folder, topic_id, sub_topic_id, error_msg: str = None):
     """Smista i file processati. Se error_msg è presente, lo inietta nel JSON."""
