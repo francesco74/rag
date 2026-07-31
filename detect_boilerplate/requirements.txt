@@ -1,0 +1,38 @@
+# =====================================================================
+#  Dipendenze per detect_boilerplate.py
+#
+#  Lo script è pensato per girare NELLO STESSO ambiente del worker: importa
+#  common.config e common.db_logger, e (per la sync dei vettori) la funzione
+#  embed_for_semantic_query da worker.py. Se lo esegui dentro l'immagine
+#  esistente, queste dipendenze ci sono già tutte e questo file è ridondante.
+#
+#  Serve come elenco minimo autonomo se lo esegui in un ambiente separato
+#  (es. un CronJob con un'immagine più leggera del worker). Le versioni
+#  ricalcano quelle dello stack di progetto: allineale al requirements.txt
+#  principale se lì sono più stringenti.
+# =====================================================================
+
+# --- Dipendenze DIRETTE dello script ---------------------------------
+# Client del vector DB: scroll del corpus + upsert nella collection
+# boilerplate_phrases. re, argparse, logging, collections, datetime sono
+# nella standard library e non vanno elencati.
+qdrant-client>=1.18.0
+
+# --- Dipendenze TRANSITIVE via common/ -------------------------------
+# common.config: load_dotenv() per leggere la configurazione
+python-dotenv>=1.0.0
+# common.db_logger: get_db_connection() / init_db_pool() -> pool MySQL
+mysql-connector-python>=8.2.0
+
+# --- Solo se NON usi --no-vectors ------------------------------------
+# La sincronizzazione dei vettori-frase importa embed_for_semantic_query da
+# worker.py, che usa il client Google GenAI. Con --no-vectors lo script
+# popola solo MySQL e questa dipendenza non viene toccata.
+google-genai>=0.1.1
+
+# NOTA: numpy, onnxruntime, transformers, celery, redis ecc. NON servono a
+# questo script. Vengono trascinati solo se importi worker.py per intero;
+# l'import di embed_for_semantic_query è però lazy (dentro sync_qdrant_vectors),
+# quindi con --no-vectors lo script non carica affatto worker.py e resta
+# leggero. Per un CronJob dedicato alla sola scrittura MySQL, esegui con
+# --no-vectors e ometti google-genai.
