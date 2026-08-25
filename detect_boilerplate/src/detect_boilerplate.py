@@ -349,11 +349,20 @@ def upsert_mysql(conn, rows, now, active=None):
 
 def _create_boilerplate_collection(qc):
     from qdrant_client import models
+    from common.embedding import get_embedding_provider
 
+    # Dimensione letta dal provider attivo, non più 768 hardcoded: chiamata
+    # solo da init_qdrant_collection/ensure_qdrant_collection, entrambe
+    # invocate in main() DOPO init_embedding() (vedi riga ~525), quindi
+    # get_embedding_provider() qui trova sempre l'istanza già pronta. Con
+    # 768 fisso, il rilevamento notturno con EMBEDDING_PROVIDER=local avrebbe
+    # ricreato la collection a dimensione sbagliata a ogni run, cancellando
+    # in silenzio l'eventuale migrazione fatta a mano su questa collection.
+    dimension = get_embedding_provider().dimension
     qc.create_collection(
         collection_name=BOILERPLATE_COLLECTION,
         vectors_config=models.VectorParams(
-            size=768, distance=models.Distance.COSINE
+            size=dimension, distance=models.Distance.COSINE
         ),
     )
 
@@ -433,7 +442,7 @@ def main():
         help="Document-frequency minima per considerare boilerplate una frase.",
     )
     ap.add_argument("--ngram-min", type=int, default=NGRAM_MIN)
-    ap.add_argument("--ngram-max", type=int, default=NGRAM_MAX)
+    ap.add_argument("--ngram-max", type=int, default=NGRAM_MAX) 
     ap.add_argument("--min-group-docs", type=int, default=MIN_GROUP_DOCS)
     ap.add_argument(
         "--max-parts", type=int, default=10,
@@ -513,7 +522,7 @@ def main():
         try:
             log.debug("Caricamento QdrantClient e modello di embedding...")
             from qdrant_client import QdrantClient
-            from embedding import init_embedding, embed_for_semantic_query
+            from common.embedding import init_embedding, embed_for_semantic_query
 
             qc = QdrantClient(
                 host=settings.qdrant_host,

@@ -98,3 +98,6 @@ aio_pika>=8.0.0
 pika>=1.3.1
 asn1crypto
 numpy
+mistralai
+sentence-transformers
+ollama

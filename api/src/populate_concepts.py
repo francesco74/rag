@@ -3,7 +3,7 @@ import logging
 import os
 from dotenv import load_dotenv
 from qdrant_client import QdrantClient, models
-from common.embedding import init_embedding, embed_for_semantic_query
+from common.embedding import init_embedding, embed_for_semantic_query, get_embedding_provider
 from common.config import settings
 from common.db_logger import MySQLLogHandler, get_db_connection, init_db_pool
 
@@ -102,15 +102,26 @@ def parse_and_clean_file(file_path):
     return parsed_concepts
 
 def reset_qdrant_collection(client):
-    """Cancella ed esegue il reset ex novo della collection e dei suoi indici."""
+    """Cancella ed esegue il reset ex novo della collection e dei suoi indici.
+
+    La dimensione NON è più hardcoded a 768: viene letta dal provider di
+    embedding attivo (get_embedding_provider().dimension), lo stesso già
+    inizializzato da init_services() via init_embedding(). Con 768 fisso,
+    passare a EMBEDDING_PROVIDER=local (BGE-M3, dim=1024) avrebbe ricreato
+    silenziosamente la collection alla dimensione SBAGLIATA, con vettori
+    incompatibili rispetto a embed_for_semantic_query usata poco sotto —
+    esattamente il tipo di disallineamento silenzioso che embedding_provider
+    in config.py è stato pensato per evitare.
+    """
+    dimension = get_embedding_provider().dimension
     log.info(f"Piazza pulita: rimozione della collection '{CONCEPT_COLLECTION}' se esistente...")
     if client.collection_exists(CONCEPT_COLLECTION):
         client.delete_collection(CONCEPT_COLLECTION)
         
-    log.info(f"Creazione nuova collection '{CONCEPT_COLLECTION}'...")
+    log.info(f"Creazione nuova collection '{CONCEPT_COLLECTION}' (dim={dimension})...")
     client.create_collection(
         collection_name=CONCEPT_COLLECTION,
-        vectors_config=models.VectorParams(size=768, distance=models.Distance.COSINE)
+        vectors_config=models.VectorParams(size=dimension, distance=models.Distance.COSINE)
     )
     
     # Ricreazione immediata degli indici di payload per ottimizzare il retrieval

@@ -167,6 +167,57 @@ class Settings:
 
     llm_provider: str
 
+    # Provider usato per gli embedding (vedi common/embedding.py). A differenza
+    # di llm_provider NON è "cambiabile a runtime senza conseguenze": i vettori
+    # già scritti in Qdrant restano legati al modello/provider con cui sono
+    # stati creati. Cambiare questo valore senza rifare l'ingestion completa
+    # (su una collection nuova, con dimensione coerente) produce similarità
+    # sbagliate in modo silenzioso.
+    embedding_provider: str
+
+    # Usati solo quando embedding_provider="local" (vedi LocalEmbeddingProvider
+    # in common/embedding.py). Cambiare local_embedding_model non richiede
+    # toccare il codice: la dimension del nuovo modello viene letta a runtime
+    # da model.get_sentence_embedding_dimension(), non è un valore da
+    # sincronizzare qui a mano.
+    local_embedding_model: str
+    local_embedding_device: str | None  # "cpu" | "cuda" | "mps" | None (auto-detect)
+
+    # Endpoint del server Ollama, usato solo quando LLM_PROVIDER="local" (vedi
+    # LocalLLMProvider in llm_provider.py). A differenza di local_embedding_model,
+    # NON serve un "local_llm_model" qui: query_rewriter_model_name/
+    # answer_generator_model_name/grader_model_name (sotto) esistono già e
+    # bastano — con provider="local" contengono un tag Ollama (es. "qwen3:14b")
+    # invece di un nome modello Gemini.
+    local_llm_host: str
+
+    # Quale backend usare quando LLM_PROVIDER="local": "ollama" (default,
+    # sviluppo/basso-concorrenza, sequenziale) o "vllm" (produzione
+    # multi-utente, continuous batching — vedi VLLMProvider in llm_provider.py
+    # per il perché della soglia). Non tocca LLM_PROVIDER: la scelta resta
+    # "sono in locale?" (llm_provider) separata da "con quale motore?"
+    # (questo campo), così passare da un backend locale all'altro non cambia
+    # nient'altro a valle (query_rewriter_model_name ecc. restano quelli).
+    local_llm_backend: str
+
+    # Usati solo quando local_llm_backend="vllm". base_url punta al server
+    # OpenAI-compatible esposto da vLLM (es. "http://localhost:8000/v1" —
+    # nota il suffisso /v1, diverso dal formato di local_llm_host per Ollama).
+    # api_key è quasi sempre superflua in locale (vLLM in genere non
+    # autentica); VLLMProvider usa un placeholder se lasciata vuota, perché
+    # il client OpenAI pretende comunque una stringa non vuota.
+    local_vllm_base_url: str
+    local_vllm_api_key: str | None
+
+    # Usata da GeminiEmbeddingProvider (output_dimensionality) e
+    # OpenAIEmbeddingProvider (dimensions): entrambi supportano la troncatura
+    # del vettore nativo a questa dimensione, a differenza di Mistral (nativo
+    # fisso a 1024) e del provider locale (dimension letta dal modello
+    # caricato, non troncabile in modo affidabile). Un solo valore condiviso
+    # tra i due invece di "768" scritto due volte in embedding.py: se un
+    # domani serve una dimensione diversa, cambia qui, non nel codice.
+    embedding_dimension: int
+
     protected_keys: set[str]
 
     max_reranker_thread: int
@@ -355,6 +406,32 @@ def load_settings() -> Settings:
         onnx_model_cache_path = os.environ.get("RERANKER_MODEL_PATH", "./model_cache/mmarco-mMiniLMv2-L12-H384-v1"),
 
         llm_provider = os.environ.get("LLM_PROVIDER", "gemini").lower(),
+
+        # Default "gemini" per compatibilità con le collection Qdrant già
+        # esistenti: chi non imposta la variabile continua a produrre vettori
+        # nello stesso spazio vettoriale di prima. Cambiarla richiede una
+        # collection nuova e una ingestion completa (vedi embedding_provider
+        # nella dataclass sopra).
+        embedding_provider = os.environ.get("EMBEDDING_PROVIDER", "gemini").lower(),
+
+        # Letti solo se embedding_provider="local". local_embedding_device
+        # vuoto/non impostato -> None -> sentence-transformers auto-rileva
+        # l'hardware disponibile (CPU/CUDA/MPS).
+        local_embedding_model = os.environ.get("LOCAL_EMBEDDING_MODEL", "").strip() or "BAAI/bge-m3",
+        local_embedding_device = os.environ.get("LOCAL_EMBEDDING_DEVICE", "").strip() or None,
+
+        local_llm_host = os.environ.get("LOCAL_LLM_HOST", "").strip() or "http://localhost:11434",
+
+        local_llm_backend = os.environ.get("LOCAL_LLM_BACKEND", "ollama").strip().lower() or "ollama",
+
+        local_vllm_base_url = os.environ.get("LOCAL_VLLM_BASE_URL", "").strip() or "http://localhost:8000/v1",
+        local_vllm_api_key = os.environ.get("LOCAL_VLLM_API_KEY", "").strip() or None,
+
+        # Default 768: dimensione con cui sono state create le collection
+        # Qdrant originali (vedi embedding_provider sopra). Cambiarla NON
+        # rende automaticamente compatibili le collection esistenti: come per
+        # embedding_provider, serve una collection nuova + ingestion completa.
+        embedding_dimension = int(os.environ.get("EMBEDDING_DIMENSION", "768")),
 
         protected_keys = {"topic_id", "sub_topic_id", "source", "parent_id", "content",
                   "parent_index", "child_index", "file_name", "_ingestion_error", "_ingestion_id", "content_hash"},
