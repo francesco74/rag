@@ -9,7 +9,6 @@ import hashlib
 
 # --- EMBEDDING (centralizzato in embedding.py) ---
 from common.embedding import init_embedding, embed_documents_batch
-from typeguard import config
 
 # --- VECTOR DB ---
 from qdrant_client import models
@@ -32,8 +31,6 @@ from tenacity import (
     wait_exponential,
     retry_if_exception_type
 )
-
-from google.genai.errors import APIError
 
 from common.db_logger import MySQLLogHandler, get_db_connection, init_db_pool
 from common.config import settings
@@ -84,7 +81,13 @@ qdrant_client = AsyncQdrantClient(
 
 # Concurrency & Limiting
 CONCURRENCY_LIMIT = asyncio.Semaphore(5)
-GEMINI_LIMITER = AsyncLimiter(max_rate=1000, time_period=60)
+# Rate limiter generico lato ingestion, NON specifico di un provider: con
+# EMBEDDING_PROVIDER=gemini protegge la quota API di Gemini, ma lo stesso
+# codice gira anche con openai/mistral (altra quota API) o local (nessuna
+# quota reale — un modello self-hosted non ha rate limit esterno, il limite
+# è solo throughput hardware). 1000/min resta un tetto di sicurezza
+# ragionevole in tutti i casi, quindi non condizionato al provider attivo.
+EMBEDDING_RATE_LIMITER = AsyncLimiter(max_rate=1000, time_period=60)
 
 headers_to_split_on = [("#", "Header 1"), ("##", "Header 2"), ("###", "Header 3"), ("####", "Header 4")]
 markdown_splitter = MarkdownHeaderTextSplitter(headers_to_split_on=headers_to_split_on, strip_headers=False)
@@ -132,7 +135,7 @@ def safe_move_file(src_path, dest_folder):
         log.error(f"File Move Error ({src_path}): {e}")
 
 @retry(
-    retry=retry_if_exception_type(APIError),
+    retry=retry_if_exception_type(Exception),
     wait=wait_random_exponential(multiplier=2, min=10, max=80),
     stop=stop_after_attempt(20)
 )
@@ -143,7 +146,7 @@ async def async_embed_batch(batch_texts):
     in embedding.embed_documents_batch; qui restano le politiche specifiche
     dell'ingestione: rate limiter globale e retry aggressivo."""
     if not batch_texts: return []
-    async with GEMINI_LIMITER:
+    async with EMBEDDING_RATE_LIMITER:
         log.debug(f"Calling Embeddings API for a batch of {len(batch_texts)} chunks...")
         return await embed_documents_batch(batch_texts)
 
