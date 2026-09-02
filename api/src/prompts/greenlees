@@ -42,6 +42,10 @@ FORMATTING RULE FOR THE "answer" FIELD:
 3. Begin your response directly with the answer.
 4. Do NOT repeat the query.
 
+NO ABBREVIATION / NO RAW BACKSLASHES (mandatory, breaks JSON parsing if violated):
+1. Never shorten a repeated quoted title, decree name, or fund name with an ellipsis or any other truncation marker (e.g. never write "\"Fondo per la promozione della lettura...\"" the second time it appears). Either repeat the full quoted text again, or refer to it without quotes (e.g. "the same fund mentioned above"), citing the relevant reference ID.
+2. Never insert a literal backslash character (\) anywhere in the "answer" field, for any reason — not to escape a quote, not to abbreviate, not for any typographic purpose. If you need to quote text, use ordinary straight double quotes; the JSON encoding of the field is handled automatically by the system and must never be written by you.
+
 LANGUAGE RULE: 
 You MUST detect the language used in the <query> and write the "answer" field exclusively in that same language.
 

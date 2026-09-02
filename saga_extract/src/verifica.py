@@ -239,6 +239,19 @@ def check_mysql_file_presence(source: str, file_name: str) -> int:
     try:
         with conn.cursor() as cursor:
             log.debug(f"Controllo in mysql source:{source} - filename:{file_name}")
+            if "\ufffd" in file_name:
+                # DIAGNOSTICA TEMPORANEA: se '\ufffd' e' davvero nella stringa
+                # Python (non un artefatto del terminale/kubectl logs che sta
+                # solo VISUALIZZANDO male un carattere corretto), qui vediamo
+                # il code point esatto e i byte UTF-8 reali, senza passare da
+                # nessun terminale che potrebbe mentire sulla resa a schermo.
+                log.warning(
+                    "check_mysql_file_presence: '\\ufffd' presente nella stringa Python "
+                    "file_name. repr()=%r, byte UTF-8 (hex)=%s, code point alla posizione: %s",
+                    file_name,
+                    file_name.encode("utf-8", errors="backslashreplace").hex(),
+                    [hex(ord(c)) for c in file_name if c == "\ufffd"],
+                )
             cursor.execute(
                 "SELECT COUNT(*) FROM parent_documents WHERE source = %s AND file_name = %s",
                 (source, file_name)

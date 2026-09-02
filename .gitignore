@@ -2,6 +2,7 @@
 !.gitignore
 !ingestion/
 !saga_extract/
+!detect_boilerplate/
 !common/
 !api/
 !web/
@@ -22,6 +23,7 @@
 !ingestion/**
 !api/**
 !saga_extract/**
+!detect_boilerplate/**
 !misc/**
 !common/**
 !web/greenlees/src/web/**

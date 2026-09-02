@@ -6,27 +6,29 @@ from celery import Celery
 from celery.signals import setup_logging
 from celery.signals import worker_process_init, worker_shutdown
 from celery.schedules import crontab
+from common.utility import normalize_ws
 from mysql.connector import pooling
 from qdrant_client import QdrantClient, models
-from google import genai  # embedding only
-from google.genai.errors import APIError
 import math
 import json, re
 import hashlib
 import numpy as np
+from pydantic import BaseModel
 # Use the optimized reranker
 from reranker import ONNXReranker, RerankResult
 
 # Provider-agnostic LLM adapter
 from llm_provider import init_llm_provider, get_llm_provider
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from tenacity import (
-    retry,
-    stop_after_attempt,
-    wait_random_exponential,
-    retry_if_exception_type
+# Embedding (Gemini only) — estratto in embedding.py
+from common.embedding import (
+    init_embedding,
+    embed_query,
+    embed_queries_batch,
+    embed_for_semantic_query,
 )
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from common.config import settings
 from common.db_logger import MySQLLogHandler, get_db_connection, init_db_pool
@@ -52,22 +54,42 @@ MAX_AGE_SECONDS = 86400  # 24 hours
 _RERANKER_POOL: list = []
 _POOL_SIZE = settings.reranker_pool_size
 
-# Embedding retry (Gemini only — embedding stays on Google)
-GEMINI_EMBEDDING_RETRY = retry(
-    retry=retry_if_exception_type((APIError,)),
-    wait=wait_random_exponential(multiplier=2, min=4, max=60),
-    stop=stop_after_attempt(6),
-    before_sleep=lambda retry_state: log.warning(
-        f"Embedding rate limit hit. Retrying in {retry_state.next_action.sleep}s..."
-    )
-)
-
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["ONNXRUNTIME_EXECUTION_MODE"] = "PARALLEL"
+
+class AnswerSchema(BaseModel):
+    """
+    Schema strutturato per l'output di generate_answer, allineato ai 3 campi
+    richiesti dal prompt (vedi prompts/atti: is_found, is_general_knowledge,
+    answer). Passato come response_schema a generate_json: sui provider che
+    lo supportano nativamente (oggi Gemini) vincola il decoding a livello di
+    grammatica, non solo il "sapore" JSON del testo — elimina alla radice la
+    classe di bug osservata in produzione (backslash orfano dentro "answer"
+    che rompe json.loads pur essendo il resto del payload valido, vedi
+    safe_json_parse Livello 2c/3b per la rete di sicurezza residua sui
+    provider senza questo supporto).
+    """
+    is_found: bool
+    is_general_knowledge: bool
+    answer: str
+
 
 QDRANT_COLLECTION = "document_chunks"
 CACHE_COLLECTION = "semantic_cache"
 CONCEPT_COLLECTION = "conceptual_dictionary"
+BOILERPLATE_COLLECTION = "boilerplate_phrases"
+
+# Backslash NON seguito da un escape JSON valido (" \ / b f n r t u).
+# Es. "\..." o "\'" -> vengono raddoppiati (\\... , \\') diventando un
+# backslash letterale valido all'interno della stringa JSON.
+_INVALID_JSON_ESCAPE_RE = re.compile(r'\\(?!["\\/bfnrtu])')
+
+# Cache in-processo delle frasi di boilerplate attive, per topic. Evita una
+# query MySQL a ogni richiesta: le frasi cambiano una volta a notte (script
+# detect_boilerplate.py) e su approvazione manuale, quindi un TTL breve è
+# ampiamente sufficiente. Struttura: {topic_id: (scadenza_epoch, [frasi...])}.
+_BOILERPLATE_CACHE = {}
+_BOILERPLATE_TTL_SECONDS = 300
 
 # ==============================================================================
 # 2. CELERY INITIALIZATION
@@ -101,11 +123,9 @@ celery_app.conf.update(
 db_pool = None
 qdrant_client = None
 
-EMBEDDING_MODEL = "gemini-embedding-001"
-
 @worker_process_init.connect
 def init_worker_process(**kwargs):
-    global qdrant_client, embedding_client
+    global qdrant_client
     log.info("Initializing Worker Resources (Post-Fork)...")
 
     try:
@@ -121,7 +141,7 @@ def init_worker_process(**kwargs):
             # comune corrispondente assente dalla risposta finale.
             timeout=10,
         )
-        embedding_client = genai.Client(api_key=settings.api_llm_key)
+        init_embedding()
         init_llm_provider()
 
         # Il pool ONNX viene costruito QUI, non alla prima query. Era lazy
@@ -193,21 +213,60 @@ def safe_json_parse(raw_text: str, task_id: str = "UNKNOWN") -> dict:
         log.debug(f"[{task_id}] [JSON_PARSE] ✓ Successo al Livello 2b (Stringa riparata).")
         return parsed_data
     except json.JSONDecodeError as e:
-        log.debug(f"[{task_id}] [JSON_PARSE] Livello 2b fallito: {e}. Passo al Livello 3 (Brute Force Regex).")
- 
+        log.debug(f"[{task_id}] [JSON_PARSE] Livello 2b fallito: {e}. Passo al Livello 2c (Escape Sanitize).")
+
+    # 2c. Tentativo con sanificazione degli escape JSON non validi.
+    # Con risposte HTML lunghe e piene di virgolette annidate, il modello
+    # occasionalmente produce un backslash "orfano" (es. \... per abbreviare
+    # un titolo già citato, o \' per un apostrofo) che non fa parte di
+    # nessuna sequenza di escape JSON valida (\" \\ \/ \b \f \n \r \t \uXXXX).
+    # json.loads() rifiuta l'intero payload con "Invalid \escape", anche se
+    # il resto del JSON è perfettamente valido e la risposta è completa e
+    # semanticamente corretta — un peccato buttarla via per un carattere.
+    # Qui raddoppiamo ogni backslash orfano trasformandolo in un backslash
+    # letterale valido, senza toccare gli escape già corretti.
+    try:
+        sanitized = _sanitize_invalid_json_escapes(clean_text)
+        parsed_data = json.loads(sanitized)
+        log.debug(f"[{task_id}] [JSON_PARSE] ✓ Successo al Livello 2c (Escape sanificati).")
+        return parsed_data
+    except json.JSONDecodeError as e:
+        log.debug(f"[{task_id}] [JSON_PARSE] Livello 2c fallito: {e}. Passo al Livello 3 (Brute Force Regex).")
+
     # 3. Tentativo "Forza Bruta": Cerca tutto ciò che è tra parentesi graffe
     match = re.search(r'\{.*\}', raw_text, re.DOTALL)
     if match:
+        candidate = match.group(0)
         try:
-            parsed_data = json.loads(match.group(0))
+            parsed_data = json.loads(candidate)
             log.debug(f"[{task_id}] [JSON_PARSE] ✓ Successo al Livello 3 (Regex Regex Brute Force).")
             return parsed_data
         except json.JSONDecodeError as e:
-            log.debug(f"[{task_id}] [JSON_PARSE] Livello 3 fallito: {e}.")
-            
+            log.debug(f"[{task_id}] [JSON_PARSE] Livello 3 fallito: {e}. Passo al Livello 3b (Brute Force + Escape Sanitize).")
+
+        # 3b. Stessa sanificazione, applicata al blocco estratto in Livello 3:
+        # copre il caso in cui l'escape invalido conviva con extra data attorno
+        # alle graffe (markdown residuo, testo introduttivo del modello, ecc.).
+        try:
+            sanitized = _sanitize_invalid_json_escapes(candidate)
+            parsed_data = json.loads(sanitized)
+            log.debug(f"[{task_id}] [JSON_PARSE] ✓ Successo al Livello 3b (Regex + Escape sanificati).")
+            return parsed_data
+        except json.JSONDecodeError as e:
+            log.debug(f"[{task_id}] [JSON_PARSE] Livello 3b fallito: {e}.")
+
     # Fallimento totale
     log.error(f"[{task_id}] [JSON_PARSE] ✗ Fallimento totale. Impossibile estrarre JSON. Testo originale:\n{raw_text}")
     raise ValueError("Impossibile estrarre un JSON valido dal testo fornito.")
+
+
+
+
+
+def _sanitize_invalid_json_escapes(text: str) -> str:
+    """Ripara backslash "orfani" che rompono json.loads() senza toccare
+    gli escape già validi (incluse le sequenze \\uXXXX)."""
+    return _INVALID_JSON_ESCAPE_RE.sub(r'\\\\', text)
 
 def safe_sigmoid(x):
     """
@@ -217,6 +276,162 @@ def safe_sigmoid(x):
         return 0.0
     return 1 / (1 + math.exp(-x))
 
+def load_active_boilerplate(topic_id: str, sub_topic_ids):
+    """Frasi di boilerplate ATTIVE per (topic, sub_topic), con cache a TTL.
+
+    Ritorna {sub_topic_id: [(phrase, vector), ...]} oppure None se non ce ne
+    sono. MySQL è la fonte di verità sull'active (rispetta la revisione umana);
+    Qdrant fornisce i vettori, recuperati PER phrase_hash — un join esatto che
+    non dipende dall'identità testuale delle stringhe fra i due sistemi.
+
+    Una frase attiva in MySQL ma priva di vettore in Qdrant (es. sync notturna
+    non ancora rigirata) non si perde: entra nella mappa con vettore None, e la
+    guardia ricadrà su di lei col criterio lessicale.
+
+    Fail-soft: qualunque errore -> None, e il reranker lavora sul testo grezzo.
+    """
+    if not sub_topic_ids:
+        return None
+
+    # Chiave di cache: topic + insieme ordinato dei sub_topic interrogati.
+    cache_key = (topic_id, tuple(sorted(sub_topic_ids)))
+    now = time.time()
+    cached = _BOILERPLATE_CACHE.get(cache_key)
+    if cached and cached[0] > now:
+        return cached[1]
+
+    # --- 1. MySQL: quali frasi (active=TRUE) e il loro hash ------------------
+    rows = []
+    try:
+        conn = get_db_connection()
+        if conn is None:
+            raise RuntimeError("connessione MySQL non disponibile")
+        try:
+            with conn.cursor(dictionary=True) as cursor:
+                placeholders = ",".join(["%s"] * len(sub_topic_ids))
+                cursor.execute(
+                    f"SELECT phrase, sub_topic_id, phrase_hash "
+                    f"FROM boilerplate_phrases "
+                    f"WHERE topic_id = %s AND active = TRUE "
+                    f"AND sub_topic_id IN ({placeholders})",
+                    (topic_id, *sub_topic_ids),
+                )
+                rows = [r for r in cursor.fetchall() if r.get("phrase")]
+
+                log.debug(f"Caricate {len(rows)} frasi boilerplate attive da MySQL per topic '{topic_id}' ")
+        finally:
+            conn.close()
+    except Exception as e:
+        log.warning(f"Caricamento boilerplate MySQL per '{topic_id}' fallito ({e}): "
+                    f"il reranker procede sul testo grezzo.")
+        _BOILERPLATE_CACHE[cache_key] = (now + 30, None)
+        return None
+
+    if not rows:
+        _BOILERPLATE_CACHE[cache_key] = (now + _BOILERPLATE_TTL_SECONDS, None)
+        return None
+
+    # --- 2. Qdrant: i vettori delle frasi attive, recuperati per hash --------
+    wanted_hashes = [r["phrase_hash"] for r in rows]
+    vec_by_hash = {}
+    try:
+        scrolled, _ = qdrant_client.scroll(
+            collection_name=BOILERPLATE_COLLECTION,
+            scroll_filter=models.Filter(must=[
+                models.FieldCondition(key="topic_id", match=models.MatchValue(value=topic_id)),
+                models.FieldCondition(key="phrase_hash", match=models.MatchAny(any=wanted_hashes)),
+            ]),
+            with_vectors=True,
+            with_payload=["phrase_hash"],
+            limit=len(wanted_hashes) + 16,
+        )
+        for p in scrolled:
+            h = (p.payload or {}).get("phrase_hash")
+            if h and p.vector is not None:
+                vec_by_hash[h] = np.asarray(p.vector, dtype=np.float32)
+    except Exception as e:
+        # Qdrant assente o collection non ancora popolata: si prosegue coi soli
+        # vettori mancanti (tutti None) -> guardia lessicale. Non è un errore
+        # fatale, è un degrado.
+        log.warning(f"Recupero vettori boilerplate da Qdrant fallito ({e}): "
+                    f"guardia lessicale per questo topic.")
+
+    # --- 3. Raggruppa per sub_topic, agganciando il vettore quando c'è -------
+    by_subtopic = {}
+    for r in rows:
+        st = r["sub_topic_id"]
+        vec = vec_by_hash.get(r["phrase_hash"])   # None se mancante
+        by_subtopic.setdefault(st, []).append((r["phrase"], vec))
+
+    _BOILERPLATE_CACHE[cache_key] = (now + _BOILERPLATE_TTL_SECONDS, by_subtopic)
+    return by_subtopic
+
+
+def build_removal_by_subtopic(boilerplate_map, query_str, query_vector):
+    """Decide UNA VOLTA per query quali frasi rimuovere, per ciascun sub_topic.
+
+    Ritorna {sub_topic_id: compiled_regex} dove la regex contiene SOLO le frasi
+    da rimuovere (quelle NON pertinenti alla query). Le frasi pertinenti non
+    entrano nella regex, quindi restano nei chunk.
+
+    Guardia PRIMARIA semantica (vettore query e vettore frase presenti): tiene
+    la frase se la similarità coseno supera settings.boilerplate_similarity_
+    threshold. FALLBACK lessicale (manca un vettore): tiene la frase se
+    condivide un termine significativo con la query.
+
+    Il confronto è per sub_topic perché il boilerplate di una serie non deve
+    toccare i chunk di un'altra; ed è per query, non per chunk, perché la
+    decisione dipende solo da query e frasi (i 200 chunk del gruppo ricevono
+    tutti la stessa regex)."""
+    if not boilerplate_map:
+        return {}
+
+    qv = None
+    if query_vector is not None:
+        qv = np.asarray(query_vector, dtype=np.float32)
+        qv = qv / (np.linalg.norm(qv) + 1e-9)
+    thr = settings.boilerplate_similarity_threshold
+    q_terms = _significant_terms(query_str)
+
+    removal = {}
+    for st, phrase_vecs in boilerplate_map.items():
+        to_remove = []
+        kept = 0
+        for phrase, pv in phrase_vecs:
+            pertinent = False
+            if qv is not None and pv is not None:
+                sim = float(qv @ (pv / (np.linalg.norm(pv) + 1e-9)))
+                pertinent = sim >= thr
+            else:
+                # Fallback lessicale: pertinente se condivide un termine.
+                pertinent = bool(_significant_terms(phrase) & q_terms)
+            if pertinent:
+                kept += 1
+            else:
+                to_remove.append(phrase)
+
+        if to_remove:
+            ordered = sorted(set(to_remove), key=len, reverse=True)
+            removal[st] = re.compile("|".join(re.escape(p) for p in ordered), re.IGNORECASE)
+        log.debug(f"[BOILERPLATE] sub_topic '{st}': rimuovo {len(to_remove)}, "
+                  f"tengo {kept} (pertinenti alla query).")
+
+    return removal
+
+
+_STOPWORDS = frozenset("""
+il lo la i gli le un uno una di del dello della dei degli delle da dal dallo
+dalla in nel nello nella con su sul sullo sulla per tra fra e ed o od a ad al
+allo alla ai agli alle che chi cui non come più meno anche se ma però quindi
+the a an of to in on for and or with by from at as is are be this that
+""".split())
+
+
+def _significant_terms(text: str) -> set:
+    """Termini di un testo, minuscoli, esclusi stopword e token troppo corti.
+    Un identificatore come '267/2000' o 'd.lgs' resta un termine significativo."""
+    toks = re.findall(r"\w+(?:['\-./]\w+)*", (text or "").lower())
+    return {t for t in toks if len(t) >= 3 and t not in _STOPWORDS}
 
 # ==============================================================================
 # 4bis. MMR (Maximal Marginal Relevance) — diversificazione dei parent
@@ -365,40 +580,6 @@ def load_prompt_template(filename):
 # ==============================================================================
 # 5. LLM API FUNCTIONS
 # ==============================================================================
-
-@GEMINI_EMBEDDING_RETRY
-def embed_query(query):
-    """Generate embedding for a single query (Gemini only)."""
-    log.debug(f"Embedding query: '{query[:50]}...'")
-    result = embedding_client.models.embed_content(
-        model=EMBEDDING_MODEL,
-        contents=query,
-        config=dict(task_type="RETRIEVAL_QUERY", output_dimensionality=768)
-    )
-    return result.embeddings[0].values
-
-
-@GEMINI_EMBEDDING_RETRY
-def embed_queries_batch(queries_list):
-    """Generate embeddings for multiple queries in a single API call (Gemini only)."""
-    result = embedding_client.models.embed_content(
-        model=EMBEDDING_MODEL,
-        contents=queries_list,
-        config=dict(task_type="RETRIEVAL_QUERY", output_dimensionality=768)
-    )
-    if isinstance(queries_list, str):
-        return [result.embeddings[0].values]
-    return [emb.values for emb in result.embeddings]
-
-@GEMINI_EMBEDDING_RETRY
-def embed_for_concept_lookup(query):
-    """Embedding per confronto con il dizionario concettuale (task simmetrico)."""
-    result = embedding_client.models.embed_content(
-        model=EMBEDDING_MODEL,
-        contents=query,
-        config=dict(task_type="SEMANTIC_SIMILARITY", output_dimensionality=768)
-    )
-    return result.embeddings[0].values
 
 def format_verified_concepts(concepts):
     """
@@ -1288,6 +1469,7 @@ def generate_answer(query, rich_context, topic_id, search_queries=None,
         max_tokens=max_tokens,
         thinking_level=settings.answer_thinking_level,
         with_meta=True,
+        response_schema=AnswerSchema,
     )
     if meta.get("truncated"):
         thinking_tokens = meta.get("thinking_tokens")
@@ -1635,6 +1817,7 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
                      metadata_filters, include_undated=True,
                      semantic_size=None, semantic_threshold=None, mmr_lambda=1.0,
                      exclude_parent_ids=None,
+                     query_semantic_vector=None,
                      task_id="UNKNOWN"):
     """
     Recupera, fonde e riordina i chunk dal Vector DB in modo sicuro.
@@ -1652,6 +1835,15 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
     if not qdrant_client:
         log.error("Qdrant client not available! Retrieval aborted.")
         return [], [], {}
+
+    # Boilerplate attivo per (topic, sub_topic), caricato una volta per
+    # l'intero retrieval. La decisione "quali frasi rimuovere" dipende solo da
+    # query e frasi, non dai chunk: si prende UNA volta qui, non per ogni chunk.
+    # removal_by_subtopic: {sub_topic_id: regex delle frasi da togliere}.
+    boilerplate_map = load_active_boilerplate(topic_id, selected_sub_topics)
+    removal_by_subtopic = build_removal_by_subtopic(
+        boilerplate_map, " ".join(search_queries), query_semantic_vector
+    )
 
     semantic_size = semantic_size or settings.qdrant_semantic_size
     semantic_threshold = semantic_threshold if semantic_threshold is not None else settings.qdrant_semantic_threshold
@@ -1892,10 +2084,26 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
             # non condivisa con gli altri thread concorrenti.
             reranker_instance = pool[q_idx % len(pool)] if pool else None
             if reranker_instance:
-                docs_content = [
-                    c.payload.get("content", "")[:settings.rerank_truncate]
-                    for c in unique_candidates
-                ]
+                # Preparazione del testo passato al reranker, in quest'ordine:
+                #   1. normalizzazione whitespace/entità HTML (&nbsp;), PRIMA del
+                #      taglio: un chunk pieno di indentazione sprecherebbe la
+                #      finestra del cross-encoder in spazi invece che in testo;
+                #   2. rimozione del boilerplate attivo, protetta dalla guardia
+                #      lessicale (una frase presente nella query non si tocca);
+                #   3. troncamento a rerank_truncate.
+                # Tutto ciò riguarda SOLO il testo per il ranking: il contenuto
+                # renderizzato per l'utente e per il generatore resta integro.
+                docs_content = []
+                for c in unique_candidates:
+                    raw = normalize_ws(c.payload.get("content", "") if c.payload else "")
+                    # Rimuove SOLO il boilerplate del sub_topic DI QUESTO chunk:
+                    # la formula delle determine non tocca i chunk dei decreti.
+                    # La decisione di pertinenza è già stata presa (regex pronta);
+                    # qui è pura sostituzione, nessun calcolo per chunk.
+                    st = c.payload.get("sub_topic_id") if c.payload else None
+                    rx = removal_by_subtopic.get(st) if st else None
+                    txt = rx.sub(" ", raw) if rx else raw
+                    docs_content.append(txt[:settings.rerank_truncate])
                 try:
                     reranked = reranker_instance.rerank(query_str, docs_content)
                     reranked.sort(key=lambda x: x.score, reverse=True)
@@ -2575,8 +2783,12 @@ def process_rag_query(self, query, history, topic_id, selected_sub_topics=None, 
             lookup_text = " ".join(recent_turns + [query])
 
         verified_concepts = []
+        concept_vector = None 
         try:
-            concept_vector = embed_for_concept_lookup(lookup_text)
+            # Dizionario concettuale: usa lookup_text (query + ultimi turni),
+            # perché il contesto conversazionale aiuta ad agganciare i concetti
+            # su domande di follow-up brevi ("e quelle del 2024?").
+            concept_vector = embed_for_semantic_query(lookup_text)
             verified_concepts = get_concepts_by_similarity(concept_vector, task_id=task_id)
         except Exception as ce:
             log.warning(f"[{task_id}] Lookup concettuale fallito ({ce}): il rewriter procede senza concetti verificati.")
@@ -2648,6 +2860,7 @@ def process_rag_query(self, query, history, topic_id, selected_sub_topics=None, 
             selected_sub_topics,
             metadata_filters,
             include_undated,
+            query_semantic_vector=concept_vector,
             task_id=task_id,
             **profile_kwargs(0, task_id=task_id)
         )
@@ -2764,8 +2977,9 @@ def process_rag_query(self, query, history, topic_id, selected_sub_topics=None, 
                     #    propagherebbe l'errore anche nel lookup. Il testo
                     #    originale dell'utente è immune da errori di rewrite.
                     retry_concepts = []
+                    retry_concept_vector = None
                     try:
-                        retry_concept_vector = embed_for_concept_lookup(lookup_text)
+                        retry_concept_vector = embed_for_semantic_query(lookup_text)
                         retry_concepts = get_concepts_by_similarity(retry_concept_vector, task_id=f"{task_id}-RETRY")
                     except Exception as ce:
                         log.warning(f"[{task_id}-RETRY] Lookup concettuale fallito ({ce}): retry senza concetti verificati.")
@@ -2795,6 +3009,7 @@ def process_rag_query(self, query, history, topic_id, selected_sub_topics=None, 
                         selected_sub_topics,
                         metadata_filters,
                         include_undated,
+                        query_semantic_vector=retry_concept_vector,
                         task_id=task_id,
                         **profile_kwargs(attempt, task_id=task_id)
                     )
@@ -2816,6 +3031,7 @@ def process_rag_query(self, query, history, topic_id, selected_sub_topics=None, 
                         metadata_filters,
                         include_undated,
                         exclude_parent_ids=used_parent_ids,
+                        query_semantic_vector=concept_vector,
                         task_id=f"{task_id}-FALLBACK",
                         **profile_kwargs(settings.max_model_retries - 1, task_id=task_id)
                     )

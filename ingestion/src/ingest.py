@@ -7,10 +7,8 @@ import asyncio
 import json
 import hashlib
 
-# --- NUOVO SDK GOOGLE GENAI ---
-from google import genai
-from typeguard import config
-from google.genai import types
+# --- EMBEDDING (centralizzato in embedding.py) ---
+from common.embedding import init_embedding, embed_documents_batch
 
 # --- VECTOR DB ---
 from qdrant_client import models
@@ -33,8 +31,6 @@ from tenacity import (
     wait_exponential,
     retry_if_exception_type
 )
-
-from google.genai.errors import APIError
 
 from common.db_logger import MySQLLogHandler, get_db_connection, init_db_pool
 from common.config import settings
@@ -71,8 +67,10 @@ for folder in [DATA_FOLDER, WATCH_FOLDER, PROCESSED_FOLDER, ERROR_FOLDER]:
     folder.mkdir(parents=True, exist_ok=True)
 
 # --- AI & DB Init ---
-ai_client = genai.Client(api_key=settings.api_llm_key)
-EMBEDDING_MODEL_NAME = "gemini-embedding-001"
+# Client di embedding centralizzato in embedding.py (stesso SDK/modello del
+# worker). Lo stesso oggetto client espone sia il path sync sia .aio per l'uso
+# asincrono in embed_documents_batch.
+init_embedding()
 
 qdrant_client = AsyncQdrantClient(
     host=settings.qdrant_host,
@@ -83,7 +81,13 @@ qdrant_client = AsyncQdrantClient(
 
 # Concurrency & Limiting
 CONCURRENCY_LIMIT = asyncio.Semaphore(5)
-GEMINI_LIMITER = AsyncLimiter(max_rate=1000, time_period=60)
+# Rate limiter generico lato ingestion, NON specifico di un provider: con
+# EMBEDDING_PROVIDER=gemini protegge la quota API di Gemini, ma lo stesso
+# codice gira anche con openai/mistral (altra quota API) o local (nessuna
+# quota reale — un modello self-hosted non ha rate limit esterno, il limite
+# è solo throughput hardware). 1000/min resta un tetto di sicurezza
+# ragionevole in tutti i casi, quindi non condizionato al provider attivo.
+EMBEDDING_RATE_LIMITER = AsyncLimiter(max_rate=1000, time_period=60)
 
 headers_to_split_on = [("#", "Header 1"), ("##", "Header 2"), ("###", "Header 3"), ("####", "Header 4")]
 markdown_splitter = MarkdownHeaderTextSplitter(headers_to_split_on=headers_to_split_on, strip_headers=False)
@@ -131,25 +135,20 @@ def safe_move_file(src_path, dest_folder):
         log.error(f"File Move Error ({src_path}): {e}")
 
 @retry(
-    retry=retry_if_exception_type(APIError),
+    retry=retry_if_exception_type(Exception),
     wait=wait_random_exponential(multiplier=2, min=10, max=80),
     stop=stop_after_attempt(20)
 )
 async def async_embed_batch(batch_texts):
-    """Genera embeddings in batch con backoff esponenziale in caso di rate limit."""
+    """Genera embeddings in batch con backoff esponenziale in caso di rate limit.
+
+    La chiamata all'API (modello, RETRIEVAL_DOCUMENT, dimensioni) è centralizzata
+    in embedding.embed_documents_batch; qui restano le politiche specifiche
+    dell'ingestione: rate limiter globale e retry aggressivo."""
     if not batch_texts: return []
-    async with GEMINI_LIMITER:
+    async with EMBEDDING_RATE_LIMITER:
         log.debug(f"Calling Embeddings API for a batch of {len(batch_texts)} chunks...")
-        
-        response = await ai_client.aio.models.embed_content(
-            model=EMBEDDING_MODEL_NAME, 
-            contents=batch_texts, 
-            config=types.EmbedContentConfig(
-                task_type="RETRIEVAL_DOCUMENT",
-                output_dimensionality=768
-            )
-        )
-        return [emb.values for emb in response.embeddings]
+        return await embed_documents_batch(batch_texts)
 
 async def finalize_file_move(file_path, root_folder, topic_id, sub_topic_id, error_msg: str = None):
     """Smista i file processati. Se error_msg è presente, lo inietta nel JSON."""

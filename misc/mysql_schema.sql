@@ -151,4 +151,63 @@
 --      JSON_TABLE(jt.missing, '$[*]' COLUMNS (target VARCHAR(255) PATH '$')) AS t
 -- WHERE created_at > NOW() - INTERVAL 30 DAY
 -- GROUP BY target ORDER BY n DESC LIMIT 20;
+
+-- =====================================================================
+--  boilerplate_phrases
+--  Frasi ricorrenti (intestazioni, firme, formule di rito) individuate
+--  per (topic, sub_topic) dallo script notturno detect_boilerplate.py.
+--
+--  Il worker le rimuove dal SOLO testo passato al reranker, mai dal testo
+--  mostrato all'utente o inviato al generatore: una frase erroneamente in
+--  lista degrada al più il ranking di un chunk, non l'informazione resa.
+--
+--  Nulla entra in produzione senza revisione umana: lo script inserisce
+--  con active = FALSE, un operatore promuove a TRUE dopo controllo.
+-- =====================================================================
+CREATE TABLE IF NOT EXISTS boilerplate_phrases (
+    id            INT AUTO_INCREMENT PRIMARY KEY,
+
+    topic_id      VARCHAR(255) NOT NULL,
+    -- La frase è specifica di una serie documentaria (determine, regolamenti,
+    -- decreti...): il boilerplate vive lì, non a livello di intero ente.
+    -- L'intestazione delle determine non è quella dei decreti.
+    sub_topic_id  VARCHAR(255) NOT NULL,
+
+    phrase        VARCHAR(512) NOT NULL,
+
+    -- md5 di normalize_ws(phrase), calcolato una sola volta da
+    -- detect_boilerplate.py e scritto identico qui e nel payload Qdrant.
+    -- È la chiave di JOIN robusta fra i due sistemi: il worker legge da MySQL
+    -- le frasi attive con il loro hash e recupera da Qdrant i vettori PER
+    -- HASH, evitando i join per stringa che divergerebbero al primo
+    -- carattere di differenza nella normalizzazione.
+    phrase_hash   CHAR(32)     NOT NULL,
+
+    -- Frazione di DOCUMENTI DISTINTI del gruppo in cui la frase appare
+    -- (document-frequency, non conteggio occorrenze). È il criterio di
+    -- boilerplate: una frase in >50% dei documenti è struttura, non contenuto.
+    doc_freq      FLOAT        NOT NULL,
+    -- Numeratore grezzo: rende informata la revisione umana (0.62 significa
+    -- cose diverse su 20 o 2000 documenti).
+    doc_count     INT          NOT NULL,
+    group_docs    INT          NOT NULL,   -- denominatore: documenti nel gruppo
+
+    -- Interruttore della revisione umana. Default FALSE: nessuna frase
+    -- viene applicata dal worker finché un operatore non la abilita.
+    active        BOOLEAN      NOT NULL DEFAULT FALSE,
+
+    detected_at   DATETIME     NOT NULL,
+    -- Ultima notte in cui la frase è risultata ancora sopra soglia. Lo script
+    -- non disattiva mai una frase già approvata (una decisione umana non va
+    -- revocata da un automatismo): aggiorna questo campo, e una frase che non
+    -- si vede da molte esecuzioni può essere rivista a mano.
+    last_seen     DATETIME     NOT NULL,
+
+    -- Un gruppo (topic, sub_topic) non può contenere due volte la stessa
+    -- frase. L'unicità è sull'hash: è ciò che identifica il contenuto in modo
+    -- stabile fra MySQL e Qdrant.
+    UNIQUE KEY uq_group_hash (topic_id, sub_topic_id, phrase_hash),
+    -- Lookup del worker: frasi attive di un gruppo.
+    KEY idx_lookup (topic_id, sub_topic_id, active)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
  

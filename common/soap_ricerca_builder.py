@@ -13,6 +13,7 @@ import sys
 
 # CORRETTO: Aggiunto DeterminaFilter negli import da ricerca_filtri
 from common.ricerca_filtri import DeterminaFilter, DatiUtenteFilter, MetadataItem, RicercaFiltri
+from common.utility import decode_soap_response
 
 # TOML: Python 3.11+ ha tomllib; fallback per versioni precedenti
 log = logging.getLogger(__name__)
@@ -123,20 +124,28 @@ class DocWSRicercheClient:
             verify=self.verify_tls,
         )
 
+        # NOTA: usiamo decode_soap_response(resp.content) invece di resp.text
+        # in ogni punto qui sotto. resp.text decodifica con errors='replace'
+        # e sostituisce silenziosamente byte cp1252 legacy (es. '°' = 0xB0,
+        # frequente in oggetti atto) con '\ufffd', perdendo il dato senza
+        # loggare nulla. decode_soap_response recupera quei byte come cp1252
+        # invece di scartarli (vedi common/utility.py:decode_soap_response).
+        response_text = decode_soap_response(resp.content)
+
         # TRACCIAMENTO RISPOSTA SERVER
         log.info("HTTP Status: %s", resp.status_code)
-        log.debug("Risposta Server (primi 1500 caratteri): %s", html.unescape(resp.text)[:1500])
+        log.debug("Risposta Server (primi 1500 caratteri): %s", html.unescape(response_text)[:1500])
     
         if not resp.ok:
             raise RuntimeError(
                 f"HTTP {resp.status_code} calling DocWSRicerche. "
-                f"Response body (first 1000 chars): {resp.text[:1000]}"
+                f"Response body (first 1000 chars): {response_text[:1000]}"
             )
 
-        result_text, result_xml_root = self._extract_result(resp.text)
+        result_text, result_xml_root = self._extract_result(response_text)
         return SoapSendResult(
             http_status=resp.status_code,
-            response_text=resp.text,
+            response_text=response_text,
             result_text=result_text,
             result_xml_root=result_xml_root,
         )
@@ -169,4 +178,3 @@ class DocWSRicercheClient:
             return result_text, inner_root
         except ET.ParseError:
             return result_text, None
-

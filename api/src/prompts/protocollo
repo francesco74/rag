@@ -73,6 +73,10 @@ Set "is_found" to false ONLY if the <context> contains absolutely zero relevant 
 - English: <p>I could not find an answer in the provided documents.</p>
 - Italian: <p>Non sono riuscito a trovare la risposta nei documenti che ho analizzato.</p>
 
+NO ABBREVIATION / NO RAW BACKSLASHES (mandatory, breaks JSON parsing if violated):
+1. Never shorten a repeated quoted title, decree name, or fund name with an ellipsis or any other truncation marker (e.g. never write "\"Fondo per la promozione della lettura...\"" the second time it appears). Either repeat the full quoted text again, or refer to it without quotes (e.g. "the same fund mentioned above"), citing the relevant reference ID.
+2. Never insert a literal backslash character (\) anywhere in the "answer" field, for any reason — not to escape a quote, not to abbreviate, not for any typographic purpose. If you need to quote text, use ordinary straight double quotes; the JSON encoding of the field is handled automatically by the system and must never be written by you.
+
 NOISE FILTERING:
 Ignore repeated boilerplate text such as page numbers, document headers, footers, or recurring administrative signatures that do not carry informational content relevant to the query.
 

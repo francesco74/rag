@@ -1,6 +1,6 @@
 aio-pika==9.4.1
 python-dotenv==1.0.1
-qdrant-client==1.16.2
+qdrant-client>=1.18.0
 langchain-text-splitters>=0.2.0
 google-genai>=0.1.0
 tenacity>=8.2.0
