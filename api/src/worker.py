@@ -13,6 +13,7 @@ import math
 import json, re
 import hashlib
 import numpy as np
+from pydantic import BaseModel
 # Use the optimized reranker
 from reranker import ONNXReranker, RerankResult
 
@@ -56,10 +57,32 @@ _POOL_SIZE = settings.reranker_pool_size
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["ONNXRUNTIME_EXECUTION_MODE"] = "PARALLEL"
 
+class AnswerSchema(BaseModel):
+    """
+    Schema strutturato per l'output di generate_answer, allineato ai 3 campi
+    richiesti dal prompt (vedi prompts/atti: is_found, is_general_knowledge,
+    answer). Passato come response_schema a generate_json: sui provider che
+    lo supportano nativamente (oggi Gemini) vincola il decoding a livello di
+    grammatica, non solo il "sapore" JSON del testo — elimina alla radice la
+    classe di bug osservata in produzione (backslash orfano dentro "answer"
+    che rompe json.loads pur essendo il resto del payload valido, vedi
+    safe_json_parse Livello 2c/3b per la rete di sicurezza residua sui
+    provider senza questo supporto).
+    """
+    is_found: bool
+    is_general_knowledge: bool
+    answer: str
+
+
 QDRANT_COLLECTION = "document_chunks"
 CACHE_COLLECTION = "semantic_cache"
 CONCEPT_COLLECTION = "conceptual_dictionary"
 BOILERPLATE_COLLECTION = "boilerplate_phrases"
+
+# Backslash NON seguito da un escape JSON valido (" \ / b f n r t u).
+# Es. "\..." o "\'" -> vengono raddoppiati (\\... , \\') diventando un
+# backslash letterale valido all'interno della stringa JSON.
+_INVALID_JSON_ESCAPE_RE = re.compile(r'\\(?!["\\/bfnrtu])')
 
 # Cache in-processo delle frasi di boilerplate attive, per topic. Evita una
 # query MySQL a ogni richiesta: le frasi cambiano una volta a notte (script
@@ -190,21 +213,60 @@ def safe_json_parse(raw_text: str, task_id: str = "UNKNOWN") -> dict:
         log.debug(f"[{task_id}] [JSON_PARSE] ✓ Successo al Livello 2b (Stringa riparata).")
         return parsed_data
     except json.JSONDecodeError as e:
-        log.debug(f"[{task_id}] [JSON_PARSE] Livello 2b fallito: {e}. Passo al Livello 3 (Brute Force Regex).")
- 
+        log.debug(f"[{task_id}] [JSON_PARSE] Livello 2b fallito: {e}. Passo al Livello 2c (Escape Sanitize).")
+
+    # 2c. Tentativo con sanificazione degli escape JSON non validi.
+    # Con risposte HTML lunghe e piene di virgolette annidate, il modello
+    # occasionalmente produce un backslash "orfano" (es. \... per abbreviare
+    # un titolo già citato, o \' per un apostrofo) che non fa parte di
+    # nessuna sequenza di escape JSON valida (\" \\ \/ \b \f \n \r \t \uXXXX).
+    # json.loads() rifiuta l'intero payload con "Invalid \escape", anche se
+    # il resto del JSON è perfettamente valido e la risposta è completa e
+    # semanticamente corretta — un peccato buttarla via per un carattere.
+    # Qui raddoppiamo ogni backslash orfano trasformandolo in un backslash
+    # letterale valido, senza toccare gli escape già corretti.
+    try:
+        sanitized = _sanitize_invalid_json_escapes(clean_text)
+        parsed_data = json.loads(sanitized)
+        log.debug(f"[{task_id}] [JSON_PARSE] ✓ Successo al Livello 2c (Escape sanificati).")
+        return parsed_data
+    except json.JSONDecodeError as e:
+        log.debug(f"[{task_id}] [JSON_PARSE] Livello 2c fallito: {e}. Passo al Livello 3 (Brute Force Regex).")
+
     # 3. Tentativo "Forza Bruta": Cerca tutto ciò che è tra parentesi graffe
     match = re.search(r'\{.*\}', raw_text, re.DOTALL)
     if match:
+        candidate = match.group(0)
         try:
-            parsed_data = json.loads(match.group(0))
+            parsed_data = json.loads(candidate)
             log.debug(f"[{task_id}] [JSON_PARSE] ✓ Successo al Livello 3 (Regex Regex Brute Force).")
             return parsed_data
         except json.JSONDecodeError as e:
-            log.debug(f"[{task_id}] [JSON_PARSE] Livello 3 fallito: {e}.")
-            
+            log.debug(f"[{task_id}] [JSON_PARSE] Livello 3 fallito: {e}. Passo al Livello 3b (Brute Force + Escape Sanitize).")
+
+        # 3b. Stessa sanificazione, applicata al blocco estratto in Livello 3:
+        # copre il caso in cui l'escape invalido conviva con extra data attorno
+        # alle graffe (markdown residuo, testo introduttivo del modello, ecc.).
+        try:
+            sanitized = _sanitize_invalid_json_escapes(candidate)
+            parsed_data = json.loads(sanitized)
+            log.debug(f"[{task_id}] [JSON_PARSE] ✓ Successo al Livello 3b (Regex + Escape sanificati).")
+            return parsed_data
+        except json.JSONDecodeError as e:
+            log.debug(f"[{task_id}] [JSON_PARSE] Livello 3b fallito: {e}.")
+
     # Fallimento totale
     log.error(f"[{task_id}] [JSON_PARSE] ✗ Fallimento totale. Impossibile estrarre JSON. Testo originale:\n{raw_text}")
     raise ValueError("Impossibile estrarre un JSON valido dal testo fornito.")
+
+
+
+
+
+def _sanitize_invalid_json_escapes(text: str) -> str:
+    """Ripara backslash "orfani" che rompono json.loads() senza toccare
+    gli escape già validi (incluse le sequenze \\uXXXX)."""
+    return _INVALID_JSON_ESCAPE_RE.sub(r'\\\\', text)
 
 def safe_sigmoid(x):
     """
@@ -1407,6 +1469,7 @@ def generate_answer(query, rich_context, topic_id, search_queries=None,
         max_tokens=max_tokens,
         thinking_level=settings.answer_thinking_level,
         with_meta=True,
+        response_schema=AnswerSchema,
     )
     if meta.get("truncated"):
         thinking_tokens = meta.get("thinking_tokens")

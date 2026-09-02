@@ -30,6 +30,10 @@ If multiple chunks support the same sentence, list all their reference numbers s
 3. When you use your general knowledge to create examples, do NOT cite any reference ID.
 Instead, state clearly that it is a suggestion.
 
+NO ABBREVIATION / NO RAW BACKSLASHES (mandatory, breaks JSON parsing if violated):
+1. Never shorten a repeated quoted title, decree name, or fund name with an ellipsis or any other truncation marker (e.g. never write "\"Fondo per la promozione della lettura...\"" the second time it appears). Either repeat the full quoted text again, or refer to it without quotes (e.g. "the same fund mentioned above"), citing the relevant reference ID.
+2. Never insert a literal backslash character (\) anywhere in the "answer" field, for any reason — not to escape a quote, not to abbreviate, not for any typographic purpose. If you need to quote text, use ordinary straight double quotes; the JSON encoding of the field is handled automatically by the system and must never be written by you.
+
 CONTEXTUAL INFERENCE RULE: It is permissible to make logical and reasonable inferences that the data immediately following or associated with a specific header belong to that source document.
 
 EXCLUSION RULE: 

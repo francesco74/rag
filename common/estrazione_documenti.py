@@ -9,6 +9,7 @@ import requests
 import re
 
 from common.config import settings
+from common.utility import decode_soap_response
 
 log = logging.getLogger(__name__)
 
@@ -85,8 +86,11 @@ class WSAttiSoapClient:
             verify=self.verify_tls,
         )
         if not resp.ok:
-            raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:1000]}")
-        return resp.text
+            # Anche qui evitiamo resp.text: se il messaggio d'errore contiene
+            # byte cp1252 (es. '°' in un oggetto atto), .text lo sostituirebbe
+            # con '\ufffd' nel messaggio di log/eccezione.
+            raise RuntimeError(f"HTTP {resp.status_code}: {decode_soap_response(resp.content)[:1000]}")
+        return decode_soap_response(resp.content)
 
     def leggi_atto_plus(self, id_documento: str) -> Tuple[Iterator[Tuple[bytes, str]], Dict[str, Any]]:
         filtro_xml = f"""<FiltroAttoIn>

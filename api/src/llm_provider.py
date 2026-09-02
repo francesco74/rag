@@ -99,7 +99,8 @@ class LLMProvider(ABC):
     def generate_json(self, model_name: str, prompt: str,
                       temperature: float = 0.1, max_tokens: int | None = 2048,
                       thinking_level: str | None = None,
-                      with_meta: bool = False):
+                      with_meta: bool = False,
+                      response_schema=None):
         """
         Call the model asking for a JSON response.
         Returns the raw JSON string, oppure (str, meta) se with_meta=True.
@@ -107,6 +108,20 @@ class LLMProvider(ABC):
         max_tokens=None -> nessun tetto esplicito (massimo del modello).
         Il default resta 2048: chi non specifica nulla è un chiamante con
         output corto e strutturato (rewriter), che il tetto lo vuole.
+
+        response_schema=None -> comportamento invariato (JSON mode "libero":
+        l'API garantisce solo che il testo SIA JSON valido, non che rispetti
+        una forma precisa). Se valorizzato, i provider che lo supportano
+        nativamente (Gemini, OpenAI) applicano un decoding vincolato alla
+        grammatica dello schema — che oltre a validare i campi elimina anche
+        la classe di bug "backslash orfano dentro una stringa" perché il
+        modello non può più emettere un token di escape non valido. I
+        provider senza equivalente nativo (Anthropic, Mistral, local) lo
+        ignorano silenziosamente e restano sul JSON mode "libero" esistente:
+        l'interfaccia resta unica, il comportamento no-op è esplicito e
+        documentato qui, non una sorpresa da scoprire in produzione.
+        Formato atteso: una classe Pydantic (BaseModel) per Gemini, oppure
+        un JSON Schema (dict) per OpenAI — vedi le rispettive implementazioni.
         """
 
     @abstractmethod
@@ -143,7 +158,7 @@ class GeminiProvider(LLMProvider):
             )
 
     def _call(self, model_name: str, prompt: str, temperature: float, max_tokens: int | None, json_mode: bool = False,
-              thinking_level: str | None = None, with_meta: bool = False):
+              thinking_level: str | None = None, with_meta: bool = False, response_schema=None):
         from google.genai import types
 
         # Nel nuovo SDK le configurazioni di generazione passano da GenerateContentConfig
@@ -159,6 +174,16 @@ class GeminiProvider(LLMProvider):
 
         if json_mode:
             config_kwargs["response_mime_type"] = "application/json"
+
+        # response_schema attiva il "controlled generation" di Gemini: il SDK
+        # accetta direttamente una classe Pydantic (BaseModel) e la traduce
+        # nello schema interno. A differenza del solo response_mime_type,
+        # questo vincola la grammatica di decoding token-per-token, quindi
+        # non solo i campi rispettano tipi/nomi attesi, ma il testo delle
+        # stringhe non può più contenere un escape JSON invalido: il
+        # tokenizer non ha la possibilità di produrre una sequenza illegale.
+        if response_schema is not None:
+            config_kwargs["response_schema"] = response_schema
 
         if thinking_level:
             config_kwargs["thinking_config"] = types.ThinkingConfig(
@@ -257,9 +282,9 @@ class GeminiProvider(LLMProvider):
             log.debug(f"[GEMINI_USAGE] Impossibile leggere usage_metadata: {e}")
 
     def generate_json(self, model_name: str, prompt: str, temperature: float = 0.1, max_tokens: int | None = 2048,
-                      thinking_level: str | None = None, with_meta: bool = False):
+                      thinking_level: str | None = None, with_meta: bool = False, response_schema=None):
         return self._call(model_name, prompt, temperature, max_tokens, json_mode=True,
-                          thinking_level=thinking_level, with_meta=with_meta)
+                          thinking_level=thinking_level, with_meta=with_meta, response_schema=response_schema)
 
     def generate_text(self, model_name: str, prompt: str, temperature: float = 0.0, max_tokens: int | None = 16,
                       thinking_level: str | None = None, with_meta: bool = False):
@@ -291,7 +316,7 @@ class OpenAIProvider(LLMProvider):
             raise RuntimeError("openai package not installed.")
 
     def _call(self, model_name, prompt, temperature, max_tokens, json_mode=False, thinking_level: str | None = None,
-              with_meta: bool = False):
+              with_meta: bool = False, response_schema=None):
         if thinking_level:
             log.warning ("OpenAIProvider thinking level not used")
 
@@ -303,7 +328,19 @@ class OpenAIProvider(LLMProvider):
         # Omesso quando None: l'API usa il massimo del modello.
         if max_tokens is not None:
             kwargs["max_tokens"] = max_tokens
-        if json_mode:
+        if response_schema is not None:
+            # OpenAI vuole un JSON Schema (dict), non una classe Pydantic:
+            # "strict": True attiva il constrained decoding vero e proprio
+            # (non solo validazione a posteriori).
+            kwargs["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "response",
+                    "schema": response_schema,
+                    "strict": True,
+                },
+            }
+        elif json_mode:
             kwargs["response_format"] = {"type": "json_object"}
 
         def _attempt():
@@ -332,9 +369,9 @@ class OpenAIProvider(LLMProvider):
         return _retry_with_backoff(_attempt)
 
     def generate_json(self, model_name, prompt, temperature=0.1, max_tokens: int | None = 2048,
-                      thinking_level: str | None = None, with_meta: bool = False):
+                      thinking_level: str | None = None, with_meta: bool = False, response_schema=None):
         return self._call(model_name, prompt, temperature, max_tokens, json_mode=True,
-                          thinking_level=thinking_level, with_meta=with_meta)
+                          thinking_level=thinking_level, with_meta=with_meta, response_schema=response_schema)
 
     def generate_text(self, model_name, prompt, temperature=0.0, max_tokens: int | None = 16,
                       thinking_level: str | None = None, with_meta: bool = False):
@@ -416,7 +453,14 @@ class AnthropicProvider(LLMProvider):
         return _retry_with_backoff(_attempt)
 
     def generate_json(self, model_name, prompt, temperature=0.1, max_tokens: int | None = 2048,
-                      thinking_level: str | None = None, with_meta: bool = False):
+                      thinking_level: str | None = None, with_meta: bool = False, response_schema=None):
+        if response_schema is not None:
+            # Nessun equivalente nativo di constrained decoding su schema per
+            # questo provider: il parametro è accettato per compatibilità con
+            # l'interfaccia comune ma ignorato, restando sul JSON mode
+            # "libero" già esistente (validato poi da safe_json_parse lato
+            # worker.py). No-op esplicito e loggato, non un fallimento silenzioso.
+            log.debug(f"{self.__class__.__name__}: response_schema richiesto ma non supportato, ignorato.")
         return self._call(model_name, prompt, temperature, max_tokens, json_mode=True,
                           thinking_level=thinking_level, with_meta=with_meta)
 
@@ -490,7 +534,14 @@ class MistralProvider(LLMProvider):
         return _retry_with_backoff(_attempt)
 
     def generate_json(self, model_name, prompt, temperature=0.1, max_tokens: int | None = 2048,
-                      thinking_level: str | None = None, with_meta: bool = False):
+                      thinking_level: str | None = None, with_meta: bool = False, response_schema=None):
+        if response_schema is not None:
+            # Nessun equivalente nativo di constrained decoding su schema per
+            # questo provider: il parametro è accettato per compatibilità con
+            # l'interfaccia comune ma ignorato, restando sul JSON mode
+            # "libero" già esistente (validato poi da safe_json_parse lato
+            # worker.py). No-op esplicito e loggato, non un fallimento silenzioso.
+            log.debug(f"{self.__class__.__name__}: response_schema richiesto ma non supportato, ignorato.")
         return self._call(model_name, prompt, temperature, max_tokens, json_mode=True,
                           thinking_level=thinking_level, with_meta=with_meta)
 
@@ -617,7 +668,14 @@ class LocalLLMProvider(LLMProvider):
         }
 
     def generate_json(self, model_name, prompt, temperature=0.1, max_tokens: int | None = 2048,
-                      thinking_level: str | None = None, with_meta: bool = False):
+                      thinking_level: str | None = None, with_meta: bool = False, response_schema=None):
+        if response_schema is not None:
+            # Nessun equivalente nativo di constrained decoding su schema per
+            # questo provider: il parametro è accettato per compatibilità con
+            # l'interfaccia comune ma ignorato, restando sul JSON mode
+            # "libero" già esistente (validato poi da safe_json_parse lato
+            # worker.py). No-op esplicito e loggato, non un fallimento silenzioso.
+            log.debug(f"{self.__class__.__name__}: response_schema richiesto ma non supportato, ignorato.")
         return self._call(model_name, prompt, temperature, max_tokens, json_mode=True,
                           thinking_level=thinking_level, with_meta=with_meta)
 
