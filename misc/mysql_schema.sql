@@ -211,3 +211,60 @@ CREATE TABLE IF NOT EXISTS boilerplate_phrases (
     KEY idx_lookup (topic_id, sub_topic_id, active)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
  
+
+-- =====================================================================
+--  SERVIZIO DI REVISIONE (review/)
+--  Utenti revisori, stato di revisione per documento e storico completo
+--  delle modifiche. Un documento è identificato dalla terna
+--  (source, topic_id, sub_topic_id), come in parent_documents.
+-- =====================================================================
+
+CREATE TABLE IF NOT EXISTS review_users (
+    id             INT AUTO_INCREMENT PRIMARY KEY,
+    username       VARCHAR(100) NOT NULL,
+    display_name   VARCHAR(255),
+    role           ENUM('revisore', 'admin') NOT NULL DEFAULT 'revisore',
+    password_hash  VARCHAR(255) NOT NULL,
+    active         BOOLEAN      NOT NULL DEFAULT TRUE,
+    -- Incrementato a ogni cambio password/disattivazione: invalida i token
+    -- di sessione già emessi senza bisogno di una blacklist.
+    token_version  INT          NOT NULL DEFAULT 1,
+    created_at     TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+    last_login_at  TIMESTAMP    NULL DEFAULT NULL,
+    UNIQUE KEY uq_username (username)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+CREATE TABLE IF NOT EXISTS review_status (
+    source        VARCHAR(255) NOT NULL,
+    topic_id      VARCHAR(255) NOT NULL,
+    sub_topic_id  VARCHAR(255) NOT NULL,
+    status        ENUM('da_revisionare', 'in_revisione', 'revisionato') NOT NULL DEFAULT 'da_revisionare',
+    note          TEXT,
+    updated_by    VARCHAR(100),
+    updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (source, topic_id, sub_topic_id),
+    KEY idx_status (topic_id, sub_topic_id, status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+CREATE TABLE IF NOT EXISTS review_audit (
+    id            BIGINT AUTO_INCREMENT PRIMARY KEY,
+    created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    user_id       INT,
+    username      VARCHAR(100) NOT NULL,
+    action        ENUM('content', 'metadata', 'status') NOT NULL,
+    source        VARCHAR(255) NOT NULL,
+    topic_id      VARCHAR(255) NOT NULL,
+    sub_topic_id  VARCHAR(255) NOT NULL,
+    -- content: testo completo prima/dopo; metadata: JSON prima/dopo;
+    -- status: stato prima/dopo.
+    old_value     LONGTEXT,
+    new_value     LONGTEXT,
+    note          TEXT,
+    details       JSON,
+    KEY idx_doc (source, topic_id, sub_topic_id, created_at),
+    KEY idx_user (username, created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+-- Consigliato: l'elenco documenti del servizio di revisione filtra su
+-- parent_index = 0 per topic/sub_topic.
+-- CREATE INDEX idx_review_list ON parent_documents (topic_id, sub_topic_id, parent_index, created_at);
