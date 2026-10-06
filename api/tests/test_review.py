@@ -1,15 +1,15 @@
 """Harness di test del servizio di revisione: SQLite al posto di MySQL,
 Qdrant in memoria, pubblicazione RabbitMQ intercettata.
 
-Uso:  pip install -r review/requirements.txt && python review/tests/test_review.py
+Uso:  pip install -r api/requirements.txt && python api/tests/test_review.py
 """
 import json, os, re, sqlite3, sys, tempfile, pathlib, time
 
 TMP = pathlib.Path(tempfile.mkdtemp())
-os.environ.update(REVIEW_SECRET_KEY="x" * 40, DATA_FOLDER=str(TMP), DOCWS_RICERCA_ENDPOINT="u",
+os.environ.update(REVIEW_SECRET_KEY="x" * 40, API_SECRET_KEY="chiave-chat", DATA_FOLDER=str(TMP), DOCWS_RICERCA_ENDPOINT="u",
                   DOCWS_ATTI_ENDPOINT="u", DOCWS_CODICE_AMMINISTRAZIONE="u", DOCWS_CODICE_AOO="u", RUOLO_DOCWS="u")
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-sys.path[:0] = [str(ROOT / "review" / "src"), str(ROOT)]
+sys.path[:0] = [str(ROOT / "api" / "src"), str(ROOT)]
 
 DB_PATH = str(TMP / "db.sqlite")
 
@@ -92,7 +92,8 @@ proc.mkdir(parents=True)
 (proc / "altro_atto.md").write_text("SBAGLIATO")
 (proc / "altro_atto.json").write_text(json.dumps({"source": "sicraweb://1::atto.pdf", "files": ["atto.pdf"]}))
 
-import review_app as ra
+import app as api_app
+import review_routes as ra
 from qdrant_client import QdrantClient, models
 q = QdrantClient(":memory:")
 q.create_collection("document_chunks", vectors_config=models.VectorParams(size=2, distance=models.Distance.COSINE))
@@ -105,7 +106,16 @@ ra._qdrant = q
 published = []
 ra._publish_to_ingest = lambda rel: published.append(rel)
 
-cl = ra.app.test_client()
+_cl = api_app.app.test_client()
+
+
+class _Prefixed:
+    """Client che antepone /review a ogni percorso."""
+    def __getattr__(self, method):
+        return lambda path, **kw: getattr(_cl, method)("/review" + path, **kw)
+
+
+cl = _Prefixed()
 KEY = dict(source=SRC, topic_id="attiprovincia", sub_topic_id="determine")
 
 
@@ -115,6 +125,9 @@ def check(cond, msg):
 check.failed = False
 
 r = cl.get("/documents"); check(r.status_code == 401, "senza token -> 401")
+check(_cl.post("/config", json={"topic_id": "x"}).status_code == 401, "chat: senza API key resta protetta")
+r = cl.post("/auth/login", json={"username": "mrossi", "password": "x"}, headers={"Authorization": "Bearer chiave-chat"})
+check(r.status_code == 401, "la API key della chat non apre /review")
 r = cl.post("/auth/login", json={"username": "mrossi", "password": "sbagliata"}); check(r.status_code == 401, "password errata -> 401")
 r = cl.post("/auth/login", json={"username": "mrossi", "password": "passwordlunga"}); check(r.status_code == 200, "login")
 H = {"Authorization": "Bearer " + r.json["token"]}

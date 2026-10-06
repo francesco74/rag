@@ -11,8 +11,10 @@ Permette a revisori autenticati di:
     MySQL e sul payload Qdrant, senza ricalcolare gli embedding;
   - marcare lo stato di revisione e consultare lo storico delle modifiche.
 
-È un servizio separato da api/app.py per non toccare il percorso della chat
-e per avere un'autenticazione diversa (utenti con login, non API key).
+Registrato in app.py come blueprint sotto /review: un solo punto di accesso
+al sistema. Le rotte /review/* NON usano la API key della chat ma i token di
+sessione dei revisori (utenti con login, tabella review_users): app.py le
+esclude dal controllo della API key.
 
 Identità di un documento: la terna (source, topic_id, sub_topic_id), la
 stessa usata dall'ingest per l'idempotenza.
@@ -22,6 +24,7 @@ import hashlib
 import json
 import logging
 import mimetypes
+import os
 import pathlib
 import re
 import uuid
@@ -29,24 +32,18 @@ from datetime import datetime
 from functools import wraps
 
 import pika
-from flask import Flask, g, jsonify, request, send_file
-from flask_cors import CORS
+from flask import Blueprint, g, jsonify, request, send_file
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from qdrant_client import QdrantClient, models
 from werkzeug.security import check_password_hash
 
 from common.config import settings
-from common.db_logger import MySQLLogHandler, get_db_connection, init_db_pool
-from review_settings import review_settings
+from common.db_logger import MySQLLogHandler, get_db_connection
 
 # ==============================================================================
 # CONFIGURAZIONE
 # ==============================================================================
 
-logging.basicConfig(
-    level=settings.log_level,
-    format='%(asctime)s - REVIEW - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s',
-)
 log = logging.getLogger("review_api")
 
 QDRANT_COLLECTION = "document_chunks"
@@ -67,17 +64,27 @@ ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 MAX_CONTENT_CHARS = 5_000_000
 REVIEW_STATUSES = {"da_revisionare", "in_revisione", "revisionato"}
 
-app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 12 * 1024 * 1024
-CORS(app, origins=review_settings.allowed_origins, expose_headers=["Content-Disposition"])
+# --- Impostazioni (variabili d'ambiente) ------------------------------------
+# REVIEW_SECRET_KEY firma i token di sessione: con una chiave assente o debole
+# chiunque potrebbe forgiarne uno. Se manca, le rotte /review rispondono 503
+# ma il resto dell'API (chat) continua a funzionare normalmente.
+REVIEW_SECRET_KEY = os.environ.get("REVIEW_SECRET_KEY", "").strip()
+REVIEW_ENABLED = len(REVIEW_SECRET_KEY) >= 32
+SESSION_HOURS = int(os.environ.get("REVIEW_SESSION_HOURS") or 10)
+FILE_TOKEN_MINUTES = int(os.environ.get("REVIEW_FILE_TOKEN_MINUTES") or 30)
 
-init_db_pool()
+bp = Blueprint("review", __name__, url_prefix="/review")
+
 db_handler = MySQLLogHandler()
 db_handler.setLevel(logging.WARNING)
 log.addHandler(db_handler)
 
-_auth_serializer = URLSafeTimedSerializer(review_settings.secret_key, salt="review-auth")
-_file_serializer = URLSafeTimedSerializer(review_settings.secret_key, salt="review-file")
+if REVIEW_ENABLED:
+    _auth_serializer = URLSafeTimedSerializer(REVIEW_SECRET_KEY, salt="review-auth")
+    _file_serializer = URLSafeTimedSerializer(REVIEW_SECRET_KEY, salt="review-file")
+else:
+    _auth_serializer = _file_serializer = None
+    log.error("REVIEW_SECRET_KEY mancante o più corta di 32 caratteri: endpoint /review disabilitati.")
 
 _qdrant = None
 
@@ -97,12 +104,12 @@ class ApiError(Exception):
         self.extra = extra
 
 
-@app.errorhandler(ApiError)
+@bp.errorhandler(ApiError)
 def _handle_api_error(e: ApiError):
     return jsonify({"error": e.message, **e.extra}), e.status
 
 
-@app.errorhandler(Exception)
+@bp.errorhandler(Exception)
 def _handle_unexpected(e):
     from werkzeug.exceptions import HTTPException
     if isinstance(e, HTTPException):
@@ -196,7 +203,7 @@ def require_user(fn):
         if not header.startswith("Bearer "):
             raise ApiError(401, "Autenticazione richiesta")
         try:
-            data = _auth_serializer.loads(header[7:], max_age=review_settings.session_hours * 3600)
+            data = _auth_serializer.loads(header[7:], max_age=SESSION_HOURS * 3600)
         except SignatureExpired:
             raise ApiError(401, "Sessione scaduta, effettua di nuovo l'accesso")
         except BadSignature:
@@ -236,14 +243,16 @@ def _public_user(user):
     }
 
 
-@app.route("/health", methods=["GET"])
-def health():
-    with Db() as db:
-        db.one("SELECT 1 AS ok")
-    return jsonify({"status": "ok"})
+@bp.before_request
+def _check_enabled():
+    if request.method == "OPTIONS":
+        return None
+    if not REVIEW_ENABLED:
+        return jsonify({"error": "Funzione di revisione non configurata (REVIEW_SECRET_KEY)"}), 503
+    return None
 
 
-@app.route("/auth/login", methods=["POST"])
+@bp.route("/auth/login", methods=["POST"])
 def login():
     data = request.get_json(silent=True) or {}
     username = str(data.get("username", "")).strip()
@@ -266,12 +275,12 @@ def login():
     token = _auth_serializer.dumps({"uid": user["id"], "tv": user["token_version"]})
     return jsonify({
         "token": token,
-        "expires_in": review_settings.session_hours * 3600,
+        "expires_in": SESSION_HOURS * 3600,
         "user": _public_user(user),
     })
 
 
-@app.route("/auth/me", methods=["GET"])
+@bp.route("/auth/me", methods=["GET"])
 @require_user
 def me():
     return jsonify({"user": _public_user(g.user)})
@@ -504,7 +513,7 @@ def _set_status(db, source, topic_id, sub_topic_id, status, note=None):
 # ENDPOINT: NAVIGAZIONE
 # ==============================================================================
 
-@app.route("/topics", methods=["GET"])
+@bp.route("/topics", methods=["GET"])
 @require_user
 def list_topics():
     with Db() as db:
@@ -525,7 +534,7 @@ def list_topics():
     })
 
 
-@app.route("/documents", methods=["GET"])
+@bp.route("/documents", methods=["GET"])
 @require_user
 def list_documents():
     topic_id = request.args.get("topic_id", "").strip()
@@ -596,7 +605,7 @@ def list_documents():
     return jsonify({"items": items, "total": total, "page": page, "page_size": page_size})
 
 
-@app.route("/document", methods=["GET"])
+@bp.route("/document", methods=["GET"])
 @require_user
 def get_document():
     source, topic_id, sub_topic_id = _doc_key_from_request()
@@ -610,7 +619,7 @@ def get_document():
     return jsonify(doc)
 
 
-@app.route("/document/file", methods=["GET"])
+@bp.route("/document/file", methods=["GET"])
 def get_document_file():
     """
     Il file originale viene aperto dal browser (iframe/tab), che non può
@@ -619,7 +628,7 @@ def get_document_file():
     """
     token = request.args.get("token", "")
     try:
-        data = _file_serializer.loads(token, max_age=review_settings.file_token_minutes * 60)
+        data = _file_serializer.loads(token, max_age=FILE_TOKEN_MINUTES * 60)
     except SignatureExpired:
         raise ApiError(401, "Link scaduto, ricarica il documento")
     except BadSignature:
@@ -648,7 +657,7 @@ def get_document_file():
     return response
 
 
-@app.route("/document/history", methods=["GET"])
+@bp.route("/document/history", methods=["GET"])
 @require_user
 def get_history():
     source, topic_id, sub_topic_id = _doc_key_from_request()
@@ -675,7 +684,7 @@ def get_history():
     ]})
 
 
-@app.route("/document/history/<int:audit_id>", methods=["GET"])
+@bp.route("/document/history/<int:audit_id>", methods=["GET"])
 @require_user
 def get_history_entry(audit_id):
     with Db() as db:
@@ -714,7 +723,7 @@ def _publish_to_ingest(manifest_rel: str):
         connection.close()
 
 
-@app.route("/document/content", methods=["PUT"])
+@bp.route("/document/content", methods=["PUT"])
 @require_user
 def update_content():
     """
@@ -852,7 +861,7 @@ def _validate_metadata(meta):
     return clean
 
 
-@app.route("/document/metadata", methods=["PUT"])
+@bp.route("/document/metadata", methods=["PUT"])
 @require_user
 def update_metadata():
     """
@@ -932,7 +941,7 @@ def update_metadata():
     return jsonify({"status": "saved", "document": doc})
 
 
-@app.route("/document/status", methods=["PUT"])
+@bp.route("/document/status", methods=["PUT"])
 @require_user
 def update_status():
     data = request.get_json(silent=True) or {}
@@ -965,7 +974,7 @@ def update_status():
 # ENDPOINT: AMMINISTRAZIONE UTENTI
 # ==============================================================================
 
-@app.route("/users", methods=["GET"])
+@bp.route("/users", methods=["GET"])
 @require_admin
 def list_users():
     with Db() as db:
@@ -978,7 +987,3 @@ def list_users():
          "last_login_at": _iso(r["last_login_at"])}
         for r in rows
     ]})
-
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5001, debug=True)

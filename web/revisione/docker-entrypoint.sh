@@ -3,7 +3,7 @@
 # Configurazione a runtime letta da settings.dart
 cat <<EOC > /usr/share/nginx/html/env-config.js
 window.ENV_CONFIG = {
-  REVIEW_API_URL: "${REVIEW_API_URL:-http://localhost:5001}",
+  REVIEW_API_URL: "${REVIEW_API_URL:-http://localhost:5000/review}",
   PROJECT_NAME: "${PROJECT_NAME:-Revisione documenti}"
 };
 EOC

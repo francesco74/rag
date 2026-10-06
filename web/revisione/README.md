@@ -1,6 +1,6 @@
 # Revisione documenti
 
-Servizio backend (`review/`) e interfaccia web (`web/revisione/`) per i revisori che controllano i documenti indicizzati nel RAG. Servono a:
+Endpoint `/review` dell'API (`api/src/review_routes.py`, registrati in `app.py`) e interfaccia web (`web/revisione/`) per i revisori che controllano i documenti indicizzati nel RAG. Servono a:
 
 - cercare i documenti per archivio, serie, stato o testo libero (oggetto, nome file, metadati);
 - vedere **affiancati** il file originale (PDF, immagini) e il testo estratto dall'OCR;
@@ -32,53 +32,49 @@ Comportamenti da conoscere:
 
 Esegui la parte finale di `misc/mysql_schema.sql`, cioè le tabelle `review_users`, `review_status` e `review_audit`. È consigliato anche l'indice commentato su `parent_documents`.
 
-### 2. Backend
+### 2. API
 
-```bash
-docker build -f review/Dockerfile -t rag-review .      # dalla radice del repository
-```
+Gli endpoint sono già dentro `app.py`: non c'è un nuovo servizio da pubblicare. Al pod/container dell'API servono però:
 
-Variabili d'ambiente:
-
-| Variabile | Note |
+| Variabile / risorsa | Note |
 |---|---|
-| `REVIEW_SECRET_KEY` | **Obbligatoria**, almeno 32 caratteri casuali (es. `openssl rand -hex 32`). Firma i token di sessione |
-| `REVIEW_ALLOWED_ORIGINS` | URL del frontend, per il CORS (es. `https://revisione.ente.it`) |
+| `REVIEW_SECRET_KEY` | **Obbligatoria**, almeno 32 caratteri casuali (es. `openssl rand -hex 32`). Firma i token di sessione. Se manca, le rotte `/review` rispondono 503 e la chat continua a funzionare |
+| `ALLOWED_ORIGINS` | Aggiungi l'URL del frontend di revisione, per il CORS |
 | `REVIEW_SESSION_HOURS` | Durata della sessione, default 10 |
 | `REVIEW_FILE_TOKEN_MINUTES` | Validità dei link al file originale, default 30 |
-| `DATA_FOLDER` | **Lo stesso volume** di converter e ingest, montato in lettura/scrittura: servono `processed/`, `watch/` e `ingestion/error/` |
-| `MYSQL_*`, `QDRANT_*`, `BROKER_*` | Gli stessi degli altri servizi |
+| `DATA_FOLDER` + volume | **Novità per l'API:** deve montare lo stesso volume dati di converter e ingest, in lettura/scrittura (servono `processed/`, `watch/` e `ingestion/error/`) |
 
-Il servizio ascolta sulla porta 5001.
+Le rotte `/review/*` non usano `API_SECRET_KEY`: ogni revisore si autentica con le proprie credenziali. Allo stesso modo, la API key della chat non dà accesso alla revisione.
 
 ### 3. Utenti
 
 ```bash
-docker exec -it <container-review> python manage_users.py add mrossi --name "Mario Rossi"
-docker exec -it <container-review> python manage_users.py list
-docker exec -it <container-review> python manage_users.py password mrossi   # chiude le sessioni aperte
-docker exec -it <container-review> python manage_users.py disable mrossi    # chiude le sessioni aperte
+docker exec -it <container-api> python -m utils.manage_review_users add mrossi --name "Mario Rossi"
+docker exec -it <container-api> python -m utils.manage_review_users add admin --role admin
+docker exec -it <container-api> python -m utils.manage_review_users list
+docker exec -it <container-api> python -m utils.manage_review_users password mrossi   # chiude le sessioni aperte
+docker exec -it <container-api> python -m utils.manage_review_users disable mrossi    # chiude le sessioni aperte
 ```
 
 ### 4. Frontend
 
 ```bash
 docker build -t rag-revisione web/revisione
-docker run -e REVIEW_API_URL=https://ia.ente.it/review -e PROJECT_NAME="Revisione documenti" -p 8080:80 rag-revisione
+docker run -e REVIEW_API_URL=https://ia.ente.it/api/review -e PROJECT_NAME="Revisione documenti" -p 8080:80 rag-revisione
 ```
 
 ## Test
 
 ```bash
-pip install -r review/requirements.txt
-python review/tests/test_review.py
+pip install -r api/requirements.txt
+python api/tests/test_review.py
 ```
 
 Il test usa SQLite al posto di MySQL, Qdrant in memoria e intercetta la pubblicazione su RabbitMQ. Copre login, ricerca, lettura del testo e dell'originale, modifica dei metadati, correzione del testo con re-indicizzazione (incluso il caso di errore), stato, storico e invalidazione delle sessioni.
 
 ## API
 
-Tutte le chiamate, tranne `/health`, `/auth/login` e `/document/file`, richiedono `Authorization: Bearer <token>`.
+Tutti i percorsi hanno il prefisso `/review`. Tutte le chiamate, tranne `/auth/login` e `/document/file`, richiedono `Authorization: Bearer <token>`.
 
 | Metodo | Percorso | Descrizione |
 |---|---|---|

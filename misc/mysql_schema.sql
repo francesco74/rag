@@ -213,7 +213,7 @@ CREATE TABLE IF NOT EXISTS boilerplate_phrases (
  
 
 -- =====================================================================
---  SERVIZIO DI REVISIONE (review/)
+--  REVISIONE DOCUMENTALE (api/src/review_routes.py, rotte /review)
 --  Utenti revisori, stato di revisione per documento e storico completo
 --  delle modifiche. Un documento è identificato dalla terna
 --  (source, topic_id, sub_topic_id), come in parent_documents.

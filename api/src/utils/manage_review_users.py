@@ -2,12 +2,12 @@
 Gestione degli utenti revisori da riga di comando.
 
 Esempi (dentro il container del servizio review):
-    python manage_users.py add mrossi --name "Mario Rossi"            # chiede la password
-    python manage_users.py add admin --role admin
-    python manage_users.py password mrossi                           # cambia password, chiude le sessioni
-    python manage_users.py disable mrossi                            # disattiva e chiude le sessioni
-    python manage_users.py enable mrossi
-    python manage_users.py list
+    python -m utils.manage_review_users add mrossi --name "Mario Rossi"            # chiede la password
+    python -m utils.manage_review_users add admin --role admin
+    python -m utils.manage_review_users password mrossi                           # cambia password, chiude le sessioni
+    python -m utils.manage_review_users disable mrossi                            # disattiva e chiude le sessioni
+    python -m utils.manage_review_users enable mrossi
+    python -m utils.manage_review_users list
 """
 
 import argparse

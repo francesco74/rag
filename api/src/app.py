@@ -11,6 +11,7 @@ import json
 from common.db_logger import MySQLLogHandler, get_db_connection, init_db_pool
 
 from common.config import settings
+from review_routes import bp as review_bp
 
 # ==============================================================================
 # CONFIGURATION & LOGGING
@@ -25,6 +26,10 @@ log = logging.getLogger("api_gateway")
 app = Flask(__name__)
 
 CORS(app, origins=settings.allowed_origins)  # Enable CORS for frontend access
+
+# Revisione documentale (frontend web/revisione): rotte sotto /review con
+# autenticazione propria a utenti e password, vedi review_routes.py.
+app.register_blueprint(review_bp)
 
 
 
@@ -45,6 +50,10 @@ except Exception as e:
 
 UNPROTECTED_ROUTES = {"/health"}
 
+# Le rotte di revisione non usano API_SECRET_KEY: ogni revisore si autentica
+# con le proprie credenziali e il blueprint verifica il suo token di sessione.
+SELF_AUTHENTICATED_PREFIXES = ("/review/",)
+
 # ==============================================================================
 # MIDDLEWARE
 # ==============================================================================
@@ -59,7 +68,8 @@ def start_timer_and_add_id():
 
     # --- Authentication ---
     # Skip auth for health checks and when no key is configured (dev mode).
-    if settings.api_secret_key and request.path not in UNPROTECTED_ROUTES:
+    if (settings.api_secret_key and request.path not in UNPROTECTED_ROUTES
+            and not request.path.startswith(SELF_AUTHENTICATED_PREFIXES)):
         auth_header = request.headers.get("Authorization", "")
         if not auth_header.startswith("Bearer ") or auth_header[7:] != settings.api_secret_key:
             log.warning(f"[{request.request_id}] Unauthorized request to {request.path}")

@@ -19,7 +19,6 @@
 !misc/
 !converter/
 !direct/
-!review/
 !web/revisione/
 !web/revisione/src/
 
@@ -39,7 +38,6 @@
 !web/provincia/src/assets/html/**
 !converter/**
 !direct/**
-!review/**
 !web/revisione/**
 
 !web/greenlees/docker-entrypoint.sh
