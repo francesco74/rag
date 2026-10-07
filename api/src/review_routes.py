@@ -14,7 +14,8 @@ Permette a revisori autenticati di:
 Registrato in app.py come blueprint sotto /review: un solo punto di accesso
 al sistema. Le rotte /review/* NON usano la API key della chat ma i token di
 sessione dei revisori (utenti con login, tabella review_users): app.py le
-esclude dal controllo della API key.
+esclude dal controllo della API key. Ogni utente può avere più ruoli e ogni
+endpoint richiede un permesso specifico: vedi review_permissions.py.
 
 Identità di un documento: la terna (source, topic_id, sub_topic_id), la
 stessa usata dall'ingest per l'idempotenza.
@@ -39,6 +40,8 @@ from werkzeug.security import check_password_hash
 
 from common.config import settings
 from common.db_logger import MySQLLogHandler, get_db_connection
+from common.review_permissions import (PERM_METADATA, PERM_READ, PERM_STATUS, PERM_TEXT,
+                                PERM_USERS, ROLE_PERMISSIONS, permissions_for)
 
 # ==============================================================================
 # CONFIGURAZIONE
@@ -196,6 +199,33 @@ def _sha256(text: str) -> str:
 # AUTENTICAZIONE
 # ==============================================================================
 
+def _load_user(db, uid, token_version):
+    """
+    Utente attivo con ruoli e permessi, oppure 401. I ruoli si rileggono a
+    ogni richiesta: una modifica ai ruoli vale subito, senza nuovo login.
+    """
+    user = db.one(
+        "SELECT id, username, display_name, active, token_version "
+        "FROM review_users WHERE id = %s",
+        (uid,),
+    )
+    # token_version permette di invalidare tutte le sessioni di un utente
+    # (cambio password, disattivazione) senza gestire una blacklist.
+    if not user or not user["active"] or user["token_version"] != token_version:
+        raise ApiError(401, "Utente non abilitato")
+    _attach_roles(db, user)
+    return user
+
+
+def _attach_roles(db, user):
+    rows = db.all("SELECT role FROM review_user_roles WHERE user_id = %s", (user["id"],))
+    user["roles"] = sorted(r["role"] for r in rows)
+    unknown = [r for r in user["roles"] if r not in ROLE_PERMISSIONS]
+    if unknown:
+        log.warning(f"Utente '{user['username']}': ruoli sconosciuti ignorati {unknown}")
+    user["permissions"] = permissions_for(user["roles"])
+
+
 def require_user(fn):
     @wraps(fn)
     def wrapper(*args, **kwargs):
@@ -210,28 +240,28 @@ def require_user(fn):
             raise ApiError(401, "Token non valido")
 
         with Db() as db:
-            user = db.one(
-                "SELECT id, username, display_name, role, active, token_version "
-                "FROM review_users WHERE id = %s",
-                (data.get("uid"),),
-            )
-        # token_version permette di invalidare tutte le sessioni di un utente
-        # (cambio password, disattivazione) senza gestire una blacklist.
-        if not user or not user["active"] or user["token_version"] != data.get("tv"):
-            raise ApiError(401, "Utente non abilitato")
-        g.user = user
+            g.user = _load_user(db, data.get("uid"), data.get("tv"))
         return fn(*args, **kwargs)
     return wrapper
 
 
-def require_admin(fn):
-    @wraps(fn)
-    @require_user
-    def wrapper(*args, **kwargs):
-        if g.user["role"] != "admin":
-            raise ApiError(403, "Operazione riservata agli amministratori")
-        return fn(*args, **kwargs)
-    return wrapper
+def _check_permission(user, permission):
+    if permission not in user["permissions"]:
+        log.warning(f"Accesso negato a '{user['username']}' su {request.method} {request.path}: "
+                    f"manca il permesso '{permission}'")
+        raise ApiError(403, "Il tuo profilo non è abilitato a questa operazione")
+
+
+def require_permission(permission):
+    """Autentica l'utente e verifica che i suoi ruoli concedano `permission`."""
+    def decorator(fn):
+        @wraps(fn)
+        @require_user
+        def wrapper(*args, **kwargs):
+            _check_permission(g.user, permission)
+            return fn(*args, **kwargs)
+        return wrapper
+    return decorator
 
 
 def _public_user(user):
@@ -239,7 +269,8 @@ def _public_user(user):
         "id": user["id"],
         "username": user["username"],
         "display_name": user.get("display_name") or user["username"],
-        "role": user["role"],
+        "roles": user["roles"],
+        "permissions": sorted(user["permissions"]),
     }
 
 
@@ -262,13 +293,14 @@ def login():
 
     with Db() as db:
         user = db.one(
-            "SELECT id, username, display_name, role, active, password_hash, token_version "
+            "SELECT id, username, display_name, active, password_hash, token_version "
             "FROM review_users WHERE username = %s",
             (username,),
         )
         if not user or not user["active"] or not check_password_hash(user["password_hash"], password):
             log.warning(f"Login fallito per l'utente '{username}' da {request.remote_addr}")
             raise ApiError(401, "Credenziali non valide")
+        _attach_roles(db, user)
         db.execute("UPDATE review_users SET last_login_at = NOW() WHERE id = %s", (user["id"],))
         db.commit()
 
@@ -284,6 +316,23 @@ def login():
 @require_user
 def me():
     return jsonify({"user": _public_user(g.user)})
+
+
+@bp.route("/auth/logout", methods=["POST"])
+@require_user
+def logout():
+    """
+    Chiude la sessione invalidando il token anche lato server: senza questo
+    un token copiato resterebbe valido fino alla scadenza. Si incrementa
+    token_version, quindi si chiudono tutte le sessioni dell'utente (altre
+    schede o postazioni) e i link ai file originali già rilasciati.
+    """
+    with Db() as db:
+        db.execute("UPDATE review_users SET token_version = token_version + 1 WHERE id = %s",
+                   (g.user["id"],))
+        db.commit()
+    log.info(f"Logout di '{g.user['username']}'.")
+    return jsonify({"status": "logged_out"})
 
 
 # ==============================================================================
@@ -514,7 +563,7 @@ def _set_status(db, source, topic_id, sub_topic_id, status, note=None):
 # ==============================================================================
 
 @bp.route("/topics", methods=["GET"])
-@require_user
+@require_permission(PERM_READ)
 def list_topics():
     with Db() as db:
         topics = db.all("SELECT topic_id, description FROM topics ORDER BY topic_id")
@@ -535,7 +584,7 @@ def list_topics():
 
 
 @bp.route("/documents", methods=["GET"])
-@require_user
+@require_permission(PERM_READ)
 def list_documents():
     topic_id = request.args.get("topic_id", "").strip()
     sub_topic_id = request.args.get("sub_topic_id", "").strip()
@@ -606,14 +655,15 @@ def list_documents():
 
 
 @bp.route("/document", methods=["GET"])
-@require_user
+@require_permission(PERM_READ)
 def get_document():
     source, topic_id, sub_topic_id = _doc_key_from_request()
     with Db() as db:
         doc, _, _ = _load_document(db, source, topic_id, sub_topic_id)
     if doc["original_file"]:
         token = _file_serializer.dumps({
-            "s": source, "t": topic_id, "st": sub_topic_id, "uid": g.user["id"],
+            "s": source, "t": topic_id, "st": sub_topic_id,
+            "uid": g.user["id"], "tv": g.user["token_version"],
         })
         doc["original_file"]["token"] = token
     return jsonify(doc)
@@ -624,7 +674,9 @@ def get_document_file():
     """
     Il file originale viene aperto dal browser (iframe/tab), che non può
     inviare l'header Authorization: si usa un token firmato a breve scadenza
-    rilasciato da GET /document a un utente già autenticato.
+    rilasciato da GET /document a un utente già autenticato. L'utente viene
+    comunque ricontrollato: un link ancora valido non apre il file a chi nel
+    frattempo è stato disattivato o ha perso il permesso di lettura.
     """
     token = request.args.get("token", "")
     try:
@@ -635,6 +687,7 @@ def get_document_file():
         raise ApiError(401, "Link non valido")
 
     with Db() as db:
+        _check_permission(_load_user(db, data.get("uid"), data.get("tv")), PERM_READ)
         row = db.one(
             "SELECT file_name FROM parent_documents WHERE source = %s AND topic_id = %s "
             "AND sub_topic_id = %s AND parent_index = 0 LIMIT 1",
@@ -658,7 +711,7 @@ def get_document_file():
 
 
 @bp.route("/document/history", methods=["GET"])
-@require_user
+@require_permission(PERM_READ)
 def get_history():
     source, topic_id, sub_topic_id = _doc_key_from_request()
     with Db() as db:
@@ -685,7 +738,7 @@ def get_history():
 
 
 @bp.route("/document/history/<int:audit_id>", methods=["GET"])
-@require_user
+@require_permission(PERM_READ)
 def get_history_entry(audit_id):
     with Db() as db:
         r = db.one(
@@ -724,7 +777,7 @@ def _publish_to_ingest(manifest_rel: str):
 
 
 @bp.route("/document/content", methods=["PUT"])
-@require_user
+@require_permission(PERM_TEXT)
 def update_content():
     """
     Salva il testo corretto e chiede all'ingest di re-indicizzare il documento.
@@ -742,6 +795,9 @@ def update_content():
     new_content = data.get("content")
     base_hash = data.get("base_hash")
     note = (data.get("note") or "").strip() or None
+    # "Segna come revisionato" cambia anche lo stato: serve il relativo permesso.
+    if data.get("mark_reviewed"):
+        _check_permission(g.user, PERM_STATUS)
 
     if not isinstance(new_content, str) or not new_content.strip():
         raise ApiError(400, "Il testo non può essere vuoto")
@@ -862,7 +918,7 @@ def _validate_metadata(meta):
 
 
 @bp.route("/document/metadata", methods=["PUT"])
-@require_user
+@require_permission(PERM_METADATA)
 def update_metadata():
     """
     Sostituisce l'insieme dei metadati del documento.
@@ -942,7 +998,7 @@ def update_metadata():
 
 
 @bp.route("/document/status", methods=["PUT"])
-@require_user
+@require_permission(PERM_STATUS)
 def update_status():
     data = request.get_json(silent=True) or {}
     source, topic_id, sub_topic_id = _doc_key_from_request(data)
@@ -975,15 +1031,18 @@ def update_status():
 # ==============================================================================
 
 @bp.route("/users", methods=["GET"])
-@require_admin
+@require_permission(PERM_USERS)
 def list_users():
     with Db() as db:
         rows = db.all(
-            "SELECT id, username, display_name, role, active, created_at, last_login_at "
+            "SELECT id, username, display_name, active, created_at, last_login_at "
             "FROM review_users ORDER BY username"
         )
+        roles = {}
+        for r in db.all("SELECT user_id, role FROM review_user_roles ORDER BY role"):
+            roles.setdefault(r["user_id"], []).append(r["role"])
     return jsonify({"items": [
         {**r, "active": bool(r["active"]), "created_at": _iso(r["created_at"]),
-         "last_login_at": _iso(r["last_login_at"])}
+         "last_login_at": _iso(r["last_login_at"]), "roles": roles.get(r["id"], [])}
         for r in rows
     ]})

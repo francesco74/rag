@@ -15,6 +15,7 @@ class ApiException implements Exception {
   final List<String> details;
 
   bool get isUnauthorized => statusCode == 401;
+  bool get isForbidden => statusCode == 403;
   bool get isConflict => statusCode == 409;
 
   @override
@@ -22,17 +23,32 @@ class ApiException implements Exception {
       details.isEmpty ? message : '$message\n• ${details.join('\n• ')}';
 }
 
+/// Permessi concessi dai ruoli (vedi api/src/review_permissions.py).
+/// L'interfaccia decide cosa mostrare in base ai permessi, mai ai nomi dei
+/// ruoli: il backend li verifica comunque su ogni richiesta.
+abstract final class Permission {
+  static const read = 'documenti.lettura';
+  static const editText = 'documenti.testo';
+  static const editMetadata = 'documenti.metadati';
+  static const changeStatus = 'documenti.stato';
+  static const manageUsers = 'utenti.gestione';
+}
+
 class ReviewUser {
   ReviewUser.fromJson(Map<String, dynamic> j)
       : id = j['id'] as int,
         username = j['username'] as String,
         displayName = (j['display_name'] ?? j['username']) as String,
-        role = j['role'] as String;
+        roles = List<String>.from(j['roles'] as List? ?? const []),
+        permissions = Set<String>.from(j['permissions'] as List? ?? const []);
 
   final int id;
   final String username;
   final String displayName;
-  final String role;
+  final List<String> roles;
+  final Set<String> permissions;
+
+  bool can(String permission) => permissions.contains(permission);
 }
 
 class SubTopic {
@@ -234,7 +250,20 @@ class ReviewApi {
     currentUser.value = ReviewUser.fromJson(res['user'] as Map<String, dynamic>);
   }
 
-  void logout() => _clearSession();
+  /// Chiude la sessione: il server invalida il token, poi lo si rimuove dal
+  /// browser. Anche se il server non risponde l'utente esce comunque.
+  Future<void> logout() async {
+    try {
+      if (_token != null) await _request('POST', '/auth/logout');
+    } catch (_) {
+      // Server irraggiungibile o token già scaduto: si esce lo stesso.
+    } finally {
+      _clearSession();
+    }
+  }
+
+  /// Vero se l'utente corrente ha il permesso indicato.
+  bool can(String permission) => currentUser.value?.can(permission) ?? false;
 
   void _clearSession() {
     _token = null;

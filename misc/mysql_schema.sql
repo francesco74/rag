@@ -223,7 +223,6 @@ CREATE TABLE IF NOT EXISTS review_users (
     id             INT AUTO_INCREMENT PRIMARY KEY,
     username       VARCHAR(100) NOT NULL,
     display_name   VARCHAR(255),
-    role           ENUM('revisore', 'admin') NOT NULL DEFAULT 'revisore',
     password_hash  VARCHAR(255) NOT NULL,
     active         BOOLEAN      NOT NULL DEFAULT TRUE,
     -- Incrementato a ogni cambio password/disattivazione: invalida i token
@@ -232,6 +231,18 @@ CREATE TABLE IF NOT EXISTS review_users (
     created_at     TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
     last_login_at  TIMESTAMP    NULL DEFAULT NULL,
     UNIQUE KEY uq_username (username)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+-- Ruoli degli utenti di revisione: un utente può averne più d'uno. I nomi
+-- dei ruoli e i permessi che concedono sono definiti in
+-- api/src/review_permissions.py (VARCHAR e non ENUM: un nuovo ruolo non
+-- richiede di modificare lo schema).
+CREATE TABLE IF NOT EXISTS review_user_roles (
+    user_id  INT         NOT NULL,
+    role     VARCHAR(50) NOT NULL,
+    PRIMARY KEY (user_id, role),
+    CONSTRAINT fk_review_user_roles_user FOREIGN KEY (user_id)
+        REFERENCES review_users (id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
 CREATE TABLE IF NOT EXISTS review_status (

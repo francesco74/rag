@@ -59,8 +59,9 @@ CREATE TABLE parent_documents (id TEXT PRIMARY KEY, topic_id TEXT, sub_topic_id 
   file_name TEXT, parent_index INT, content TEXT, metadata TEXT,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE review_users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE, display_name TEXT,
-  role TEXT DEFAULT 'revisore', password_hash TEXT, active INT DEFAULT 1, token_version INT DEFAULT 1,
+  password_hash TEXT, active INT DEFAULT 1, token_version INT DEFAULT 1,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, last_login_at TIMESTAMP);
+CREATE TABLE review_user_roles (user_id INT, role TEXT, PRIMARY KEY(user_id, role));
 CREATE TABLE review_status (source TEXT, topic_id TEXT, sub_topic_id TEXT, status TEXT, note TEXT,
   updated_by TEXT, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(source, topic_id, sub_topic_id));
 CREATE TABLE review_audit (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -70,8 +71,17 @@ INSERT INTO topics VALUES ('attiprovincia', 'Atti');
 INSERT INTO sub_topics VALUES ('attiprovincia', 'determine', 'Determine');
 """)
 from werkzeug.security import generate_password_hash
-c.execute("INSERT INTO review_users (username, password_hash) VALUES ('mrossi', ?)",
-          (generate_password_hash("passwordlunga"),))
+USERS = {  # username -> ruoli
+    "mrossi": ["revisore"],
+    "lettore1": ["lettore"],
+    "multi": ["correttore", "validatore"],   # più ruoli: testo e stato, non metadati
+    "admin1": ["admin"],
+    "senzaruoli": [],
+}
+for i, (username, roles) in enumerate(USERS.items(), start=1):
+    c.execute("INSERT INTO review_users (id, username, password_hash) VALUES (?, ?, ?)",
+              (i, username, generate_password_hash("passwordlunga")))
+    c.executemany("INSERT INTO review_user_roles (user_id, role) VALUES (?, ?)", [(i, r) for r in roles])
 # Documento Sicr@Web: md = <stemManifest>_<stemFile>.md accanto al pdf
 meta = {"oggetto": "Affidamento lavori strada", "anno": "2024", "data": "2024-03-01", "numero": "12"}
 SRC = "sicraweb://999::atto.pdf"
@@ -131,6 +141,13 @@ check(r.status_code == 401, "la API key della chat non apre /review")
 r = cl.post("/auth/login", json={"username": "mrossi", "password": "sbagliata"}); check(r.status_code == 401, "password errata -> 401")
 r = cl.post("/auth/login", json={"username": "mrossi", "password": "passwordlunga"}); check(r.status_code == 200, "login")
 H = {"Authorization": "Bearer " + r.json["token"]}
+check(r.json["user"]["roles"] == ["revisore"] and "documenti.testo" in r.json["user"]["permissions"]
+      and "utenti.gestione" not in r.json["user"]["permissions"], "login restituisce ruoli e permessi")
+
+
+def login(username):
+    r = cl.post("/auth/login", json={"username": username, "password": "passwordlunga"})
+    return {"Authorization": "Bearer " + r.json["token"]}, r.json["user"]
 
 r = cl.get("/topics", headers=H); check(r.json["topics"][0]["sub_topics"][0]["id"] == "determine", "topics")
 r = cl.get("/documents?topic_id=attiprovincia", headers=H)
@@ -210,6 +227,59 @@ h = cl.get("/document/history", headers=H, query_string=KEY).json["items"]
 check([i["action"] for i in h] == ["status", "content", "metadata"], f"storico {[i['action'] for i in h]}")
 e = cl.get(f"/document/history/{h[1]['id']}", headers=H).json
 check(e["old_value"] != e["new_value"] and "errore" in e["new_value"], "voce di storico con prima/dopo")
+
+# --- ruoli e permessi ---
+check(cl.get("/users", headers=H).status_code == 403, "revisore: /users -> 403")
+HA, _ = login("admin1")
+u = {i["username"]: i["roles"] for i in cl.get("/users", headers=HA).json["items"]}
+check(u["multi"] == ["correttore", "validatore"] and u["senzaruoli"] == [], "admin: /users con i ruoli")
+
+HL, ul = login("lettore1")
+check(ul["permissions"] == ["documenti.lettura"], "lettore: solo lettura")
+check(cl.get("/documents", headers=HL).status_code == 200, "lettore: elenco documenti")
+dl = cl.get("/document", headers=HL, query_string=KEY).json
+check(cl.get("/document/history", headers=HL, query_string=KEY).status_code == 200, "lettore: storico")
+check(cl.put("/document/content", headers=HL, json={**KEY, "content": "x", "base_hash": dl["content_hash"]}).status_code == 403,
+      "lettore: correzione testo -> 403")
+check(cl.put("/document/metadata", headers=HL, json={**KEY, "metadata": dl["metadata"]}).status_code == 403,
+      "lettore: metadati -> 403")
+check(cl.put("/document/status", headers=HL, json={**KEY, "status": "in_revisione"}).status_code == 403,
+      "lettore: stato -> 403")
+
+HM, um = login("multi")
+check(um["permissions"] == ["documenti.lettura", "documenti.stato", "documenti.testo"], f"più ruoli: unione dei permessi {um['permissions']}")
+check(cl.put("/document/status", headers=HM, json={**KEY, "status": "in_revisione"}).status_code == 200, "più ruoli: stato consentito")
+check(cl.put("/document/metadata", headers=HM, json={**KEY, "metadata": dl["metadata"]}).status_code == 403,
+      "più ruoli: metadati -> 403")
+
+cn.execute("DELETE FROM review_user_roles WHERE user_id = 3 AND role = 'validatore'"); cn.commit()
+check(cl.put("/document/status", headers=HM, json={**KEY, "status": "revisionato"}).status_code == 403,
+      "ruolo revocato: vale subito, senza nuovo login")
+r = cl.put("/document/content", headers=HM, json={**KEY, "content": "testo nuovo", "base_hash": dl["content_hash"], "mark_reviewed": True})
+check(r.status_code == 403, "correttore senza stato: 'segna come revisionato' -> 403")
+check(len(published) == 1, "nessuna re-indicizzazione avviata dalle richieste rifiutate")
+
+HN, un = login("senzaruoli")
+check(un["permissions"] == [] and cl.get("/auth/me", headers=HN).status_code == 200, "senza ruoli: login e /auth/me")
+check(cl.get("/topics", headers=HN).status_code == 403, "senza ruoli: /topics -> 403")
+
+file_token = dl["original_file"]["token"]
+check(cl.get("/document/file", query_string={"token": file_token}).status_code == 200, "lettore: file originale")
+cn.execute("DELETE FROM review_user_roles WHERE user_id = 2"); cn.commit()
+check(cl.get("/document/file", query_string={"token": file_token}).status_code == 403,
+      "link al file non più valido per chi perde la lettura")
+
+# --- logout ---
+file_token = cl.get("/document", headers=HA, query_string=KEY).json["original_file"]["token"]
+HA2, _ = login("admin1")  # seconda sessione dello stesso utente
+check(cl.post("/auth/logout", headers=HA).status_code == 200, "logout")
+check(cl.get("/auth/me", headers=HA).status_code == 401, "dopo il logout il token non vale più")
+check(cl.get("/auth/me", headers=HA2).status_code == 401, "il logout chiude anche le altre sessioni dell'utente")
+check(cl.get("/document/file", query_string={"token": file_token}).status_code == 401, "dopo il logout il link al file non vale più")
+check(cl.post("/auth/logout").status_code == 401, "logout senza token -> 401")
+HA, _ = login("admin1")
+check(cl.get("/auth/me", headers=HA).status_code == 200, "nuovo login dopo il logout")
+check(cl.get("/topics", headers=H).status_code == 200, "il logout non tocca le sessioni degli altri utenti")
 
 # --- disattivazione utente invalida il token ---
 cn.execute("UPDATE review_users SET active=0, token_version=token_version+1"); cn.commit()

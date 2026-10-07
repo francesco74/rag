@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'api.dart';
 import 'screens/documents_screen.dart';
 import 'screens/login_screen.dart';
+import 'screens/no_access_screen.dart';
 import 'settings.dart';
 
 void main() {
@@ -27,7 +28,8 @@ class ReviewApp extends StatelessWidget {
   }
 }
 
-/// Mostra il login o l'elenco documenti a seconda della sessione.
+/// Mostra il login, l'elenco documenti o l'avviso di accesso non abilitato
+/// a seconda della sessione e dei permessi dell'utente.
 class _SessionGate extends StatefulWidget {
   const _SessionGate();
 
@@ -57,6 +59,7 @@ class _SessionGateState extends State<_SessionGate> {
               });
               return const LoginScreen();
             }
+            if (!user.can(Permission.read)) return NoAccessScreen(user: user);
             return const DocumentsScreen();
           },
         );

@@ -8,6 +8,7 @@ import '../widgets/history_panel.dart';
 import '../widgets/metadata_editor.dart';
 import '../widgets/original_viewer.dart';
 import '../widgets/text_editor.dart';
+import '../widgets/user_menu.dart';
 
 class DocumentScreen extends StatefulWidget {
   const DocumentScreen({super.key, required this.docKey, this.initialTitle});
@@ -30,6 +31,12 @@ class _DocumentScreenState extends State<DocumentScreen> {
   bool _metaDirty = false;
   int _historyToken = 0;
   Timer? _poll;
+
+  // Le funzioni non concesse dai ruoli restano visibili in sola lettura;
+  // il backend rifiuta comunque le richieste senza il permesso.
+  bool get _canEditText => _api.can(Permission.editText);
+  bool get _canEditMetadata => _api.can(Permission.editMetadata);
+  bool get _canChangeStatus => _api.can(Permission.changeStatus);
 
   bool get _textDirty => _doc != null && _text.text != _doc!.content;
   bool get _dirty => _textDirty || _metaDirty;
@@ -106,7 +113,7 @@ class _DocumentScreenState extends State<DocumentScreen> {
         _text.text,
         baseHash: doc.contentHash,
         note: note,
-        markReviewed: _markReviewed,
+        markReviewed: _markReviewed && _canChangeStatus,
       );
       if (!mounted) return;
       setState(() {
@@ -236,6 +243,7 @@ class _DocumentScreenState extends State<DocumentScreen> {
                 _load();
               },
             ),
+            UserMenu(confirmLogout: () async => !_dirty || await _confirmDiscard()),
             const SizedBox(width: 8),
           ],
         ),
@@ -245,6 +253,15 @@ class _DocumentScreenState extends State<DocumentScreen> {
   }
 
   Widget _statusMenu(ReviewDocument doc) {
+    if (!_canChangeStatus) {
+      return Tooltip(
+        message: 'Il tuo profilo non permette di cambiare lo stato',
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 8),
+          child: StatusChip(doc.status),
+        ),
+      );
+    }
     return PopupMenuButton<String>(
       tooltip: 'Cambia stato di revisione',
       onSelected: _changeStatus,
@@ -339,9 +356,11 @@ class _DocumentScreenState extends State<DocumentScreen> {
       );
 
   Widget _tabs(ReviewDocument doc, {required bool includeOriginal}) {
-    final locked = doc.reindex?.isPending == true
-        ? 'Re-indicizzazione in corso: i metadati saranno modificabili al termine.'
-        : null;
+    final locked = !_canEditMetadata
+        ? 'Il tuo profilo non permette di modificare i metadati.'
+        : doc.reindex?.isPending == true
+            ? 'Re-indicizzazione in corso: i metadati saranno modificabili al termine.'
+            : null;
     return DefaultTabController(
       length: includeOriginal ? 4 : 3,
       child: Column(children: [
@@ -383,8 +402,20 @@ class _DocumentScreenState extends State<DocumentScreen> {
   Widget _textTab() {
     final theme = Theme.of(context);
     return Column(children: [
-      Expanded(child: OcrTextEditor(controller: _text)),
+      Expanded(
+          child: OcrTextEditor(controller: _text, readOnly: !_canEditText)),
       const Divider(height: 1),
+      if (!_canEditText)
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+          child: Row(children: [
+            Icon(Icons.lock_outline, size: 18, color: theme.colorScheme.outline),
+            const SizedBox(width: 8),
+            const Expanded(
+                child: Text('Sola lettura: il tuo profilo non permette di correggere il testo.')),
+          ]),
+        )
+      else
       Padding(
         padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
         child: Wrap(
@@ -396,13 +427,14 @@ class _DocumentScreenState extends State<DocumentScreen> {
             if (_textDirty)
               Text('Modifiche non salvate',
                   style: TextStyle(color: theme.colorScheme.tertiary)),
-            Row(mainAxisSize: MainAxisSize.min, children: [
-              Checkbox(
-                value: _markReviewed,
-                onChanged: (v) => setState(() => _markReviewed = v ?? false),
-              ),
-              const Text('Segna come revisionato'),
-            ]),
+            if (_canChangeStatus)
+              Row(mainAxisSize: MainAxisSize.min, children: [
+                Checkbox(
+                  value: _markReviewed,
+                  onChanged: (v) => setState(() => _markReviewed = v ?? false),
+                ),
+                const Text('Segna come revisionato'),
+              ]),
             TextButton(
               onPressed: _textDirty && !_savingText
                   ? () => setState(() => _text.text = _doc!.content)

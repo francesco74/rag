@@ -1,9 +1,16 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import 'formatted_editor.dart';
+import 'markdown_view.dart';
+
 /// Editor del testo OCR con barra Trova/Sostituisci: gli errori di
 /// riconoscimento tendono a ripetersi (stessa parola sbagliata in più punti),
 /// quindi "sostituisci tutto" fa risparmiare molto tempo.
+///
+/// Se il testo è in Markdown si apre nella vista "Formattato" (titoli,
+/// tabelle, elenchi formattati), modificabile un blocco alla volta; la vista
+/// "Sorgente" mostra il Markdown grezzo e serve per Trova e sostituisci.
 class OcrTextEditor extends StatefulWidget {
   const OcrTextEditor({
     super.key,
@@ -27,6 +34,8 @@ class _OcrTextEditorState extends State<OcrTextEditor> {
   bool _matchCase = false;
   List<int> _matches = const [];
   int _current = -1;
+  late bool _isMarkdown = looksLikeMarkdown(widget.controller.text);
+  late bool _readable = _isMarkdown;
 
   @override
   void initState() {
@@ -56,10 +65,18 @@ class _OcrTextEditorState extends State<OcrTextEditor> {
   String? _lastText;
   void _onTextChanged() {
     final text = widget.controller.text;
+    // Un documento riconosciuto come Markdown resta tale: la vista non deve
+    // cambiare sotto le mani di chi sta modificando (es. cancellando l'unico
+    // titolo). Un testo grezzo che diventa Markdown offre la vista
+    // formattata ma non ci passa da solo.
+    if (!_isMarkdown && text != _lastText && looksLikeMarkdown(text)) {
+      setState(() => _isMarkdown = true);
+    }
     if (_showFind && text != _lastText) {
       _lastText = text;
       _computeMatches(keepPosition: true);
     }
+    _lastText = text;
   }
 
   void _computeMatches({bool keepPosition = false}) {
@@ -143,7 +160,11 @@ class _OcrTextEditorState extends State<OcrTextEditor> {
   }
 
   void _toggleFind([bool? show]) {
-    setState(() => _showFind = show ?? !_showFind);
+    setState(() {
+      _showFind = show ?? !_showFind;
+      // Trova e sostituisci lavora sul testo sorgente.
+      if (_showFind) _readable = false;
+    });
     if (_showFind) {
       final sel = widget.controller.selection;
       if (sel.isValid && !sel.isCollapsed && sel.end - sel.start < 100) {
@@ -177,30 +198,59 @@ class _OcrTextEditorState extends State<OcrTextEditor> {
           color: theme.colorScheme.surfaceContainer,
           child: Padding(
             padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-            child: Row(children: [
-              TextButton.icon(
-                onPressed: () => _toggleFind(),
-                icon: const Icon(Icons.find_replace, size: 18),
-                label: const Text('Trova e sostituisci'),
-              ),
-              const Spacer(),
-              ListenableBuilder(
-                listenable: widget.controller,
-                builder: (_, _) {
-                  final text = widget.controller.text;
-                  final words =
-                      RegExp(r'\S+').allMatches(text).length;
-                  return Text('$words parole · ${text.length} caratteri',
-                      style: theme.textTheme.bodySmall);
-                },
-              ),
-            ]),
+            // Nel pannello affiancato all'originale lo spazio è poco: sotto
+            // una certa larghezza i pulsanti mostrano solo l'icona.
+            child: LayoutBuilder(builder: (context, constraints) {
+              final compact = constraints.maxWidth < 700;
+              final tiny = constraints.maxWidth < 420;
+              return Row(children: [
+                compact
+                    ? IconButton(
+                        tooltip: 'Trova e sostituisci',
+                        onPressed: () => _toggleFind(),
+                        icon: const Icon(Icons.find_replace, size: 20),
+                      )
+                    : TextButton.icon(
+                        onPressed: () => _toggleFind(),
+                        icon: const Icon(Icons.find_replace, size: 18),
+                        label: const Text('Trova e sostituisci'),
+                      ),
+                if (_isMarkdown) ...[
+                  const SizedBox(width: 8),
+                  _viewSelector(showLabels: !tiny),
+                ],
+                const SizedBox(width: 8),
+                Expanded(
+                  child: ListenableBuilder(
+                    listenable: widget.controller,
+                    builder: (_, _) {
+                      final text = widget.controller.text;
+                      final words = RegExp(r'\S+').allMatches(text).length;
+                      return Text(
+                        compact
+                            ? '$words parole'
+                            : '$words parole · ${text.length} caratteri',
+                        style: theme.textTheme.bodySmall,
+                        overflow: TextOverflow.ellipsis,
+                        textAlign: TextAlign.end,
+                      );
+                    },
+                  ),
+                ),
+              ]);
+            }),
           ),
         ),
         if (_showFind) _findBar(theme),
+        if (_readable && !widget.readOnly) _formattedHint(theme),
         const Divider(height: 1),
         Expanded(
-          child: TextField(
+          child: _readable
+              ? FormattedEditor(
+                  controller: widget.controller,
+                  readOnly: widget.readOnly,
+                )
+              : TextField(
             controller: widget.controller,
             focusNode: _textFocus,
             readOnly: widget.readOnly,
@@ -218,6 +268,58 @@ class _OcrTextEditorState extends State<OcrTextEditor> {
           ),
         ),
       ]),
+    );
+  }
+
+  /// Selettore tra vista formattata e sorgente Markdown.
+  Widget _viewSelector({bool showLabels = true}) {
+    return SegmentedButton<bool>(
+      showSelectedIcon: false,
+      style: const ButtonStyle(visualDensity: VisualDensity.compact),
+      segments: [
+        ButtonSegment(
+          value: true,
+          icon: const Icon(Icons.article_outlined, size: 18),
+          label: showLabels ? const Text('Formattato') : null,
+          tooltip: widget.readOnly
+              ? 'Testo formattato, più facile da leggere'
+              : 'Testo formattato: clicca un paragrafo o una tabella per modificarlo',
+        ),
+        ButtonSegment(
+          value: false,
+          icon: const Icon(Icons.code, size: 18),
+          label: showLabels ? const Text('Sorgente') : null,
+          tooltip: 'Testo Markdown originale',
+        ),
+      ],
+      selected: {_readable},
+      onSelectionChanged: (v) => setState(() {
+        _readable = v.first;
+        if (_readable) _showFind = false;
+      }),
+    );
+  }
+
+  /// Nella vista formattata chi può modificare vede come farlo.
+  Widget _formattedHint(ThemeData theme) {
+    return Material(
+      color: theme.colorScheme.secondaryContainer,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+        child: Row(children: [
+          Icon(Icons.edit_outlined,
+              size: 18, color: theme.colorScheme.onSecondaryContainer),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              'Clicca un paragrafo, un titolo o una tabella per modificarlo. '
+              'Esc o un clic fuori per chiudere.',
+              style: theme.textTheme.bodySmall
+                  ?.copyWith(color: theme.colorScheme.onSecondaryContainer),
+            ),
+          ),
+        ]),
+      ),
     );
   }
 

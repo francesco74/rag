@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import '../api.dart';
 import '../settings.dart';
 import '../widgets/common.dart';
+import '../widgets/user_menu.dart';
 import 'document_screen.dart';
 
 class DocumentsScreen extends StatefulWidget {
@@ -96,27 +97,11 @@ class _DocumentsScreenState extends State<DocumentsScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final user = _api.currentUser.value;
     return Scaffold(
       appBar: AppBar(
         title: Text(AppSettings.projectName),
         actions: [
-          if (user != null)
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 8),
-              child: Center(
-                child: Row(children: [
-                  const Icon(Icons.person_outline, size: 18),
-                  const SizedBox(width: 4),
-                  Text(user.displayName),
-                ]),
-              ),
-            ),
-          IconButton(
-            tooltip: 'Esci',
-            icon: const Icon(Icons.logout),
-            onPressed: _api.logout,
-          ),
+          const UserMenu(),
           const SizedBox(width: 8),
         ],
       ),
