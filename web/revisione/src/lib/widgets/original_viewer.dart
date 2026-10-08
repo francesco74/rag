@@ -34,7 +34,7 @@ class OriginalViewer extends StatelessWidget {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final f = file;
-    if (f == null || f.token == null) {
+    if (f == null) {
       return _placeholder(
         theme,
         Icons.hide_source_outlined,
@@ -58,12 +58,12 @@ class OriginalViewer extends StatelessWidget {
           IconButton(
             tooltip: 'Apri in una nuova scheda',
             icon: const Icon(Icons.open_in_new, size: 18),
-            onPressed: () => web.window.open(f.url()!, '_blank'),
+            onPressed: () => web.window.open(f.url(), '_blank'),
           ),
           IconButton(
             tooltip: 'Scarica',
             icon: const Icon(Icons.download_outlined, size: 18),
-            onPressed: () => web.window.open(f.url(download: true)!, '_blank'),
+            onPressed: () => web.window.open(f.url(download: true), '_blank'),
           ),
         ]),
       ),
@@ -73,7 +73,7 @@ class OriginalViewer extends StatelessWidget {
       header,
       Expanded(
         child: f.previewable
-            ? HtmlElementView(viewType: _register(f.url()!))
+            ? HtmlElementView(viewType: _register(f.url()))
             : _placeholder(
                 theme,
                 Icons.insert_drive_file_outlined,

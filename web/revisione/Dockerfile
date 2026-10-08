@@ -9,7 +9,9 @@ RUN flutter pub get
 # Copy the rest of the source code
 COPY src .
 
-# Build the web app, passing Docker ARGs to Dart's --dart-define
+# Il percorso sotto cui l'app è pubblicata (<base href>) non si fissa qui:
+# lo imposta docker-entrypoint.sh all'avvio dalla variabile BASE_HREF, così
+# la stessa immagine funziona sotto qualunque percorso.
 RUN flutter clean
 RUN flutter build web --release
 

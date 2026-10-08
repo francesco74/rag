@@ -25,7 +25,10 @@
       `description` text NOT NULL,
       `created_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP,
       `aliases` text,
-      `prompt` varchar(100) DEFAULT NULL
+      `prompt` varchar(100) DEFAULT NULL,
+      -- Documenti originali scaricabili da chiunque (TRUE) o solo da utenti
+      -- autenticati e abilitati all'archivio (FALSE), vedi api/src/files_routes.py
+      `public_access` BOOLEAN NOT NULL DEFAULT FALSE
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
     CREATE TABLE IF NOT EXISTS `sub_topics` (
@@ -71,7 +74,9 @@
         metadata JSON,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-        INDEX idx_search (source, topic_id, sub_topic_id)
+        INDEX idx_search (source, topic_id, sub_topic_id),
+        -- Download dei documenti: /files/<topic>/<sub_topic>/<file_name>
+        INDEX idx_file (topic_id, sub_topic_id, file_name)
     );
 
     -- Tabella metriche per il RAG: una riga per ogni task processato da process_rag_query.
@@ -242,6 +247,16 @@ CREATE TABLE IF NOT EXISTS review_user_roles (
     role     VARCHAR(50) NOT NULL,
     PRIMARY KEY (user_id, role),
     CONSTRAINT fk_review_user_roles_user FOREIGN KEY (user_id)
+        REFERENCES review_users (id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+-- Archivi (topic) su cui ogni utente di revisione può lavorare. Chi ha il
+-- permesso topic.tutti (ruolo admin) li vede tutti senza assegnazione.
+CREATE TABLE IF NOT EXISTS review_user_topics (
+    user_id   INT          NOT NULL,
+    topic_id  VARCHAR(255) NOT NULL,
+    PRIMARY KEY (user_id, topic_id),
+    CONSTRAINT fk_review_user_topics_user FOREIGN KEY (user_id)
         REFERENCES review_users (id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 

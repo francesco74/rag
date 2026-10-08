@@ -15,8 +15,12 @@ PERM_TEXT = "documenti.testo"          # correzione del testo e re-indicizzazion
 PERM_METADATA = "documenti.metadati"   # modifica dei metadati
 PERM_STATUS = "documenti.stato"        # cambio dello stato di revisione
 PERM_USERS = "utenti.gestione"         # amministrazione degli utenti
+# Accesso a tutti gli archivi (topic) senza assegnazione. Gli altri utenti
+# lavorano solo sui topic assegnati (tabella review_user_topics).
+PERM_ALL_TOPICS = "topic.tutti"
 
-ALL_PERMISSIONS = frozenset({PERM_READ, PERM_TEXT, PERM_METADATA, PERM_STATUS, PERM_USERS})
+ALL_PERMISSIONS = frozenset({PERM_READ, PERM_TEXT, PERM_METADATA, PERM_STATUS, PERM_USERS,
+                             PERM_ALL_TOPICS})
 
 ROLE_PERMISSIONS = {
     "lettore": frozenset({PERM_READ}),

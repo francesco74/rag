@@ -975,7 +975,8 @@ def _subquery_quotas(group_scores: list, total_budget: int, task_id: str = "UNKN
                 quotas[i] = min(cap, quotas[i] + excess * share)
 
     quotas = [int(q) for q in quotas]
-    log.debug(f"[{task_id}] [ALLOC] Quote per sottoquery: {quotas} (floor={floor_ratio}, cap={cap_ratio}).")
+    log.debug(f"[{task_id}] [ALLOC] Quote per sottoquery: {quotas} (floor={floor_ratio}, cap={cap_ratio}, "
+              f"rilevanza '{settings.context_score_source}': {[round(g, 3) for g in group_scores]}).")
     return quotas
 
 
@@ -1292,6 +1293,69 @@ def render_parent_window(content: str, core_spans: list, budget: int, task_id: s
     return result
 
 
+# Campi data da cui si ricava "Date:" nell'header, in ordine di priorità
+# (gli stessi indicizzati come DATETIME su Qdrant, vedi setup_qdrant.py).
+_DATE_KEYS = ("data", "data_pubblicazione", "data_esecutivita")
+# Intestazioni di sezione del MarkdownHeaderTextSplitter: proprie del singolo
+# parent, non del documento.
+_HEADER_KEY_RE = re.compile(r"^Header \d+$")
+
+
+def document_context_metadata(raw_metadata):
+    """
+    Dai metadati di un parent (JSON salvato in MySQL) ricava:
+      - la data del documento per "Date:" nell'header;
+      - i metadati del documento da mostrare al generatore: tutti, esclusi le
+        chiavi di sistema, le intestazioni "Header N", i campi con "_"
+        iniziale (uso interno), i campi tecnici di CONTEXT_METADATA_EXCLUDE,
+        i valori vuoti e il campo già mostrato come "Date:".
+    Ritorna (data, metadati).
+    """
+    if not raw_metadata:
+        return None, {}
+    try:
+        meta = raw_metadata if isinstance(raw_metadata, dict) else json.loads(raw_metadata)
+    except (json.JSONDecodeError, TypeError):
+        return None, {}
+    if not isinstance(meta, dict):
+        return None, {}
+
+    date_key = next((k for k in _DATE_KEYS if meta.get(k)), None)
+    doc_date = meta.get(date_key) if date_key else None
+    if not settings.context_metadata:
+        return doc_date, {}
+
+    shown = {}
+    for key, value in meta.items():
+        if (key == date_key
+                or key in settings.protected_keys
+                or key in settings.context_metadata_exclude
+                or key.startswith("_")
+                or _HEADER_KEY_RE.match(key)):
+            continue
+        if value is None or value == [] or (isinstance(value, str) and not value.strip()):
+            continue
+        shown[key] = value
+    return doc_date, shown
+
+
+def format_document_metadata(metadata: dict) -> str:
+    """
+    Riga dei metadati del documento per il contesto, es.
+    "Metadati del documento: numero: 375 | oggetto: Affidamento lavori...".
+    Nomi resi leggibili (underscore -> spazio), valori lunghi accorciati.
+    """
+    limit = settings.context_metadata_max_value_chars
+    parts = []
+    for key, value in metadata.items():
+        text = ", ".join(str(v) for v in value) if isinstance(value, list) else str(value)
+        text = " ".join(text.split())
+        if len(text) > limit:
+            text = text[:limit - 1].rstrip() + "…"
+        parts.append(f"{key.replace('_', ' ')}: {text}")
+    return ("Metadati del documento: " + " | ".join(parts) + "\n") if parts else ""
+
+
 def build_context(rich_context, task_id="UNKNOWN"):
     """
     Assembla il contesto testuale per il generatore e restituisce
@@ -1308,7 +1372,7 @@ def build_context(rich_context, task_id="UNKNOWN"):
     # --- 1. header: costruiti PRIMA, così il loro costo è sottratto dal budget
     # invece di sforare silenziosamente come accadeva prima (il vecchio codice
     # contava gli header solo nel break finale, non nel budget per parent).
-    headers = []
+    base_parts = []
     for idx, item in enumerate(rich_context, start=1):
         parts = [str(idx)]
         if item.get("sub_topic"):
@@ -1318,7 +1382,34 @@ def build_context(rich_context, task_id="UNKNOWN"):
         if item.get("retrieved_by"):
             parts.append(f"Rif. ricerca: {'; '.join(item['retrieved_by'])}")
         parts.append(f"Date: {item.get('date') or 'unknown'}")
-        headers.append("[" + " | ".join(parts) + "]\n")
+        base_parts.append(parts)
+
+    # Metadati del documento (oggetto, numero, ufficio...): una volta per
+    # documento, sul suo primo passaggio; gli altri passaggi dello stesso
+    # documento li richiamano con "Stesso documento di: N". Un parent dal
+    # centro di un atto non contiene né numero né oggetto: senza questa riga
+    # il modello non saprebbe a quale atto appartiene.
+    meta_lines = [format_document_metadata(item.get("metadata") or {}) for item in rich_context]
+
+    def doc_key(pos, item):
+        return item.get("source") or f"_senza_source_{pos}"
+
+    def make_header(pos, same_as=None):
+        if not settings.context_metadata:
+            same_as = None  # funzione spenta: header identico a prima
+        parts = base_parts[pos] + ([f"Stesso documento di: {same_as}"] if same_as else [])
+        header = "[" + " | ".join(parts) + "]\n"
+        return header if same_as else header + meta_lines[pos]
+
+    # Stima per il budget: metadati sul primo passaggio di ogni documento. Se
+    # quel passaggio verrà escluso, i metadati passano al successivo incluso
+    # (vedi rendering): lo scarto è piccolo e l'hard cap resta il limite vero.
+    planned = {}
+    headers = []
+    for pos, (idx, item) in enumerate(enumerate(rich_context, start=1)):
+        key = doc_key(pos, item)
+        headers.append(make_header(pos, same_as=planned.get(key)))
+        planned.setdefault(key, idx)
 
     header_cost = sum(len(h) for h in headers) + 2 * n_parents  # "\n\n" tra i blocchi
     budget = max(1000, settings.max_context_chars - header_cost)
@@ -1340,6 +1431,10 @@ def build_context(rich_context, task_id="UNKNOWN"):
     index_to_item = {}
     curr_len = 0
     hard_cap = settings.context_hard_cap_chars
+    # Documento -> numero del passaggio INCLUSO che ne porta i metadati: il
+    # rimando "Stesso documento di" punta sempre a un passaggio presente.
+    shown_docs = {}
+    meta_chars = 0
 
     for pos, (idx, item) in enumerate(enumerate(rich_context, start=1)):
         content = item.get("content", "")
@@ -1349,7 +1444,8 @@ def build_context(rich_context, task_id="UNKNOWN"):
             continue
 
         rendered = render_parent_window(content, item.get("_core_spans", []), item_budget, task_id=task_id)
-        chunk = f"{headers[pos]}{rendered}\n\n"
+        key = doc_key(pos, item)
+        chunk = f"{make_header(pos, same_as=shown_docs.get(key))}{rendered}\n\n"
 
         if curr_len + len(chunk) > hard_cap:
             log.warning(
@@ -1361,6 +1457,9 @@ def build_context(rich_context, task_id="UNKNOWN"):
         formatted_chunks.append(chunk)
         curr_len += len(chunk)
         index_to_item[idx] = item
+        if key not in shown_docs:
+            shown_docs[key] = idx
+            meta_chars += len(meta_lines[pos])
         # Caratteri REALMENTE finiti nel contesto per questo parent, header
         # incluso: è l'unico numero che serve per capire come il budget è stato
         # speso davvero. Va registrato qui perché dopo il windowing il dato non
@@ -1383,14 +1482,16 @@ def build_context(rich_context, task_id="UNKNOWN"):
     log.info(
         f"[{task_id}] [ALLOC] Contesto: {len(index_to_item)}/{n_parents} parent, "
         f"{curr_len} chars (budget {settings.max_context_chars}, tetto {alloc_stats.get('ceiling')}, "
-        f"hard cap {hard_cap}). Ripartizione per sottoquery: "
+        f"hard cap {hard_cap}), {len(shown_docs)} documenti, metadati {meta_chars} chars. "
+        f"Ripartizione per sottoquery: "
         + " | ".join(
             f"#{q}({v['parents']} parent, {v['chars']} chars)"
             for q, v in sorted(per_query.items())
         )
     )
 
-    stats = {**alloc_stats, "context_chars": curr_len, "n_parents_in_context": len(index_to_item)}
+    stats = {**alloc_stats, "context_chars": curr_len, "n_parents_in_context": len(index_to_item),
+             "n_documents_in_context": len(shown_docs), "metadata_chars": meta_chars}
     return "".join(formatted_chunks), index_to_item, stats
 
 
@@ -1813,17 +1914,99 @@ def setup_periodic_tasks(sender, **kwargs):
 # ==============================================================================
 # 7. DOCUMENT RETRIEVAL (With OPTIMIZED Reranking)
 # ==============================================================================
+
+# Gruppi di parole chiave combinati al massimo (i più rari): 2^6 - 1 = 63 conteggi.
+KEYWORD_MAX_GROUPS = 6
+
+
+def build_keyword_groups(keywords, concepts=None):
+    """
+    Raggruppa le parole chiave per la ricerca testuale a combinazioni.
+
+    Gli alias di uno stesso concetto del dizionario sono ALTERNATIVE, non
+    requisiti: "Barga" è un comune della Garfagnana, e un pezzo che cita sia
+    "Garfagnana" sia "Barga" non è più pertinente di uno che cita solo
+    "Barga" (tipicamente è un DUP che elenca tutti i comuni). Ogni concetto
+    diventa quindi UN gruppo in OR (nome + alias); ogni altra parola chiave è
+    un gruppo a sé. Le parole chiave che coincidono con il nome o un alias di
+    un concetto confluiscono nel suo gruppo.
+
+    Ritorna [{"label", "terms", "geo"}], con i termini in minuscolo.
+    """
+    groups, by_term = [], {}
+    for c in concepts or []:
+        name = (c.get("concept") or "").strip()
+        terms = [t for t in dict.fromkeys([name.lower()] + [a.lower().strip() for a in c.get("aliases", [])])
+                 if len(t) > 2]
+        if not terms or any(t in by_term for t in terms):
+            continue
+        group = {"label": name or terms[0], "terms": terms, "geo": c.get("category") == "geografico"}
+        groups.append(group)
+        for t in terms:
+            by_term[t] = group
+    for k in keywords or []:
+        w = (k or "").lower().strip()
+        if len(w) <= 2 or w in by_term:
+            continue
+        group = {"label": w, "terms": [w], "geo": False}
+        groups.append(group)
+        by_term[w] = group
+    return groups
+
+
+def plan_keyword_combinations(n_groups, count_fn, max_hits, max_workers=8):
+    """
+    Conta i pezzi di ogni combinazione in AND dei gruppi (indici 0..n-1) e
+    sceglie quelle da usare.
+
+    Livello per livello, dalle singole alle combinazioni più ampie; una
+    combinazione che contiene una sotto-combinazione a zero risultati è zero
+    anch'essa e non si conta. count_fn(tuple_di_indici) -> int, o None se il
+    conteggio fallisce (la combinazione si scarta).
+
+    Ritorna (usate, counts):
+      - usate: [(combinazione, conteggio)] con 0 < conteggio <= max_hits,
+        prima i livelli più alti (più gruppi in AND), poi le più rare;
+        se nessuna è sotto soglia, la sola combinazione più ampia e più rara
+        (ripiego: la più specifica disponibile);
+      - counts: tutti i conteggi calcolati, per il log.
+    """
+    from itertools import combinations
+    counts = {}
+    for level in range(1, n_groups + 1):
+        todo = [combo for combo in combinations(range(n_groups), level)
+                if all(counts.get(sub) for sub in combinations(combo, level - 1))] if level > 1 \
+            else [(i,) for i in range(n_groups)]
+        if not todo:
+            break
+        with ThreadPoolExecutor(max_workers=min(max_workers, len(todo))) as pool:
+            for combo, n in zip(todo, pool.map(count_fn, todo)):
+                counts[combo] = n or 0
+    found = [(combo, n) for combo, n in counts.items() if n > 0]
+    found.sort(key=lambda item: (-len(item[0]), item[1]))
+    used = [(combo, n) for combo, n in found if n <= max_hits]
+    if not used and found:
+        used = found[:1]
+    return used, counts
+
 def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_sub_topics,
                      metadata_filters, include_undated=True,
                      semantic_size=None, semantic_threshold=None, mmr_lambda=1.0,
                      exclude_parent_ids=None,
                      query_semantic_vector=None,
+                     rerank_size=None,
+                     concepts=None,
                      task_id="UNKNOWN"):
     """
     Recupera, fonde e riordina i chunk dal Vector DB in modo sicuro.
 
+    concepts: concetti del dizionario trovati per la domanda; nella ricerca
+        testuale i loro alias valgono come alternative (vedi build_keyword_groups).
+
     semantic_size / semantic_threshold: sovrascrivono i default di settings, usati
         dai profili di retry per allargare progressivamente la recall.
+    rerank_size: passaggi tenuti dopo il rerank per ogni sotto-domanda; default
+        settings.rerank_size, settings.rerank_max_size con la ricerca approfondita.
     mmr_lambda: peso rilevanza/diversità nella redistribuzione degli slot liberi.
         1.0 = comportamento identico a prima dell'introduzione di MMR.
     exclude_parent_ids: set di parent_id da escludere del tutto dalla selezione
@@ -1846,6 +2029,7 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
     )
 
     semantic_size = semantic_size or settings.qdrant_semantic_size
+    rerank_size = rerank_size or settings.rerank_size
     semantic_threshold = semantic_threshold if semantic_threshold is not None else settings.qdrant_semantic_threshold
 
     # I vettori dei chunk servono SOLO a costruire i centroid-per-parent usati
@@ -1860,6 +2044,7 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
     log.info(f"=== Inizio Retrieval per topic '{topic_id}' ===")
     log.info(
         f"[{task_id}] [RETRIEVAL_PARAMS] semantic_size={semantic_size}, "
+        f"rerank_size={rerank_size}, "
         f"semantic_threshold={semantic_threshold:.3f}, mmr_lambda={mmr_lambda}, "
         f"with_vectors={needs_vectors}."
     )
@@ -1966,48 +2151,120 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
                 return []
             
         def safe_keyword_search():
-            if not keywords: return []
-            try:
-                clean_kw = [w.lower().strip() for w in keywords if len(w.strip()) > 2]
-                if not clean_kw: return []
+            """
+            Ricerca testuale a COMBINAZIONI di parole chiave.
 
-                should_cond = [models.FieldCondition(key="content", match=models.MatchText(text=w)) for w in clean_kw]
+            Lo scroll di Qdrant non ordina per pertinenza: dentro un filtro
+            restituisce i punti in ordine di id (UUID casuali). L'ordine lo
+            danno quindi le combinazioni:
+              1. parole chiave e concetti diventano gruppi (alias di un
+                 concetto in OR, vedi build_keyword_groups);
+              2. si conta ogni combinazione in AND dei gruppi (pochi ms l'una,
+                 indice testuale su "content");
+              3. si riempiono i posti prima con le combinazioni con più gruppi,
+                 poi, a parità, con le più rare. Una combinazione con più di
+                 KEYWORD_MAX_HITS pezzi è troppo generica (ne uscirebbe un
+                 campione a caso) e si salta: "lavori" da sola no, "lavori +
+                 scuole + versilia" sì. Se nessuna è sotto soglia, si usa la più
+                 specifica;
+              4. in una combinazione con un concetto geografico i posti si
+                 dividono fra i comuni, perché uno solo non li prenda tutti.
+            """
+            groups = build_keyword_groups(keywords, concepts)
+            if not groups:
+                return []
+            try:
                 target_size = settings.qdrant_syntactic_size
+
+                def term_cond(term):
+                    return models.FieldCondition(key="content", match=models.MatchText(text=term))
+
+                def group_cond(group):
+                    if len(group["terms"]) == 1:
+                        return term_cond(group["terms"][0])
+                    return models.Filter(should=[term_cond(t) for t in group["terms"]])
+
+                def count_combo(combo):
+                    try:
+                        return qdrant_client.count(
+                            collection_name=QDRANT_COLLECTION,
+                            count_filter=models.Filter(must=must_conditions + [group_cond(groups[i]) for i in combo]),
+                            exact=True,
+                        ).count
+                    except Exception as e:
+                        log.warning(f"Conteggio parole chiave {[groups[i]['label'] for i in combo]} fallito: {e}")
+                        return None
+
+                # I gruppi più rari, al massimo KEYWORD_MAX_GROUPS
+                single = {i: count_combo((i,)) for i in range(len(groups))}
+                kept = sorted((i for i in single if single[i]), key=lambda i: single[i])[:KEYWORD_MAX_GROUPS]
+                dropped = [groups[i]["label"] for i in single if i not in kept]
+                groups = [groups[i] for i in kept]
+                if not groups:
+                    log.info(f"[{task_id}] [KEYWORD] Nessun risultato per le parole chiave: {', '.join(dropped)}")
+                    return []
+
+                used, counts = plan_keyword_combinations(len(groups), count_combo, settings.keyword_max_hits)
+                label = lambda combo: " + ".join(groups[i]["label"] for i in combo)
+                too_wide = sum(1 for n in counts.values() if n > settings.keyword_max_hits)
+                groups_str = ", ".join(f"{g['label']}({counts[(i,)]})" for i, g in enumerate(groups))
+                log.info(
+                    f"[{task_id}] [KEYWORD] Gruppi: {groups_str}"
+                    + (f" | senza risultati o oltre {KEYWORD_MAX_GROUPS} gruppi: {', '.join(dropped)}" if dropped else "")
+                )
+                log.info(
+                    f"[{task_id}] [KEYWORD] Combinazioni usate, in ordine: "
+                    f"{', '.join(f'{label(c)}({n})' for c, n in used) or 'nessuna'}"
+                    f" | troppo generiche (> {settings.keyword_max_hits}): {too_wide}"
+                )
 
                 seen_hashes: set = set()
                 unique_hits = []
-                next_offset = None
-                max_scroll_iterations = 5  # safety: evita loop infiniti se il corpus è quasi tutto duplicato
-                iterations = 0
 
-                while len(unique_hits) < target_size and iterations < max_scroll_iterations:
-                    log.debug(f"Scroll {iterations} di {max_scroll_iterations}")
+                def scroll_into(conds, limit):
+                    """Aggiunge fino a `limit` pezzi nuovi (senza duplicati) che soddisfano conds."""
+                    added, next_offset, iterations = 0, None, 0
+                    while added < limit and len(unique_hits) < target_size and iterations < 5:
+                        res, next_offset = qdrant_client.scroll(
+                            collection_name=QDRANT_COLLECTION,
+                            scroll_filter=models.Filter(must=must_conditions + conds),
+                            limit=target_size * 2,  # batch ampio per compensare i duplicati scartati
+                            offset=next_offset,
+                            with_payload=True,
+                            with_vectors=needs_vectors  # centroid-per-parent: solo se MMR è attivo
+                        )
+                        iterations += 1
+                        if not res:
+                            break
+                        for point in res:
+                            h = point.payload.get("content_hash") if point.payload else None
+                            if h and h not in seen_hashes:
+                                seen_hashes.add(h)
+                                unique_hits.append(point)
+                                added += 1
+                                if added >= limit or len(unique_hits) >= target_size:
+                                    break
+                        if next_offset is None:
+                            break
+                    return added
 
-                    res, next_offset = qdrant_client.scroll(
-                        collection_name=QDRANT_COLLECTION,
-                        scroll_filter=models.Filter(must=must_conditions + [models.Filter(should=should_cond)]),
-                        limit=target_size * 2,  # batch ampio per compensare i duplicati scartati
-                        offset=next_offset,
-                        with_payload=True,
-                        with_vectors=needs_vectors  # centroid-per-parent: solo se MMR è attivo
-                    )
-                    iterations += 1
-
-                    if not res:
+                for combo, _ in used:
+                    if len(unique_hits) >= target_size:
                         break
+                    before = len(unique_hits)
+                    geo = next((i for i in combo if groups[i]["geo"] and len(groups[i]["terms"]) > 1), None)
+                    if geo is None:
+                        scroll_into([group_cond(groups[i]) for i in combo], target_size)
+                    else:
+                        # Posti divisi fra i luoghi del concetto geografico
+                        others = [group_cond(groups[i]) for i in combo if i != geo]
+                        places = groups[geo]["terms"]
+                        share = max(1, math.ceil((target_size - len(unique_hits)) / len(places)))
+                        for term in places:
+                            scroll_into(others + [term_cond(term)], share)
+                    log.debug(f"[{task_id}] [KEYWORD] '{label(combo)}': +{len(unique_hits) - before} pezzi.")
 
-                    for point in res:
-                        h = point.payload.get("content_hash") if point.payload else None
-                        if h and h not in seen_hashes:
-                            seen_hashes.add(h)
-                            unique_hits.append(point)
-                            if len(unique_hits) >= target_size:
-                                break
-
-                    if next_offset is None:
-                        break  # esauriti i punti nella collection per questo filtro
-
-                log.debug(f"Keyword search returned {len(unique_hits)} unique hits (deduped, {iterations} scroll iterations).")
+                log.debug(f"Keyword search returned {len(unique_hits)} unique hits (deduped).")
                 return unique_hits
             except Exception as e:
                 log.error(f"Keyword search failed: {e}")
@@ -2049,6 +2306,13 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
         pool = get_reranker_pool()
         n_queries = len(search_queries)
         top_chunks_per_query: list[list] = [[] for _ in range(n_queries)]
+
+        # Giudizio del reranker su ogni chunk, come probabilità 0..1, per
+        # sottoquery: lo stesso chunk può valere diversamente per domande
+        # diverse. Usato come rilevanza dei parent (quote di contesto, MMR,
+        # ordine dei core) al posto della similarità vettoriale di Qdrant,
+        # che varia poco tra un chunk e l'altro e non coglie la pertinenza.
+        rerank_probs: dict[tuple[int, str], float] = {}
 
         def process_single_rerank(q_idx, query_str, candidates):
             if not candidates:
@@ -2108,10 +2372,12 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
                     reranked = reranker_instance.rerank(query_str, docs_content)
                     reranked.sort(key=lambda x: x.score, reverse=True)
                     top_chunks = []
-                    for res in reranked[:settings.rerank_size]:
+                    for res in reranked[:rerank_size]:
                         prob = safe_sigmoid(res.score)
                         if prob >= settings.min_prob_threshold or len(top_chunks) < 2:
-                            top_chunks.append(unique_candidates[res.index])
+                            chunk = unique_candidates[res.index]
+                            top_chunks.append(chunk)
+                            rerank_probs[(q_idx, str(chunk.id))] = prob
                         else:
                             break
                     return top_chunks
@@ -2119,7 +2385,7 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
                     log.error(f"Reranker failed for query #{q_idx}: {e}. Fallback.")
                     
             unique_candidates.sort(key=lambda x: getattr(x, 'score', 0), reverse=True)
-            return unique_candidates[:settings.rerank_size]
+            return unique_candidates[:rerank_size]
         
         max_workers = min(n_queries, settings.max_reranker_thread)
         
@@ -2154,6 +2420,11 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
         # che se lo aggiudica in quota): serve per l'header del contesto, dove
         # dichiariamo al modello la PROVENIENZA della ricerca.
         parent_retrieved_by: dict[str, set] = {}
+        n_score_fallback = 0  # chunk senza giudizio del reranker (vedi sotto)
+        # Miglior probabilità del reranker per parent e sottoquery che l'ha
+        # data: serve ai posti extra per pertinenza (passo 5ter), sempre
+        # calcolata qualunque sia CONTEXT_SCORE_SOURCE.
+        parent_rerank_best: dict[str, tuple[float, int]] = {}
         # NEW: fino a SNIPPETS_PER_PARENT child (contenuto + score) per parent,
         # usati da generate_answer per il windowing invece del troncamento cieco.
         parent_top_snippets: dict[str, list] = {}
@@ -2170,7 +2441,19 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
                     excluded_count += 1
                     continue
                 parent_retrieved_by.setdefault(pid, set()).add(q_idx)
-                score = getattr(chunk, "score", 0.0) or 0.0
+                vector_score = getattr(chunk, "score", 0.0) or 0.0
+                rerank_prob = rerank_probs.get((q_idx, str(chunk.id)))
+                if rerank_prob is not None and rerank_prob > parent_rerank_best.get(pid, (-1.0, 0))[0]:
+                    parent_rerank_best[pid] = (rerank_prob, q_idx)
+                if settings.context_score_source == "rerank":
+                    # Se il reranker non era disponibile (fallback) si usa la
+                    # similarità vettoriale: stessa scala 0..1, nessun buco.
+                    score = rerank_probs.get((q_idx, str(chunk.id)))
+                    if score is None:
+                        score = vector_score
+                        n_score_fallback += 1
+                else:
+                    score = vector_score
                 if pid not in parent_best_score or score > parent_best_score[pid]:
                     parent_best_score[pid] = score
 
@@ -2193,6 +2476,13 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
                     })
                     snippets.sort(key=lambda s: s["score"], reverse=True)
                     del snippets[SNIPPETS_PER_PARENT:]
+
+        log.debug(
+            f"[{task_id}] [SCORE] Rilevanza dei parent da '{settings.context_score_source}'"
+            + (f" ({n_score_fallback} chunk senza giudizio del reranker: similarità vettoriale)"
+               if n_score_fallback else "")
+            + f". Migliori: {sorted((round(v, 3) for v in parent_best_score.values()), reverse=True)[:8]}"
+        )
 
         if exclude_parent_ids:
             log.info(f"[{task_id}] [EXCLUDE] {excluded_count} chunk scartati (parent già usati in tentativi precedenti: {len(exclude_parent_ids)}).")
@@ -2364,16 +2654,53 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
             n_mmr_penalized = sum(1 for d in mmr_debug if d["penalized"])
  
         # ==========================================================
+        # 5ter. POSTI EXTRA PER PERTINENZA
+        #
+        # La quota (PARENTS_PER_QUERY × sottoquery) dipende da quante
+        # sottoquery ha prodotto il rewriter, non da quanti documenti
+        # pertinenti esistono: con una sola sottoquery si prendevano 4
+        # parent anche se il reranker ne giudicava pertinenti 8, e una
+        # domanda "quali atti..." riceveva un elenco incompleto.
+        # Si aggiungono quindi i parent non ancora scelti con probabilità
+        # del reranker >= EXTRA_PARENTS_MIN_PROB, dal più pertinente, fino
+        # al tetto MAX_SUB_QUERIES × PARENTS_PER_QUERY: lo stesso numero di
+        # documenti a cui può arrivare la ricerca più ampia. Ogni extra va
+        # alla sottoquery che lo ha giudicato meglio (quote di contesto).
+        # ==========================================================
+        n_extra_parents = 0
+        max_total_parents = settings.max_sub_queries * settings.parents_per_query
+        if settings.extra_parents and len(already_selected) < max_total_parents:
+            extra_candidates = sorted(
+                ((prob, pid, q) for pid, (prob, q) in parent_rerank_best.items()
+                 if pid not in already_selected and prob >= settings.extra_parents_min_prob),
+                reverse=True,
+            )
+            room = max_total_parents - len(already_selected)
+            for prob, pid, q in extra_candidates[:room]:
+                quota_per_query[q].append(pid)
+                already_selected.add(pid)
+                n_extra_parents += 1
+            if n_extra_parents or extra_candidates:
+                log.info(
+                    f"[{task_id}] [EXTRA] {n_extra_parents} parent aggiunti per pertinenza "
+                    f"(probabilità >= {settings.extra_parents_min_prob}, candidati {len(extra_candidates)}, "
+                    f"tetto {max_total_parents}): "
+                    f"{[round(p, 3) for p, _, _ in extra_candidates[:room]]}"
+                )
+
+        # ==========================================================
         # 5bis. STATISTICHE DI RETRIEVAL (per la tabella rag_metrics)
         # ==========================================================
         retrieval_stats = {
             "semantic_size": semantic_size,
+            "rerank_size": rerank_size,
             "semantic_threshold": round(semantic_threshold, 4),
             "mmr_lambda": mmr_lambda,
             "n_parent_candidates": len(parent_best_score),
             "n_mmr_candidates": n_mmr_candidates,
             "n_mmr_penalized": n_mmr_penalized,
             "n_parents_selected": len(already_selected),
+            "n_extra_parents": n_extra_parents,
         }
 
         # ==========================================================
@@ -2412,7 +2739,8 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
  
         log.info(
             f"Pool finale: {len(final_parent_ids_ordered)} parent distinti "
-            f"(budget={settings.parents_per_query}×{n_queries}={total_budget})."
+            f"(budget={settings.parents_per_query}×{n_queries}={total_budget}"
+            f"{f', +{n_extra_parents} per pertinenza' if n_extra_parents else ''})."
         )
  
  
@@ -2465,22 +2793,9 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
             sub_topic_id = p_doc.get("sub_topic_id", "")
             content = p_doc.get("content", "").strip()
 
-            # Estrae la data rilevata dal documento (se presente) dal JSON di
-            # metadata salvato in MySQL. Priorità: "data" > "data_pubblicazione"
-            # > "data_esecutivita" (stessi campi indicizzati come DATETIME su
-            # Qdrant, vedi setup_qdrant.py).
-            doc_date = None
-            raw_metadata = p_doc.get("metadata")
-            if raw_metadata:
-                try:
-                    meta = raw_metadata if isinstance(raw_metadata, dict) else json.loads(raw_metadata)
-                    doc_date = (
-                        meta.get("data")
-                        or meta.get("data_pubblicazione")
-                        or meta.get("data_esecutivita")
-                    )
-                except (json.JSONDecodeError, TypeError, AttributeError) as e:
-                    log.debug(f"Metadata non parsabile per parent_id={p_doc.get('id')}: {e}")
+            # Data del documento (per "Date:") e metadati da mostrare al
+            # generatore, dal JSON dei metadati salvato in MySQL.
+            doc_date, doc_metadata = document_context_metadata(p_doc.get("metadata"))
 
             if content:
                 pid = p_doc.get("id")
@@ -2500,6 +2815,7 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
                     "content": content,
                     "source": source,
                     "date": doc_date,
+                    "metadata": doc_metadata,
                     "file_name": file_name,
                     "sub_topic": sub_topic_id,
                     "matched_snippets": matched_snippets,
@@ -2642,6 +2958,62 @@ def get_concepts_by_similarity(query_vector, threshold=settings.qdrant_concept_t
         return []
 
 
+
+def get_concepts_by_name(text, task_id="UNKNOWN"):
+    """
+    Concetti il cui NOME compare letteralmente nel testo (parola intera, senza
+    distinzione di maiuscole): "atti sulle scuole della Versilia" -> Versilia.
+
+    Il confronto per similarità (get_concepts_by_similarity) misura il
+    significato dell'intera frase: una domanda che cita la Versilia insieme ad
+    atti, lavori, anni e magari ai turni precedenti della conversazione resta
+    sotto soglia anche se il nome del concetto c'è, scritto tale e quale. Qui
+    il nome basta. Gli alias NON fanno scattare il concetto: "scuole di
+    Viareggio" non deve allargarsi a tutti i comuni della Versilia.
+
+    Il dizionario è piccolo (decine di voci): si legge tutto a ogni domanda.
+    Lista vuota su errore, mai eccezioni.
+    """
+    if not qdrant_client or not text:
+        return []
+    try:
+        lowered = text.lower()
+        found, offset = [], None
+        while True:
+            points, offset = qdrant_client.scroll(
+                collection_name=CONCEPT_COLLECTION, limit=256, offset=offset,
+                with_payload=True, with_vectors=False)
+            for point in points:
+                payload = point.payload or {}
+                name = (payload.get("concept") or "").strip()
+                if name and re.search(r"(?<!\w)" + re.escape(name.lower()) + r"(?!\w)", lowered):
+                    found.append({
+                        "concept": name,
+                        "aliases": payload.get("aliases", []),
+                        "category": payload.get("category", ""),
+                        "score": 1.0,
+                    })
+            if offset is None:
+                break
+        if found:
+            log.info(f"[{task_id}] [CONCEPT NAME] Concetti citati per nome: {', '.join(c['concept'] for c in found)}")
+        return found
+    except Exception as e:
+        log.error(f"[{task_id}] Errore lookup dei concetti per nome: {e}")
+        return []
+
+
+def find_concepts(query, concept_vector, task_id="UNKNOWN"):
+    """
+    Concetti del dizionario per la domanda: prima quelli citati per nome nella
+    domanda corrente (sicuri), poi quelli trovati per similarità sul vettore
+    di lookup (domanda + ultimi turni), senza doppioni.
+    """
+    by_name = get_concepts_by_name(query, task_id=task_id)
+    by_similarity = get_concepts_by_similarity(concept_vector, task_id=task_id) if concept_vector is not None else []
+    names = {c["concept"] for c in by_name}
+    return by_name + [c for c in by_similarity if c["concept"] not in names]
+
 def log_automatic_negative_feedback(query, answer, topic_id, history, task_id="UNKNOWN"):
     """
     Salva automaticamente nel database le query che non hanno trovato risposte
@@ -2734,11 +3106,20 @@ def log_rag_metrics(task_id, topic_id, query, cache_hit, is_satisfactory,
 # ==============================================================================
 
 @celery_app.task(bind=True, name="rag_queue")
-def process_rag_query(self, query, history, topic_id, selected_sub_topics=None, metadata_filters=None, include_undated=True):
+def process_rag_query(self, query, history, topic_id, selected_sub_topics=None, metadata_filters=None,
+                      include_undated=True, deep_search=False):
     """Main RAG processing pipeline: JSON Mode, Multi-Query, and Defensive Error Handling."""
     start_time = time.time()
     task_id = self.request.id
     log.info(f"[{task_id}] Task started: '{query[:50]}...' su topic: {topic_id}")
+
+    # Ricerca approfondita (opzione della chat): più passaggi per sotto-domanda.
+    # max(): se RERANK_SIZE fosse configurata più alta, l'opzione non deve ridurla.
+    rerank_size = (max(settings.rerank_size, settings.rerank_max_size)
+                   if deep_search else settings.rerank_size)
+    if deep_search:
+        log.info(f"[{task_id}] Ricerca approfondita: rerank_size={rerank_size} "
+                 f"(normale: {settings.rerank_size})")
 
     # Accumula, per ciascun tentativo di retrieval, i parametri usati e le stats
     # ritornate da retrieve_chunks. Alla fine viene salvato in rag_metrics
@@ -2770,6 +3151,9 @@ def process_rag_query(self, query, history, topic_id, selected_sub_topics=None, 
     # rewriter, e i concetti trovati vengono passati come vocabolario
     # autoritativo dentro l'unica chiamata LLM che decide tutto)
     # ==========================================================
+    # Concetti dell'ultimo giro di riformulazione: servono anche alla ricerca
+    # testuale (alias in alternativa, vedi build_keyword_groups).
+    active_concepts = []
     try:
         # 1. Lookup concettuale sul testo grezzo (ultimi turni + query corrente):
         #    nomi di zone e concetti tecnici sono quasi sempre espliciti, quindi
@@ -2789,13 +3173,16 @@ def process_rag_query(self, query, history, topic_id, selected_sub_topics=None, 
             # perché il contesto conversazionale aiuta ad agganciare i concetti
             # su domande di follow-up brevi ("e quelle del 2024?").
             concept_vector = embed_for_semantic_query(lookup_text)
-            verified_concepts = get_concepts_by_similarity(concept_vector, task_id=task_id)
+            verified_concepts = find_concepts(query, concept_vector, task_id=task_id)
         except Exception as ce:
             log.warning(f"[{task_id}] Lookup concettuale fallito ({ce}): il rewriter procede senza concetti verificati.")
+            # L'embedding può fallire (rete, quota): i concetti citati per nome restano validi
+            verified_concepts = get_concepts_by_name(query, task_id=task_id)
 
         # 2. Unica chiamata: rewrite + decomposizione + espansione insieme,
         #    con i concetti verificati come dato di fatto nel prompt.
         rewritten_data = transform_query(history, query, task_id, verified_concepts=verified_concepts)
+        active_concepts = verified_concepts
 
         standalone_query = rewritten_data.get("standalone_query", query)
         primary_vector = embed_query(standalone_query)
@@ -2827,7 +3214,14 @@ def process_rag_query(self, query, history, topic_id, selected_sub_topics=None, 
     # SEMANTIC CACHE CHECK
     # ==========================================================
     try:
-        filters_key = generate_filters_key({**(metadata_filters or {}), "_include_undated": include_undated})
+        # La ricerca approfondita ha la sua voce in cache (una risposta normale
+        # non deve servirla). Solo se attiva: le chiavi delle ricerche normali
+        # restano quelle di prima e la cache esistente resta valida.
+        filters_key = generate_filters_key({
+            **(metadata_filters or {}),
+            "_include_undated": include_undated,
+            **({"_deep_search": True} if deep_search else {}),
+        })
 
         cached = check_semantic_cache(primary_vector, topic_id, st_key, filters_key)
         if cached:
@@ -2861,6 +3255,8 @@ def process_rag_query(self, query, history, topic_id, selected_sub_topics=None, 
             metadata_filters,
             include_undated,
             query_semantic_vector=concept_vector,
+            rerank_size=rerank_size,
+            concepts=active_concepts,
             task_id=task_id,
             **profile_kwargs(0, task_id=task_id)
         )
@@ -2980,11 +3376,13 @@ def process_rag_query(self, query, history, topic_id, selected_sub_topics=None, 
                     retry_concept_vector = None
                     try:
                         retry_concept_vector = embed_for_semantic_query(lookup_text)
-                        retry_concepts = get_concepts_by_similarity(retry_concept_vector, task_id=f"{task_id}-RETRY")
+                        retry_concepts = find_concepts(query, retry_concept_vector, task_id=f"{task_id}-RETRY")
                     except Exception as ce:
                         log.warning(f"[{task_id}-RETRY] Lookup concettuale fallito ({ce}): retry senza concetti verificati.")
+                        retry_concepts = get_concepts_by_name(query, task_id=f"{task_id}-RETRY")
 
                     retry_data = transform_query(retry_history, query, f"{task_id}-RETRY", verified_concepts=retry_concepts)
+                    active_concepts = retry_concepts
                     
                     standalone_query = retry_data.get("standalone_query", query)
                     extracted_keywords = retry_data.get("keywords", [])
@@ -3010,6 +3408,8 @@ def process_rag_query(self, query, history, topic_id, selected_sub_topics=None, 
                         metadata_filters,
                         include_undated,
                         query_semantic_vector=retry_concept_vector,
+                        rerank_size=rerank_size,
+                        concepts=active_concepts,
                         task_id=task_id,
                         **profile_kwargs(attempt, task_id=task_id)
                     )
@@ -3032,6 +3432,8 @@ def process_rag_query(self, query, history, topic_id, selected_sub_topics=None, 
                         include_undated,
                         exclude_parent_ids=used_parent_ids,
                         query_semantic_vector=concept_vector,
+                        rerank_size=rerank_size,
+                        concepts=active_concepts,
                         task_id=f"{task_id}-FALLBACK",
                         **profile_kwargs(settings.max_model_retries - 1, task_id=task_id)
                     )

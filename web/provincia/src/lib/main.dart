@@ -6,7 +6,10 @@ import 'package:flutter_html/flutter_html.dart'; // For rendering HTML
 import 'package:url_launcher/url_launcher.dart'; // For opening links
 import 'settings.dart'; // Import the settings file
 import 'app_translations.dart'; // Import the translations file
+import 'chat_auth.dart';
+import 'login_dialog.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter/semantics.dart';
 import 'package:tutorial_coach_mark/tutorial_coach_mark.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'dart:html' as html;
@@ -228,6 +231,21 @@ class _ChatScreenState extends State<ChatScreen> {
   DateTime? _dateFrom;
   DateTime? _dateTo;
   bool _includeUndatedDocs = true;
+  // Ricerca approfondita: il server analizza più fonti per ogni domanda
+  // (RERANK_MAX_SIZE invece di RERANK_SIZE).
+  bool _deepSearch = false;
+
+  /// Filtri diversi dalla situazione iniziale (tutte le serie, nessun
+  /// periodo, ricerca normale), per il pallino sul pulsante "Filtri".
+  List<String> get _activeFilters => [
+        if (_deepSearch) AppTranslations.get('filter_kind_deep', langNotifier.value),
+        if (_allowSubtopicSelection &&
+            _availableSubTopicIds.isNotEmpty &&
+            !_selectedSubTopics.containsAll(_availableSubTopicIds))
+          AppTranslations.get('filter_kind_series', langNotifier.value),
+        if (_dateFrom != null || _dateTo != null)
+          AppTranslations.get('filter_kind_period', langNotifier.value),
+      ];
 
   // --- STATO PER PROGRESSIVE DELAY ---
   Timer? _longWaitTimer;
@@ -239,6 +257,8 @@ class _ChatScreenState extends State<ChatScreen> {
     super.initState();
     _addWelcomeMessage();
     _fetchConfig();
+    // Accesso facoltativo: serve solo per i documenti degli archivi riservati.
+    ChatAuth.instance.restore();
 
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _checkFirstRun();
@@ -866,6 +886,7 @@ class _ChatScreenState extends State<ChatScreen> {
               if (_dateTo != null) "date_to": _formatDate(_dateTo!),
               if (_dateFrom != null || _dateTo != null)
                 "include_undated": _includeUndatedDocs,
+              "deep_search": _deepSearch,
             }),
           )
           .timeout(const Duration(seconds: 10));
@@ -1022,6 +1043,147 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
+  /// Apre un documento citato tra le fonti. Prima controlla se è
+  /// consultabile: se l'archivio è riservato e non si è autenticati propone
+  /// l'accesso e poi il pulsante per aprirlo.
+  Future<void> _openDocument(String url, String fileName) async {
+    final lang = langNotifier.value;
+    String msg(String key) =>
+        AppTranslations.get(key, lang).replaceAll('{file}', fileName);
+
+    // La scheda si apre subito, durante il clic: i browser (Safari in
+    // particolare) bloccano le schede aperte dopo un'attesa, come quella
+    // del controllo sul documento. Se il documento non è consultabile la
+    // scheda si richiude.
+    html.WindowBase? tab;
+    try {
+      tab = html.window.open('', '_blank');
+    } catch (_) {}
+
+    final access = await ChatAuth.instance.checkDocument(url);
+    if (access == DocumentAccess.allowed || access == DocumentAccess.unknown) {
+      // unknown: controllo non riuscito, decide il server (che mostra la
+      // sua pagina se il documento è riservato).
+      if (tab != null) {
+        tab.location.href = url;
+      } else {
+        await _launchUrl(url);
+      }
+      return;
+    }
+    tab?.close();
+
+    if (access == DocumentAccess.loginRequired) {
+      if (!mounted) return;
+      final ok = await showLoginDialog(context, lang,
+          reason: msg('document_restricted'));
+      if (!ok || !mounted) return;
+      final after = await ChatAuth.instance.checkDocument(url);
+      if (!mounted) return;
+      if (after == DocumentAccess.allowed || after == DocumentAccess.unknown) {
+        _offerDocument(url, fileName);
+        return;
+      }
+      _addMessage(ChatMessage(
+          text: msg(after == DocumentAccess.notFound
+              ? 'document_not_found'
+              : 'document_forbidden'),
+          isError: true,
+          isSystemMessage: true));
+      return;
+    }
+    _addMessage(ChatMessage(
+        text: msg(access == DocumentAccess.notFound
+            ? 'document_not_found'
+            : 'document_forbidden'),
+        isError: true,
+        isSystemMessage: true));
+  }
+
+  /// Dopo l'accesso il documento si apre con un nuovo clic: un'apertura
+  /// automatica, arrivando dopo l'attesa del login, verrebbe bloccata.
+  void _offerDocument(String url, String fileName) {
+    final lang = langNotifier.value;
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(AppTranslations.get('login_done', lang)),
+        content: Text(AppTranslations.get('document_ready', lang)
+            .replaceAll('{file}', fileName)),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: Text(AppTranslations.get('cancel', lang)),
+          ),
+          FilledButton.icon(
+            onPressed: () {
+              html.window.open(url, '_blank');
+              Navigator.pop(ctx);
+            },
+            icon: const Icon(Icons.open_in_new),
+            label: Text(AppTranslations.get('open_document', lang)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Pulsante di accesso nella barra: "Accedi" oppure il menu dell'utente.
+  Widget _accountButton() {
+    return ValueListenableBuilder<ChatUser?>(
+      valueListenable: ChatAuth.instance.user,
+      builder: (context, user, _) {
+        final lang = langNotifier.value;
+        if (user == null) {
+          return IconButton(
+            icon: const Icon(Icons.login),
+            tooltip: AppTranslations.get('login_tooltip', lang),
+            onPressed: () => showLoginDialog(context, lang),
+          );
+        }
+        final theme = Theme.of(context);
+        return PopupMenuButton<String>(
+          tooltip:
+              '${AppTranslations.get('logged_in_as', lang)} ${user.displayName}',
+          position: PopupMenuPosition.under,
+          icon: CircleAvatar(
+            radius: 14,
+            backgroundColor: theme.colorScheme.primaryContainer,
+            child: Text(
+              user.displayName.isEmpty
+                  ? '?'
+                  : user.displayName[0].toUpperCase(),
+              style: TextStyle(
+                  fontSize: 13, color: theme.colorScheme.onPrimaryContainer),
+            ),
+          ),
+          itemBuilder: (_) => [
+            PopupMenuItem<String>(
+              enabled: false,
+              child: Text(
+                  '${AppTranslations.get('logged_in_as', lang)} ${user.displayName}'),
+            ),
+            const PopupMenuDivider(),
+            PopupMenuItem<String>(
+              value: 'logout',
+              child: ListTile(
+                contentPadding: EdgeInsets.zero,
+                leading: const Icon(Icons.logout),
+                title: Text(AppTranslations.get('logout', lang)),
+              ),
+            ),
+          ],
+          onSelected: (_) async {
+            await ChatAuth.instance.logout();
+            if (!mounted) return;
+            ScaffoldMessenger.of(this.context).showSnackBar(SnackBar(
+                content: Text(AppTranslations.get('logged_out', lang))));
+          },
+        );
+      },
+    );
+  }
+
   /// --- Opens Nginx Document URLs ---
   Future<void> _launchUrl(String urlString) async {
     final Uri url = Uri.parse(urlString);
@@ -1071,6 +1233,28 @@ class _ChatScreenState extends State<ChatScreen> {
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
+                  Text(
+                    AppTranslations.get('filter_subtopics', langNotifier.value),
+                    style: Theme.of(context).textTheme.titleLarge,
+                  ),
+                  CheckboxListTile(
+                    value: _deepSearch,
+                    contentPadding: EdgeInsets.zero,
+                    controlAffinity: ListTileControlAffinity.leading,
+                    title: Text(
+                      AppTranslations.get('deep_search', langNotifier.value),
+                    ),
+                    subtitle: Text(
+                      AppTranslations.get('deep_search_desc', langNotifier.value),
+                    ),
+                    onChanged: (value) {
+                      setState(() => _deepSearch = value ?? false);
+                      setModalState(() {});
+                    },
+                  ),
+                  if ((_allowSubtopicSelection && _availableSubTopicIds.isNotEmpty) ||
+                      AppSettings.allowDateFilter)
+                    const Divider(),
                   if (_allowSubtopicSelection && _availableSubTopicIds.isNotEmpty) ...[
                     Text(
                       AppTranslations.get('subtopics_title', langNotifier.value),
@@ -1230,33 +1414,47 @@ class _ChatScreenState extends State<ChatScreen> {
       appBar: AppBar(
         title: Text(AppSettings.projectName),
         actions: [
-          if ((_allowSubtopicSelection && _availableSubTopicIds.isNotEmpty) ||
-              AppSettings.allowDateFilter)
-            IconButton(
-              key: _filterKey,
-              icon: const Icon(Icons.filter_list),
-              onPressed: _showSubTopicSelector,
-              tooltip: AppTranslations.get(
-                'filter_subtopics',
-                langNotifier.value,
-              ),
+          // Sempre visibile: la ricerca approfondita è disponibile ovunque,
+          // serie e date solo dove configurate. Il pallino segnala che c'è
+          // almeno un filtro impostato; il suggerimento dice quali.
+          IconButton(
+            key: _filterKey,
+            icon: Badge(
+              isLabelVisible: _activeFilters.isNotEmpty,
+              smallSize: 8,
+              child: const Icon(Icons.filter_list),
             ),
+            onPressed: _showSubTopicSelector,
+            tooltip: _activeFilters.isEmpty
+                ? AppTranslations.get('filter_subtopics', langNotifier.value)
+                : AppTranslations.get('filters_active', langNotifier.value)
+                    .replaceAll('{list}', _activeFilters.join(', ')),
+          ),
           ValueListenableBuilder<AppLang>(
             valueListenable: langNotifier,
             builder: (_, AppLang currentLang, __) {
-              return TextButton(
-                key: _langKey,
-                onPressed: () {
-                  langNotifier.value = currentLang == AppLang.it
-                      ? AppLang.en
-                      : AppLang.it;
-                  _clearChat();
-                },
-                child: Text(
-                  currentLang == AppLang.it ? "🇮🇹 IT" : "🇬🇧 EN",
-                  style: TextStyle(
-                    fontSize: 16,
-                    color: Theme.of(context).colorScheme.onSurface,
+              return Tooltip(
+                message: AppTranslations.get('language_switch', currentLang),
+                child: TextButton(
+                  key: _langKey,
+                  onPressed: () {
+                    langNotifier.value = currentLang == AppLang.it
+                        ? AppLang.en
+                        : AppLang.it;
+                    _clearChat();
+                  },
+                  // Il lettore di schermo leggerebbe "bandiera Italia IT".
+                  child: Semantics(
+                    label: AppTranslations.get('language_label', currentLang),
+                    child: ExcludeSemantics(
+                      child: Text(
+                        currentLang == AppLang.it ? "🇮🇹 IT" : "🇬🇧 EN",
+                        style: TextStyle(
+                          fontSize: 16,
+                          color: Theme.of(context).colorScheme.onSurface,
+                        ),
+                      ),
+                    ),
                   ),
                 ),
               );
@@ -1293,6 +1491,7 @@ class _ChatScreenState extends State<ChatScreen> {
             tooltip: AppTranslations.get('clear_chat', langNotifier.value),
             onPressed: _isLoading ? null : _clearChat,
           ),
+          _accountButton(),
           const SizedBox(width: 8),
         ],
       ),
@@ -1368,19 +1567,28 @@ class _ChatScreenState extends State<ChatScreen> {
 
     Widget messageContent;
 
+    // Il testo resta selezionabile col mouse, ma l'area di selezione esce
+    // dall'ordine del Tab: altrimenti ogni messaggio aggiunge una fermata
+    // invisibile in cui il fuoco sembra non spostarsi. (SelectableText, usato
+    // prima per i messaggi dell'utente, sul web diventa un campo di testo
+    // disabilitato e senza etichetta per i lettori di schermo.)
+    Widget selectable(Widget child) =>
+        ExcludeFocusTraversal(child: SelectionArea(child: child));
+
     if (isUser) {
-      messageContent = SelectableText(
-        message.text,
-        style: theme.textTheme.bodyLarge!.copyWith(
-          color: theme.colorScheme.onPrimary,
+      messageContent = selectable(
+        Text(
+          message.text,
+          style: theme.textTheme.bodyLarge!.copyWith(
+            color: theme.colorScheme.onPrimary,
+          ),
         ),
       );
     } else {
-      messageContent = SelectionArea(
-        child: Column(
+      messageContent = Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Html(
+            selectable(Html(
               data: message.text,
               style: {
                 "body": Style(margin: Margins.zero, padding: HtmlPaddings.zero),
@@ -1404,7 +1612,7 @@ class _ChatScreenState extends State<ChatScreen> {
                       : theme.colorScheme.onSurface,
                 ),
               },
-            ),
+            )),
             _buildSources(message),
 
             if (!message.isError && !message.isSystemMessage)
@@ -1449,12 +1657,33 @@ class _ChatScreenState extends State<ChatScreen> {
                 ),
               ),
           ],
-        ),
-      );
+        );
     }
 
+    // Chi parla, letto prima del messaggio (l'avatar dell'utente è a destra:
+    // l'ordine di lettura lo porta comunque davanti).
+    final String speaker = AppTranslations.get(
+      isUser
+          ? 'speaker_user'
+          : message.isError
+              ? 'speaker_error'
+              : message.isSystemMessage
+                  ? 'speaker_info'
+                  : 'speaker_assistant',
+      langNotifier.value,
+    );
+    Widget avatar(Widget circle) => Semantics(
+          container: true,
+          sortKey: const OrdinalSortKey(0),
+          label: speaker,
+          child: ExcludeSemantics(child: circle),
+        );
+
+    // Solo le risposte vengono annunciate quando arrivano: la domanda
+    // l'utente l'ha appena scritta.
     return Semantics(
-      liveRegion: true,
+      container: true,
+      liveRegion: !isUser,
       child: Container(
         margin: const EdgeInsets.symmetric(vertical: 8.0),
         child: Row(
@@ -1464,7 +1693,7 @@ class _ChatScreenState extends State<ChatScreen> {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             if (!isUser)
-              CircleAvatar(
+              avatar(CircleAvatar(
                 backgroundColor: theme.colorScheme.secondary,
                 child: Icon(
                   message.isError
@@ -1474,10 +1703,13 @@ class _ChatScreenState extends State<ChatScreen> {
                             : Icons.computer),
                   color: theme.colorScheme.onSecondary,
                 ),
-              ),
+              )),
             if (isUser) const SizedBox(width: 40),
             Expanded(
-              child: Container(
+              child: Semantics(
+                container: true,
+                sortKey: const OrdinalSortKey(1),
+                child: Container(
                 margin: const EdgeInsets.symmetric(horizontal: 12.0),
                 padding: const EdgeInsets.all(16.0),
                 decoration: BoxDecoration(
@@ -1499,12 +1731,13 @@ class _ChatScreenState extends State<ChatScreen> {
                 ),
                 child: messageContent,
               ),
+              ),
             ),
             if (isUser)
-              CircleAvatar(
+              avatar(CircleAvatar(
                 backgroundColor: theme.colorScheme.primary,
                 child: Icon(Icons.person, color: theme.colorScheme.onPrimary),
-              ),
+              )),
             if (!isUser) const SizedBox(width: 40),
           ],
         ),
@@ -1530,33 +1763,56 @@ class _ChatScreenState extends State<ChatScreen> {
           return Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              MouseRegion(
-                cursor: SystemMouseCursors.click,
-                child: GestureDetector(
+              // Pulsante vero (non un semplice GestureDetector): raggiungibile
+              // con Tab, attivabile con Invio o Spazio, annunciato dai lettori
+              // di schermo come pulsante con lo stato aperto/chiuso.
+              // container: nodo a sé, senza inglobare il testo della risposta.
+              Semantics(
+                container: true,
+                button: true,
+                expanded: message.isSourcesExpanded,
+                label:
+                    "${AppTranslations.get('sources', langNotifier.value)} ${message.sources.length}",
+                hint: AppTranslations.get(
+                  message.isSourcesExpanded ? 'sources_hide' : 'sources_show',
+                  langNotifier.value,
+                ),
+                child: InkWell(
+                  borderRadius: BorderRadius.circular(6),
                   onTap: () {
                     setLocalState(() {
                       message.isSourcesExpanded = !message.isSourcesExpanded;
                     });
                   },
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Icon(
-                        message.isSourcesExpanded
-                            ? Icons.keyboard_arrow_down
-                            : Icons.keyboard_arrow_right,
-                        size: 20,
-                        color: theme.colorScheme.onSurface.withAlpha(204),
-                      ),
-                      const SizedBox(width: 4.0),
-                      Text(
-                        "${AppTranslations.get('sources', langNotifier.value)} ${message.sources.length}",
-                        style: theme.textTheme.bodySmall!.copyWith(
-                          fontWeight: FontWeight.bold,
-                          color: theme.colorScheme.onSurface.withAlpha(204),
+                  // Il testo visibile è già nell'etichetta: non va ripetuto.
+                  child: ExcludeSemantics(
+                    child: ConstrainedBox(
+                      // Area di tocco di almeno 24px (WCAG 2.5.8): era alta 20
+                      constraints: const BoxConstraints(minHeight: 32),
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 4),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(
+                              message.isSourcesExpanded
+                                  ? Icons.keyboard_arrow_down
+                                  : Icons.keyboard_arrow_right,
+                              size: 20,
+                              color: theme.colorScheme.onSurface.withAlpha(204),
+                            ),
+                            const SizedBox(width: 4.0),
+                            Text(
+                              "${AppTranslations.get('sources', langNotifier.value)} ${message.sources.length}",
+                              style: theme.textTheme.bodySmall!.copyWith(
+                                fontWeight: FontWeight.bold,
+                                color: theme.colorScheme.onSurface.withAlpha(204),
+                              ),
+                            ),
+                          ],
                         ),
                       ),
-                    ],
+                    ),
                   ),
                 ),
               ),
@@ -1584,7 +1840,7 @@ class _ChatScreenState extends State<ChatScreen> {
                                 "${AppSettings.downloadDocumentUrl}/${Uri.encodeComponent(topic)}/${Uri.encodeComponent(subTopic)}/${Uri.encodeComponent(fileName)}";
 
                             return ActionChip(
-                              onPressed: () => _launchUrl(url),
+                              onPressed: () => _openDocument(url, fileName),
                               avatar: Icon(
                                 Icons.link,
                                 size: 16,

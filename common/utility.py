@@ -155,3 +155,19 @@ def clean_iso_date(date_raw: Optional[str]) -> Optional[str]:
 
     log.warning("clean_iso_date: formato data non riconosciuto, scartato: %r", date_raw)
     return None
+
+def split_protected_metadata(metadata: dict, protected_keys) -> tuple[dict, list]:
+    """
+    Separa i metadati di un documento dalle chiavi di sistema
+    (settings.protected_keys: content, source, topic_id, ...).
+
+    Ritorna (metadati_puliti, chiavi_scartate). Le chiavi di sistema non sono
+    metadati del documento: non vanno mostrate né modificate in revisione,
+    né accettate da un manifest, né copiate nei metadati di MySQL. Usata da
+    ingest, revisione e script di migrazione, così la regola è una sola.
+    """
+    if not isinstance(metadata, dict):
+        return {}, []
+    clean = {k: v for k, v in metadata.items() if k not in protected_keys}
+    dropped = sorted(k for k in metadata if k in protected_keys)
+    return clean, dropped

@@ -42,6 +42,14 @@ class UserMenu extends StatelessWidget {
                     : 'Ruoli: ${user.roles.join(', ')}',
                 style: theme.textTheme.bodySmall,
               ),
+              Text(
+                switch (user.topics) {
+                  null => 'Archivi: tutti',
+                  [] => 'Nessun archivio assegnato',
+                  final t => 'Archivi: ${t.join(', ')}',
+                },
+                style: theme.textTheme.bodySmall,
+              ),
             ],
           ),
         ),

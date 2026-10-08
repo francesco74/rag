@@ -64,6 +64,23 @@ class Settings:
 
     api_llm_key: str
     api_secret_key: str
+    # Firma i token emessi dal server agli utenti autenticati (sessioni, link
+    # temporanei). Deve restare solo sul server: a differenza di
+    # API_SECRET_KEY non va mai inviata ai frontend. Vuota = funzioni con
+    # login disabilitate.
+    auth_secret_key: str
+    # Cookie di sessione solo su HTTPS. False solo per lo sviluppo in http
+    # su un host diverso da localhost.
+    session_cookie_secure: bool
+
+    # Download dei documenti (/files/...). Se valorizzato, l'API autorizza e
+    # risponde con X-Accel-Redirect: <prefisso><topic>/<sub_topic>/<file>, e
+    # il file lo invia nginx dalla sua location internal (k8s/nginx.yaml).
+    # Vuoto: il file lo invia l'API stessa (sviluppo senza nginx).
+    files_x_accel_prefix: str
+    # Pagina di login proposta a chi apre un documento riservato senza
+    # essere autenticato.
+    files_login_url: str
 
     hostname: str
 
@@ -74,6 +91,17 @@ class Settings:
 
     allowed_origins: list[str]
 
+    # Metadati del documento nel contesto del generatore (worker.build_context):
+    # oggetto, numero, ufficio... sul primo passaggio di ogni documento, un
+    # rimando sugli altri. Si escludono sempre le chiavi di sistema, le
+    # intestazioni "Header N" e i campi il cui nome inizia con "_" (riservati
+    # all'uso interno, anche per i metadati aggiunti in revisione).
+    context_metadata: bool
+    # Campi tecnici da non passare al modello.
+    context_metadata_exclude: frozenset[str]
+    # Valori più lunghi di così vengono accorciati.
+    context_metadata_max_value_chars: int
+
     max_history_items: int
 
     redis_host: str
@@ -82,6 +110,10 @@ class Settings:
     allow_general_knowledge: bool
 
     rerank_size: int
+    # Ricerca approfondita (opzione "Ricerca in maniera approfondita" della
+    # chat): passaggi tenuti dopo il rerank per ogni sotto-domanda al posto
+    # di rerank_size. Più fonti, risposta più lenta e più costosa.
+    rerank_max_size: int
     rerank_truncate: int
     rerank_batch_size: int
     rerank_max_length: int
@@ -99,6 +131,10 @@ class Settings:
     # senza tetto genera fino al soffitto del modello e lo paghi tutto.
     grader_max_tokens: int
     qdrant_syntactic_size: int
+    # Parole chiave con più risultati di così non sono selettive: lo scroll
+    # ne restituirebbe un campione casuale. Escluse dalla ricerca per parole
+    # chiave (worker.safe_keyword_search), restano per vettori e reranker.
+    keyword_max_hits: int
     qdrant_semantic_size: int
     qdrant_semantic_threshold: float
     qdrant_concept_threshold: float
@@ -133,6 +169,10 @@ class Settings:
     context_floor_ratio: float
     context_cap_ratio: float
     context_score_weight: str
+    # Da dove viene la rilevanza dei parent usata per pesare le quote (e per
+    # MMR e l'ordine dei core): "rerank" = probabilità del reranker (0..1),
+    # "vector" = similarità vettoriale di Qdrant (comportamento precedente).
+    context_score_source: str
 
     # Sforamento tollerato (frazione di max_context_chars) per includere un
     # documento INTERO invece di finestrarlo per pochi caratteri. Non può mai
@@ -157,6 +197,11 @@ class Settings:
 
     min_prob_threshold: float
     parents_per_query: int
+    # Posti extra per pertinenza (worker.retrieve_chunks, passo 5ter): oltre
+    # alla quota, parent con probabilità del reranker >= extra_parents_min_prob,
+    # fino a max_sub_queries × parents_per_query parent in tutto.
+    extra_parents: bool
+    extra_parents_min_prob: float
 
     mmr_similarity_threshold: float
     boilerplate_similarity_threshold: float
@@ -238,6 +283,12 @@ def load_settings() -> Settings:
     # L'operatore "or" protegge dalle stringhe vuote. 
     # Es: se HTTP_TIMEOUT_SECONDS="", os.getenv() o 30 restituisce 30.
 
+    auth_secret_key = os.environ.get("AUTH_SECRET_KEY", "").strip()
+    context_metadata_exclude_raw = os.environ.get(
+        "CONTEXT_METADATA_EXCLUDE",
+        "id_sicraweb,id_tipo_iter,percorso_originale,giorni_pubblicazione,classifica",
+    )
+
     allowed_origins_raw = os.environ.get("ALLOWED_ORIGINS")
     allowed_origins = allowed_origins_raw.split(",") if allowed_origins_raw else ["*"]
 
@@ -260,6 +311,14 @@ def load_settings() -> Settings:
     # già stato allocato: build_context si troverebbe a scartare parent a cui
     # era stato appena assegnato del budget — di nuovo il bug che questa
     # modifica elimina, solo per un'altra strada.
+    context_score_source = (os.environ.get("CONTEXT_SCORE_SOURCE") or "rerank").strip().lower()
+    if context_score_source not in ("rerank", "vector"):
+        _log.warning(
+            "CONTEXT_SCORE_SOURCE '%s' non valido (ammessi: rerank, vector): uso 'rerank'.",
+            context_score_source,
+        )
+        context_score_source = "rerank"
+
     if context_hard_cap_ratio < context_overflow_ratio:
         _log.warning(
             "CONTEXT_HARD_CAP_RATIO (%.2f) è inferiore a CONTEXT_OVERFLOW_RATIO (%.2f): "
@@ -348,6 +407,11 @@ def load_settings() -> Settings:
 
         api_llm_key = os.environ.get("API_LLM_KEY", "default_key"),
         api_secret_key  = os.environ.get("API_SECRET_KEY", "default_key"),
+        auth_secret_key = auth_secret_key,
+        session_cookie_secure = os.environ.get("SESSION_COOKIE_SECURE", "true").strip().lower()
+                                not in ("0", "false", "no", "off"),
+        files_x_accel_prefix = os.environ.get("FILES_X_ACCEL_PREFIX", "").strip(),
+        files_login_url = os.environ.get("FILES_LOGIN_URL", "/revisione/").strip() or "/revisione/",
 
         hostname = os.environ.get("HOSTNAME", socket.gethostname()),
 
@@ -356,6 +420,12 @@ def load_settings() -> Settings:
 
         allow_subtopic_selection=_parse_bool(os.environ.get("ALLOW_SUBTOPIC_SELECTION"), default=True),
         allowed_origins=allowed_origins,
+        context_metadata=os.environ.get("CONTEXT_METADATA", "true").strip().lower()
+                         not in ("0", "false", "no", "off"),
+        context_metadata_exclude=frozenset(
+            k.strip() for k in context_metadata_exclude_raw.split(",") if k.strip()
+        ),
+        context_metadata_max_value_chars=int(os.environ.get("CONTEXT_METADATA_MAX_VALUE_CHARS") or 200),
 
         max_history_items = int(os.environ.get("MAX_HISTORY_ITEMS") or 20),
 
@@ -363,6 +433,7 @@ def load_settings() -> Settings:
         redis_port = int(os.environ.get("REDIS_PORT") or 6379),
 
         rerank_size = int(os.environ.get("RERANK_SIZE") or 25),
+        rerank_max_size = int(os.environ.get("RERANK_MAX_SIZE") or 30),
         rerank_truncate = int(os.environ.get("RERANK_TRUNCATE") or 1200),
         rerank_batch_size = int(os.environ.get("RERANK_BATCH_SIZE") or  4),
         rerank_max_length = int(os.environ.get("RERANK_MAX_LENGTH") or 512),
@@ -377,6 +448,7 @@ def load_settings() -> Settings:
         allow_general_knowledge = _parse_bool(os.environ.get("ALLOW_GENERAL_KNOWLEDGE"), default=True),
 
         qdrant_syntactic_size = int(os.environ.get("QDRANT_SYNTACTIC_SIZE") or 20),
+        keyword_max_hits = int(os.environ.get("KEYWORD_MAX_HITS") or 1000),
         qdrant_semantic_size = int(os.environ.get("QDRANT_SEMANTIC_SIZE") or 30),
 
         qdrant_semantic_threshold = float(os.environ.get("QDRANT_SEMANTIC_THRESHOLD") or 0.60),
@@ -387,6 +459,7 @@ def load_settings() -> Settings:
         context_floor_ratio = float(os.environ.get("CONTEXT_FLOOR_RATIO") or 0.60),
         context_cap_ratio = float(os.environ.get("CONTEXT_CAP_RATIO") or 0.40),
         context_score_weight = (os.environ.get("CONTEXT_SCORE_WEIGHT") or "best").lower(),
+        context_score_source = context_score_source,
 
         context_overflow_ratio = context_overflow_ratio,
         context_hard_cap_ratio = context_hard_cap_ratio,
@@ -395,6 +468,9 @@ def load_settings() -> Settings:
 
         min_prob_threshold = float(os.environ.get("MIN_PROB_THRESHOLD") or 0.02),
         parents_per_query = int(os.environ.get("PARENTS_PER_QUERY") or 4),
+        extra_parents = os.environ.get("EXTRA_PARENTS", "true").strip().lower()
+                        not in ("0", "false", "no", "off"),
+        extra_parents_min_prob = float(os.environ.get("EXTRA_PARENTS_MIN_PROB") or 0.5),
 
         mmr_similarity_threshold = float(os.environ.get("MMR_SIMILARITY_THRESHOLD") or 0.92),
         boilerplate_similarity_threshold = float(os.environ.get("BOILERPLATE_SIMILARITY_THRESHOLD") or 0.55),

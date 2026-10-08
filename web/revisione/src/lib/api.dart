@@ -23,7 +23,7 @@ class ApiException implements Exception {
       details.isEmpty ? message : '$message\n• ${details.join('\n• ')}';
 }
 
-/// Permessi concessi dai ruoli (vedi api/src/review_permissions.py).
+/// Permessi concessi dai ruoli (vedi common/review_permissions.py).
 /// L'interfaccia decide cosa mostrare in base ai permessi, mai ai nomi dei
 /// ruoli: il backend li verifica comunque su ogni richiesta.
 abstract final class Permission {
@@ -40,7 +40,10 @@ class ReviewUser {
         username = j['username'] as String,
         displayName = (j['display_name'] ?? j['username']) as String,
         roles = List<String>.from(j['roles'] as List? ?? const []),
-        permissions = Set<String>.from(j['permissions'] as List? ?? const []);
+        permissions = Set<String>.from(j['permissions'] as List? ?? const []),
+        topics = j['topics'] == null
+            ? null
+            : List<String>.from(j['topics'] as List);
 
   final int id;
   final String username;
@@ -48,7 +51,13 @@ class ReviewUser {
   final List<String> roles;
   final Set<String> permissions;
 
+  /// Archivi (topic) su cui l'utente può lavorare; null = tutti. Il backend
+  /// filtra già elenchi e documenti: qui serve solo per informare l'utente.
+  final List<String>? topics;
+
   bool can(String permission) => permissions.contains(permission);
+
+  bool get hasNoTopics => topics != null && topics!.isEmpty;
 }
 
 class SubTopic {
@@ -108,24 +117,29 @@ class DocumentPage {
 }
 
 class OriginalFile {
-  OriginalFile.fromJson(Map<String, dynamic> j)
+  OriginalFile.fromJson(Map<String, dynamic> j, this.docKey, this.fileName)
       : name = j['name'] as String,
         size = j['size'] as int,
-        mimeType = j['mime_type'] as String,
-        token = j['token'] as String?;
+        mimeType = j['mime_type'] as String;
 
   final String name;
   final int size;
   final String mimeType;
-  final String? token;
+  final DocKey docKey;
 
-  String? url({bool download = false}) {
-    if (token == null) return null;
-    final q = Uri(queryParameters: {
-      'token': token!,
-      if (download) 'download': '1',
-    }).query;
-    return '${AppSettings.apiUrl}/document/file?$q';
+  /// Percorso del file nell'archivio (può contenere sottocartelle).
+  final String fileName;
+
+  /// Stesso indirizzo usato dalle chat: `/files/<topic>/<sub_topic>/<file>`.
+  /// Per gli archivi riservati il browser si autentica con il cookie di
+  /// sessione impostato al login, anche aprendo il file in una nuova scheda.
+  String url({bool download = false}) {
+    final path = [
+      docKey.topicId,
+      docKey.subTopicId,
+      ...fileName.split('/'),
+    ].map(Uri.encodeComponent).join('/');
+    return '${AppSettings.filesUrl}/$path${download ? '?download=1' : ''}';
   }
 
   /// Tipi che il browser sa mostrare da solo in un riquadro.
@@ -160,7 +174,11 @@ class ReviewDocument {
         protectedKeys = List<String>.from(j['protected_keys'] as List),
         originalFile = j['original_file'] == null
             ? null
-            : OriginalFile.fromJson(j['original_file'] as Map<String, dynamic>),
+            : OriginalFile.fromJson(
+                j['original_file'] as Map<String, dynamic>,
+                DocKey(j['source'] as String, j['topic_id'] as String,
+                    j['sub_topic_id'] as String),
+                j['file_name'] as String),
         status = (j['review_status'] as Map)['status'] as String,
         statusNote = (j['review_status'] as Map)['note'] as String?,
         statusUpdatedBy = (j['review_status'] as Map)['updated_by'] as String?,

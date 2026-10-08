@@ -59,7 +59,9 @@ class _SessionGateState extends State<_SessionGate> {
               });
               return const LoginScreen();
             }
-            if (!user.can(Permission.read)) return NoAccessScreen(user: user);
+            if (!user.can(Permission.read) || user.hasNoTopics) {
+              return NoAccessScreen(user: user);
+            }
             return const DocumentsScreen();
           },
         );

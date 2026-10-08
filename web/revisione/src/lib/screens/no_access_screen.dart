@@ -4,8 +4,8 @@ import '../api.dart';
 import '../settings.dart';
 import '../widgets/user_menu.dart';
 
-/// Mostrata a un utente autenticato i cui ruoli non permettono di
-/// consultare i documenti (nessun ruolo assegnato o ruoli non validi).
+/// Mostrata a un utente autenticato che non può consultare alcun documento:
+/// nessun ruolo che dia la lettura, oppure nessun archivio assegnato.
 class NoAccessScreen extends StatelessWidget {
   const NoAccessScreen({super.key, required this.user});
 
@@ -31,9 +31,13 @@ class NoAccessScreen extends StatelessWidget {
             Text('Nessuna funzione disponibile', style: theme.textTheme.titleLarge),
             const SizedBox(height: 8),
             Text(
-              'Ciao ${user.displayName}, il tuo profilo non è ancora abilitato '
-              'alla consultazione dei documenti.\n'
-              'Chiedi a un amministratore di assegnarti un ruolo.',
+              user.can(Permission.read)
+                  ? 'Ciao ${user.displayName}, non ti è ancora stato assegnato '
+                      'alcun archivio su cui lavorare.\n'
+                      'Chiedi a un amministratore di abilitarti.'
+                  : 'Ciao ${user.displayName}, il tuo profilo non è ancora abilitato '
+                      'alla consultazione dei documenti.\n'
+                      'Chiedi a un amministratore di assegnarti un ruolo.',
               textAlign: TextAlign.center,
             ),
           ]),

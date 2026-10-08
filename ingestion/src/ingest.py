@@ -34,6 +34,7 @@ from tenacity import (
 
 from common.db_logger import MySQLLogHandler, get_db_connection, init_db_pool
 from common.config import settings
+from common.utility import split_protected_metadata
 
 # ==============================================================================
 # 1. CONFIGURATION & LOGGING SETUP
@@ -308,13 +309,15 @@ async def process_single_file_async(topic_id, sub_topic_id, json_path, root_fold
             if not isinstance(extra_metadata, dict):
                 extra_metadata = {}
 
-            conflicting_keys = set(extra_metadata.keys()) & settings.protected_keys
-            if conflicting_keys:
-                err = f"Chiavi riservate trovate nei metadati extra: {conflicting_keys}. Ingestione bloccata."
-                log.error(f"HARD STOP: {err}")
-                await finalize_file_move(json_path, root_folder, topic_id, sub_topic_id, error_msg=err)
-                await finalize_file_move(text_file_path, root_folder, topic_id, sub_topic_id, error_msg=err)
-                return False
+            # Le chiavi di sistema (source, content, topic_id...) non possono
+            # arrivare dai metadati del manifest: si scartano e si prosegue.
+            # Prima l'ingestione si bloccava, e un manifest con metadati sporchi
+            # (es. parent migrati da Qdrant, poi corretti in revisione) faceva
+            # fallire la re-indicizzazione del documento.
+            extra_metadata, dropped_keys = split_protected_metadata(extra_metadata, settings.protected_keys)
+            if dropped_keys:
+                log.warning(f"Manifest {json_path.name}: chiavi di sistema nei metadati ignorate "
+                            f"{dropped_keys} (i campi di sistema li imposta l'ingest).")
 
         except Exception as e:
             log.error(f"Errore critico nel parsing JSON {json_path.name}: {e}")

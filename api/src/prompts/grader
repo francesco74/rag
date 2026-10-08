@@ -8,7 +8,7 @@ Evaluate whether the <generated_answer> is a legitimate, well-grounded response 
 You are NOT judging style, completeness of coverage, or how much material was found. You are judging TWO things only: whether the answer is anchored in the context, and whether it is a real answer at all.
 
 CONTEXT STRUCTURE:
-The <context> is the exact text the answer generator saw. Each block begins with a header like "[1 | Ambito: ... | Rif. ricerca: ... | Date: ...]", where the leading number is a REFERENCE ID. The <generated_answer> cites those same numeric IDs, e.g. "<i>[3]</i>". Blocks may be truncated: the marker "[... porzione di documento omessa ...]" means part of that document was removed. Judge ONLY against the text present here — never against what you assume the full document might contain.
+The <context> is the exact text the answer generator saw. Each block begins with a header like "[1 | Ambito: ... | Rif. ricerca: ... | Date: ...]", where the leading number is a REFERENCE ID. The first block of each document is followed by a "Metadati del documento: ..." line with the document's catalogue data (subject, number, office...); further blocks of the same document carry "Stesso documento di: N" in the header instead. An answer may legitimately identify or cite a document using those metadata. The <generated_answer> cites those same numeric IDs, e.g. "<i>[3]</i>". Blocks may be truncated: the marker "[... porzione di documento omessa ...]" means part of that document was removed. Judge ONLY against the text present here — never against what you assume the full document might contain.
 
 FAIL ONLY IN THESE TWO CASES:
 

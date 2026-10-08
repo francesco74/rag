@@ -27,6 +27,27 @@ class AppTranslations {
       AppLang.it: "Fonti analizzate:",
       AppLang.en: "Analyzed sources:",
     },
+    // --- Accessibilità ---
+    'speaker_user': {AppLang.it: "Tu", AppLang.en: "You"},
+    'speaker_assistant': {AppLang.it: "Assistente", AppLang.en: "Assistant"},
+    'speaker_info': {AppLang.it: "Avviso", AppLang.en: "Notice"},
+    'speaker_error': {AppLang.it: "Errore", AppLang.en: "Error"},
+    'language_label': {
+      AppLang.it: "Lingua: italiano",
+      AppLang.en: "Language: English",
+    },
+    'language_switch': {
+      AppLang.it: "Passa all'inglese (la chat verrà svuotata)",
+      AppLang.en: "Switch to Italian (the chat will be cleared)",
+    },
+    'sources_show': {
+      AppLang.it: "Mostra l'elenco dei documenti usati per la risposta",
+      AppLang.en: "Show the documents used for the answer",
+    },
+    'sources_hide': {
+      AppLang.it: "Nascondi l'elenco dei documenti",
+      AppLang.en: "Hide the list of documents",
+    },
     'unknown_file': {
       AppLang.it: "File sconosciuto",
       AppLang.en: "Unknown file",
@@ -90,10 +111,27 @@ class AppTranslations {
       AppLang.it: "Aggiungi un commento opzionale...",
       AppLang.en: "Add an optional comment...",
     },
-    'filter_subtopics': {
-      AppLang.it: "Filtra Sottocategorie",
-      AppLang.en: "Filter Subtopics",
+    'filter_subtopics': {AppLang.it: "Filtri", AppLang.en: "Filters"},
+    'deep_search': {
+      AppLang.it: "Ricerca in maniera approfondita",
+      AppLang.en: "In-depth search",
     },
+    'deep_search_desc': {
+      AppLang.it:
+          "Analizza più fonti per ogni domanda. La risposta può richiedere più tempo.",
+      AppLang.en:
+          "Analyzes more sources for each question. The answer may take longer.",
+    },
+    'filters_active': {
+      AppLang.it: "Filtri attivi: {list}",
+      AppLang.en: "Active filters: {list}",
+    },
+    'filter_kind_deep': {
+      AppLang.it: "ricerca approfondita",
+      AppLang.en: "in-depth search",
+    },
+    'filter_kind_series': {AppLang.it: "serie", AppLang.en: "series"},
+    'filter_kind_period': {AppLang.it: "periodo", AppLang.en: "period"},
     'subtopics_title': {AppLang.it: "Sottocategorie", AppLang.en: "Subtopics"},
     'maintenance_mode': {
       AppLang.it: "Sistema in manutenzione",
@@ -139,8 +177,9 @@ class AppTranslations {
     },
     'filter_subtopics_desc': {
       AppLang.it:
-          "Filtro per effettuare le ricerche solamente sulle serie che ti interessano.",
-      AppLang.en: "Filter to search only within the series that interest you.",
+          "Opzioni di ricerca: la ricerca approfondita e, dove disponibili, le serie e il periodo su cui cercare.",
+      AppLang.en:
+          "Search options: in-depth search and, where available, the series and period to search.",
     },
     'ai_processing': {
       AppLang.it: "Sto elaborando la tua domanda...",
@@ -190,6 +229,54 @@ class AppTranslations {
     'subtopic_stat_with_year': {
       AppLang.it: "{desc}: {count} documenti, a partire dal {year}",
       AppLang.en: "{desc}: {count} documents, since {year}",
+    },
+    // --- Accesso per i documenti riservati ---
+    'login': {AppLang.it: "Accedi", AppLang.en: "Sign in"},
+    'logout': {AppLang.it: "Esci", AppLang.en: "Sign out"},
+    'cancel': {AppLang.it: "Annulla", AppLang.en: "Cancel"},
+    'login_title': {AppLang.it: "Accesso", AppLang.en: "Sign in"},
+    'login_tooltip': {
+      AppLang.it: "Accedi per consultare i documenti riservati",
+      AppLang.en: "Sign in to view restricted documents",
+    },
+    'login_username': {AppLang.it: "Nome utente", AppLang.en: "Username"},
+    'login_password': {AppLang.it: "Password", AppLang.en: "Password"},
+    'login_missing': {
+      AppLang.it: "Inserisci nome utente e password.",
+      AppLang.en: "Enter username and password.",
+    },
+    'login_failed': {
+      AppLang.it: "Credenziali non valide.",
+      AppLang.en: "Invalid credentials.",
+    },
+    'login_unreachable': {
+      AppLang.it: "Servizio non raggiungibile, riprova tra poco.",
+      AppLang.en: "Service unreachable, please try again shortly.",
+    },
+    'logged_in_as': {AppLang.it: "Accesso come", AppLang.en: "Signed in as"},
+    'logged_out': {
+      AppLang.it: "Sei uscito: i documenti riservati non sono più consultabili.",
+      AppLang.en: "Signed out: restricted documents are no longer available.",
+    },
+    'document_restricted': {
+      AppLang.it:
+          "Il documento \"{file}\" è riservato: accedi per consultarlo.",
+      AppLang.en: "The document \"{file}\" is restricted: sign in to view it.",
+    },
+    'document_forbidden': {
+      AppLang.it:
+          "Il tuo profilo non è abilitato a consultare il documento \"{file}\".",
+      AppLang.en: "Your profile is not allowed to view the document \"{file}\".",
+    },
+    'login_done': {AppLang.it: "Accesso eseguito", AppLang.en: "Signed in"},
+    'document_ready': {
+      AppLang.it: "Ora puoi consultare il documento \"{file}\".",
+      AppLang.en: "You can now view the document \"{file}\".",
+    },
+    'open_document': {AppLang.it: "Apri il documento", AppLang.en: "Open document"},
+    'document_not_found': {
+      AppLang.it: "Il documento \"{file}\" non è disponibile in archivio.",
+      AppLang.en: "The document \"{file}\" is not available in the archive.",
     },
     'subtopic_stat_no_year': {
       AppLang.it: "{desc}: {count} documenti",

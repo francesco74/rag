@@ -11,7 +11,8 @@ import json
 from common.db_logger import MySQLLogHandler, get_db_connection, init_db_pool
 
 from common.config import settings
-from review_routes import bp as review_bp
+from review_routes import auth_bp, bp as review_bp
+from files_routes import bp as files_bp
 
 # ==============================================================================
 # CONFIGURATION & LOGGING
@@ -30,6 +31,11 @@ CORS(app, origins=settings.allowed_origins)  # Enable CORS for frontend access
 # Revisione documentale (frontend web/revisione): rotte sotto /review con
 # autenticazione propria a utenti e password, vedi review_routes.py.
 app.register_blueprint(review_bp)
+# Login/logout generici (/auth/...), usati dalla chat per i documenti riservati.
+app.register_blueprint(auth_bp)
+# Download dei documenti originali per chat e revisione: archivi pubblici
+# liberi, riservati solo per utenti autenticati, vedi files_routes.py.
+app.register_blueprint(files_bp)
 
 
 
@@ -52,7 +58,9 @@ UNPROTECTED_ROUTES = {"/health"}
 
 # Le rotte di revisione non usano API_SECRET_KEY: ogni revisore si autentica
 # con le proprie credenziali e il blueprint verifica il suo token di sessione.
-SELF_AUTHENTICATED_PREFIXES = ("/review/",)
+# Lo stesso per i documenti: i link sono aperti dal browser, che non può
+# inviare la API key; l'accesso lo decide files_routes.py per archivio.
+SELF_AUTHENTICATED_PREFIXES = ("/review/", "/files/", "/auth/")
 
 # ==============================================================================
 # MIDDLEWARE
@@ -219,6 +227,17 @@ def chat_handler():
                 "message": "include_undated deve essere un booleano"
             }), 400
 
+        # Ricerca approfondita: più passaggi per sotto-domanda (RERANK_MAX_SIZE
+        # invece di RERANK_SIZE).
+        deep_search = data.get("deep_search", False)
+        if not isinstance(deep_search, bool):
+            return jsonify({
+                "error": "Bad Request",
+                "message": "deep_search deve essere un booleano"
+            }), 400
+        if deep_search:
+            log.info(f"[{request.request_id}] Ricerca approfondita richiesta per il topic {topic_id}")
+
         if date_from or date_to:
             log.info(f"Received data range: {date_from}...{date_to}  for topic {topic_id}")
             date_range = {}
@@ -242,7 +261,7 @@ def chat_handler():
 
         task = celery_client.send_task(
             'rag_queue', 
-            args=[query, history, topic_id, selected_sub_topics, metadata_filters, include_undated] 
+            args=[query, history, topic_id, selected_sub_topics, metadata_filters, include_undated, deep_search] 
         )
 
         return jsonify({

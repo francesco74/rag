@@ -16,6 +16,7 @@ COPY api/model_cache /app/model_cache/
 
 COPY api/src/. .
 COPY common/ ./common/
+COPY utils/ ./utils/
 
 ENV PYTHONUNBUFFERED=1
 ENV FASTEMBED_CACHE_PATH=/app/model_cache
