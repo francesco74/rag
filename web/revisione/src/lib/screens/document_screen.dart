@@ -1,6 +1,8 @@
 import 'dart:async';
+import 'dart:js_interop';
 
 import 'package:flutter/material.dart';
+import 'package:web/web.dart' as web;
 
 import '../api.dart';
 import '../widgets/common.dart';
@@ -32,11 +34,24 @@ class _DocumentScreenState extends State<DocumentScreen> {
   int _historyToken = 0;
   Timer? _poll;
 
+  // Blocco in modifica: chi può modificare apre il documento bloccandolo per
+  // gli altri e lo rinnova finché resta qui; gli altri lo vedono in sola
+  // lettura. Il backend rifiuta comunque i salvataggi senza blocco.
+  DocLock? _lock;
+  Timer? _lockTimer;
+  late final JSFunction _onPageHide =
+      ((web.Event _) => _releaseOnUnload()).toJS;
+
+  bool get _mayEdit => Permission.editing.any(_api.can);
+  bool get _haveLock => _lock?.heldByMe == true;
+
+  /// Blocco di un altro utente, se il documento è in revisione da lui.
+  DocLock? get _otherLock => _lock != null && !_lock!.heldByMe ? _lock : null;
+
   // Le funzioni non concesse dai ruoli restano visibili in sola lettura;
   // il backend rifiuta comunque le richieste senza il permesso.
-  bool get _canEditText => _api.can(Permission.editText);
-  bool get _canEditMetadata => _api.can(Permission.editMetadata);
-  bool get _canChangeStatus => _api.can(Permission.changeStatus);
+  bool get _canEditText => _api.can(Permission.editText) && _haveLock;
+  bool get _canChangeStatus => _api.can(Permission.changeStatus) && _haveLock;
 
   bool get _textDirty => _doc != null && _text.text != _doc!.content;
   bool get _dirty => _textDirty || _metaDirty;
@@ -51,8 +66,93 @@ class _DocumentScreenState extends State<DocumentScreen> {
   @override
   void dispose() {
     _poll?.cancel();
+    _lockTimer?.cancel();
+    if (_lockTimer != null) {
+      web.window.removeEventListener('pagehide', _onPageHide);
+    }
+    if (_haveLock) {
+      // Uscita dal documento: lo si libera subito per gli altri.
+      unawaited(_api.releaseLock(widget.docKey).catchError((_) {}));
+    }
     _text.dispose();
     super.dispose();
+  }
+
+  void _releaseOnUnload() {
+    if (_haveLock) _api.releaseLockOnUnload(widget.docKey);
+  }
+
+  /// Prende il blocco all'apertura e lo rinnova ogni terzo della sua durata.
+  void _startLocking(int ttlSeconds) {
+    final every = Duration(seconds: (ttlSeconds ~/ 3).clamp(20, 600));
+    _lockTimer = Timer.periodic(every, (_) => _refreshLock());
+    web.window.addEventListener('pagehide', _onPageHide);
+    _refreshLock();
+  }
+
+  Future<void> _refreshLock() async {
+    final before = _lock;
+    final DocLock? now;
+    try {
+      now = await _api.acquireLock(widget.docKey);
+    } catch (_) {
+      // Rete o servizio momentaneamente giù: si riprova al prossimo giro,
+      // il blocco dura più di un intervallo di rinnovo.
+      return;
+    }
+    if (!mounted) return;
+    setState(() => _lock = now);
+    final had = before?.heldByMe == true;
+    final has = now?.heldByMe == true;
+    if (before != null && !had && has) {
+      // Chi lo revisionava ha finito: si ricarica la sua versione.
+      await _load();
+      if (mounted) showInfo(context, 'Il documento è ora libero: puoi modificarlo.');
+    } else if (had && !has) {
+      _warnLockLost(now);
+    }
+  }
+
+  void _warnLockLost(DocLock? holder) {
+    showError(
+      context,
+      'Il documento è ora in revisione da ${holder?.displayName ?? 'un altro utente'}: '
+      'le modifiche non salvate restano visibili ma non si possono più salvare.',
+    );
+  }
+
+  /// Un salvataggio è stato rifiutato perché il blocco è di un altro.
+  void _onLocked(ApiException e) {
+    setState(() => _lock = e.lock);
+    _warnLockLost(e.lock);
+  }
+
+  Future<void> _forceRelease(DocLock holder) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Liberare il documento?'),
+        content: Text(
+            '${holder.displayName} non potrà più salvare le modifiche in corso. '
+            'Fallo solo se il blocco è rimasto appeso (ad esempio una scheda '
+            'dimenticata aperta).'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Annulla')),
+          FilledButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('Libera')),
+        ],
+      ),
+    );
+    if (ok != true || !mounted) return;
+    try {
+      await _api.releaseLock(widget.docKey, force: true);
+      await _refreshLock();
+    } catch (e) {
+      if (mounted) showError(context, e);
+    }
   }
 
   bool _wasTextDirty = false;
@@ -70,11 +170,13 @@ class _DocumentScreenState extends State<DocumentScreen> {
       setState(() {
         final replaceText = !keepText || !_textDirty;
         _doc = doc;
+        _lock = doc.lock;
         _loadError = null;
         if (replaceText) _text.text = doc.content;
         _wasTextDirty = _textDirty;
       });
       _schedulePoll();
+      if (_mayEdit && _lockTimer == null) _startLocking(doc.lockTtlSeconds);
     } catch (e) {
       if (mounted) setState(() => _loadError = e.toString());
     }
@@ -118,6 +220,7 @@ class _DocumentScreenState extends State<DocumentScreen> {
       if (!mounted) return;
       setState(() {
         _doc = updated;
+        _lock = updated.lock;
         _text.text = updated.content;
         _wasTextDirty = false;
         _historyToken++;
@@ -126,7 +229,9 @@ class _DocumentScreenState extends State<DocumentScreen> {
       showInfo(context, 'Testo salvato: re-indicizzazione avviata.');
     } on ApiException catch (e) {
       if (!mounted) return;
-      if (e.isConflict) {
+      if (e.isLocked) {
+        _onLocked(e);
+      } else if (e.isConflict) {
         await _showConflict(e.message);
       } else {
         showError(context, e);
@@ -161,14 +266,26 @@ class _DocumentScreenState extends State<DocumentScreen> {
         title: 'Salva metadati', confirmLabel: 'Salva');
     if (note == null || !mounted) return false;
     try {
-      final updated = await _api.saveMetadata(_doc!.key, meta, note: note);
+      final updated = await _api.saveMetadata(_doc!.key, meta,
+          baseHash: _doc!.metadataHash, note: note);
       if (!mounted) return true;
       setState(() {
         _doc = updated;
+        _lock = updated.lock;
         _historyToken++;
       });
       showInfo(context, 'Metadati salvati.');
       return true;
+    } on ApiException catch (e) {
+      if (!mounted) return false;
+      if (e.isLocked) {
+        _onLocked(e);
+      } else if (e.isConflict) {
+        await _showConflict(e.message);
+      } else {
+        showError(context, e);
+      }
+      return false;
     } catch (e) {
       if (mounted) showError(context, e);
       return false;
@@ -180,6 +297,9 @@ class _DocumentScreenState extends State<DocumentScreen> {
       await _api.setStatus(_doc!.key, status);
       await _load(keepText: true);
       if (mounted) setState(() => _historyToken++);
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      e.isLocked ? _onLocked(e) : showError(context, e);
     } catch (e) {
       if (mounted) showError(context, e);
     }
@@ -252,10 +372,19 @@ class _DocumentScreenState extends State<DocumentScreen> {
     );
   }
 
+  /// Perché una funzione concessa dal profilo è comunque bloccata.
+  String _lockedMessage() {
+    final other = _otherLock;
+    if (other != null) return 'Il documento è in revisione da ${other.displayName}.';
+    return 'Apertura del documento in modifica in corso…';
+  }
+
   Widget _statusMenu(ReviewDocument doc) {
     if (!_canChangeStatus) {
       return Tooltip(
-        message: 'Il tuo profilo non permette di cambiare lo stato',
+        message: _api.can(Permission.changeStatus)
+            ? _lockedMessage()
+            : 'Il tuo profilo non permette di cambiare lo stato',
         child: Padding(
           padding: const EdgeInsets.symmetric(horizontal: 8),
           child: StatusChip(doc.status),
@@ -315,6 +444,21 @@ class _DocumentScreenState extends State<DocumentScreen> {
   List<Widget> _banners(ReviewDocument doc) {
     final theme = Theme.of(context);
     final out = <Widget>[];
+    final other = _otherLock;
+    if (other != null) {
+      out.add(_banner(
+        theme.colorScheme.tertiaryContainer,
+        Icon(Icons.lock_person_outlined, color: theme.colorScheme.onTertiaryContainer),
+        'In revisione da ${other.displayName} dal ${formatDateTime(other.since)}: '
+        'puoi solo consultarlo.'
+        '${_mayEdit ? ' Diventerà modificabile da solo quando avrà finito.' : ''}',
+        action: _api.can(Permission.manageUsers)
+            ? TextButton(
+                onPressed: () => _forceRelease(other),
+                child: const Text('Libera il documento'))
+            : null,
+      ));
+    }
     final r = doc.reindex;
     if (r != null && r.isPending) {
       out.add(_banner(
@@ -343,7 +487,7 @@ class _DocumentScreenState extends State<DocumentScreen> {
     return out;
   }
 
-  Widget _banner(Color color, Widget leading, String text) => Material(
+  Widget _banner(Color color, Widget leading, String text, {Widget? action}) => Material(
         color: color,
         child: Padding(
           padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
@@ -351,14 +495,17 @@ class _DocumentScreenState extends State<DocumentScreen> {
             leading,
             const SizedBox(width: 12),
             Expanded(child: Text(text)),
+            if (action != null) ...[const SizedBox(width: 12), action],
           ]),
         ),
       );
 
   Widget _tabs(ReviewDocument doc, {required bool includeOriginal}) {
-    final locked = !_canEditMetadata
+    final locked = !_api.can(Permission.editMetadata)
         ? 'Il tuo profilo non permette di modificare i metadati.'
-        : doc.reindex?.isPending == true
+        : !_haveLock
+            ? _lockedMessage()
+            : doc.reindex?.isPending == true
             ? 'Re-indicizzazione in corso: i metadati saranno modificabili al termine.'
             : null;
     return DefaultTabController(
@@ -411,8 +558,10 @@ class _DocumentScreenState extends State<DocumentScreen> {
           child: Row(children: [
             Icon(Icons.lock_outline, size: 18, color: theme.colorScheme.outline),
             const SizedBox(width: 8),
-            const Expanded(
-                child: Text('Sola lettura: il tuo profilo non permette di correggere il testo.')),
+            Expanded(
+                child: Text(_api.can(Permission.editText)
+                    ? 'Sola lettura. ${_lockedMessage()}'
+                    : 'Sola lettura: il tuo profilo non permette di correggere il testo.')),
           ]),
         )
       else

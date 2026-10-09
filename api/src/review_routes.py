@@ -500,8 +500,12 @@ def logout():
     with Db() as db:
         db.execute("UPDATE review_users SET token_version = token_version + 1 WHERE id = %s",
                    (g.user["id"],))
+        # Le sessioni sono chiuse ovunque: i documenti che teneva aperti si
+        # liberano subito, senza aspettare la scadenza.
+        released = db.execute("DELETE FROM review_locks WHERE user_id = %s", (g.user["id"],))
         db.commit()
-    log.info(f"Logout di '{g.user['username']}'.")
+    log.info(f"Logout di '{g.user['username']}'"
+             f"{f' (documenti in revisione liberati: {released})' if released else ''}.")
     response = jsonify({"status": "logged_out"})
     response.delete_cookie(SESSION_COOKIE, path="/", samesite="Lax", secure=settings.session_cookie_secure)
     return response
@@ -749,7 +753,11 @@ def _load_document(db, source, topic_id, sub_topic_id, include_content=True):
         },
         "reindex": reindex,
         "has_text_package": text_path is not None,
+        "lock": _lock_info(_lock_row(db, source, topic_id, sub_topic_id)),
+        "lock_ttl_seconds": settings.review_lock_ttl_seconds,
     }
+    # Versione dei metadati: chi salva indica quella su cui ha lavorato.
+    doc["metadata_hash"] = _sha256(json.dumps(doc["metadata"], sort_keys=True, ensure_ascii=False, default=str))
     if original:
         mime, _ = mimetypes.guess_type(original.name)
         doc["original_file"] = {
@@ -788,6 +796,147 @@ def _set_status(db, source, topic_id, sub_topic_id, status, note=None):
         "updated_by = VALUES(updated_by), updated_at = CURRENT_TIMESTAMP",
         (source, topic_id, sub_topic_id, status, note, g.user["username"]),
     )
+
+
+# ==============================================================================
+# BLOCCO IN MODIFICA
+# ==============================================================================
+#
+# Un documento aperto da un revisore è bloccato per gli altri: lo consultano
+# in sola lettura. Il frontend rinnova il blocco finché il documento resta
+# aperto (POST /document/lock); senza rinnovi scade da solo dopo
+# REVIEW_LOCK_TTL_SECONDS (scheda chiusa, PC spento, rete persa). Testo,
+# metadati e stato si salvano solo con il blocco: chi lo ha perso riceve 409.
+# Gli orari sono quelli del database (NOW()), non dei pod.
+
+EDIT_PERMISSIONS = (PERM_TEXT, PERM_METADATA, PERM_STATUS)
+
+
+def _can_edit(user):
+    return any(p in user["permissions"] for p in EDIT_PERMISSIONS)
+
+
+def _lock_row(db, source, topic_id, sub_topic_id, for_update=False):
+    """Blocco ATTIVO del documento (quelli scaduti non contano), o None."""
+    return db.one(
+        "SELECT user_id, username, display_name, acquired_at, expires_at FROM review_locks "
+        "WHERE source = %s AND topic_id = %s AND sub_topic_id = %s AND expires_at > NOW()"
+        + (" FOR UPDATE" if for_update else ""),
+        (source, topic_id, sub_topic_id),
+    )
+
+
+def _lock_info(row):
+    if not row:
+        return None
+    return {
+        "held_by_me": row["user_id"] == g.user["id"],
+        "username": row["username"],
+        "display_name": row["display_name"] or row["username"],
+        "since": _iso(row["acquired_at"]),
+        "expires_at": _iso(row["expires_at"]),
+    }
+
+
+def _acquire_lock(db, source, topic_id, sub_topic_id):
+    """
+    Prende il blocco per g.user, o lo rinnova se è già suo; un blocco scaduto
+    passa a chi lo chiede. Ritorna il blocco attivo (di g.user o di chi lo
+    detiene), con la riga bloccata fino al commit: due salvataggi simultanei
+    sullo stesso documento si mettono in fila. Nessun commit qui.
+
+    Un'unica istruzione, senza DELETE dei blocchi scaduti prima dell'INSERT
+    (due richieste contemporanee si bloccherebbero a vicenda). In ON DUPLICATE
+    KEY UPDATE le assegnazioni si applicano in ordine e quelle successive
+    vedono i valori già aggiornati: user_id cambia per penultimo, quando le
+    altre colonne hanno già letto quello vecchio; expires_at, per ultimo, si
+    allunga solo se il blocco ora è di chi lo chiede.
+    """
+    user = g.user
+    db.execute(
+        "INSERT INTO review_locks (source, topic_id, sub_topic_id, user_id, username, display_name, "
+        "acquired_at, expires_at) VALUES (%s, %s, %s, %s, %s, %s, NOW(), NOW() + INTERVAL %s SECOND) "
+        "ON DUPLICATE KEY UPDATE "
+        "username = IF(user_id = VALUES(user_id) OR expires_at <= NOW(), VALUES(username), username), "
+        "display_name = IF(user_id = VALUES(user_id) OR expires_at <= NOW(), VALUES(display_name), display_name), "
+        "acquired_at = IF(expires_at <= NOW(), VALUES(acquired_at), acquired_at), "
+        "user_id = IF(user_id = VALUES(user_id) OR expires_at <= NOW(), VALUES(user_id), user_id), "
+        "expires_at = IF(user_id = VALUES(user_id), VALUES(expires_at), expires_at)",
+        (source, topic_id, sub_topic_id, user["id"], user["username"],
+         user.get("display_name") or user["username"], settings.review_lock_ttl_seconds),
+    )
+    return _lock_row(db, source, topic_id, sub_topic_id, for_update=True)
+
+
+def _require_lock(db, source, topic_id, sub_topic_id):
+    """Per le modifiche: il blocco deve essere di g.user (se è libero, lo prende)."""
+    row = _acquire_lock(db, source, topic_id, sub_topic_id)
+    if not row or row["user_id"] != g.user["id"]:
+        holder = (row["display_name"] or row["username"]) if row else "un altro utente"
+        log.info(f"Modifica di {source} rifiutata a '{g.user['username']}': documento in revisione da '{holder}'")
+        raise ApiError(409, f"Il documento è in revisione da {holder}: puoi solo consultarlo.",
+                       reason="locked", lock=_lock_info(row))
+    return row
+
+
+@bp.route("/document/lock", methods=["POST"])
+@require_permission(PERM_READ)
+def acquire_lock():
+    """
+    Prende o rinnova il blocco del documento. Risponde sempre con il blocco
+    attivo: "held_by_me" dice se è dell'utente o di qualcun altro.
+    """
+    data = request.get_json(silent=True) or {}
+    source, topic_id, sub_topic_id = _doc_key_from_request(data)
+    if not _can_edit(g.user):
+        raise ApiError(403, "Il tuo profilo non permette di modificare i documenti")
+    with Db() as db:
+        exists = db.one(
+            "SELECT 1 AS ok FROM parent_documents WHERE source = %s AND topic_id = %s "
+            "AND sub_topic_id = %s LIMIT 1",
+            (source, topic_id, sub_topic_id),
+        )
+        if not exists:
+            raise ApiError(404, "Documento non trovato")
+        row = _acquire_lock(db, source, topic_id, sub_topic_id)
+        db.commit()
+    info = _lock_info(row)
+    if info and info["held_by_me"]:
+        log.debug(f"Blocco di {source} a '{g.user['username']}' fino a {info['expires_at']}")
+    else:
+        log.info(f"'{g.user['username']}' apre {source} in sola lettura: in revisione da "
+                 f"'{info['username'] if info else '?'}'")
+    return jsonify({"lock": info, "ttl_seconds": settings.review_lock_ttl_seconds})
+
+
+@bp.route("/document/lock", methods=["DELETE"])
+@require_permission(PERM_READ)
+def release_lock():
+    """
+    Libera il blocco dell'utente (uscita dal documento). Con force=1 chi
+    gestisce gli utenti libera anche il blocco di un altro, rimasto appeso.
+    """
+    source, topic_id, sub_topic_id = _doc_key_from_request()
+    force = request.args.get("force", "").lower() in ("1", "true")
+    if force:
+        check_permission(g.user, PERM_USERS)
+    with Db() as db:
+        holder = _lock_row(db, source, topic_id, sub_topic_id)
+        if force:
+            released = db.execute(
+                "DELETE FROM review_locks WHERE source = %s AND topic_id = %s AND sub_topic_id = %s",
+                (source, topic_id, sub_topic_id))
+        else:
+            released = db.execute(
+                "DELETE FROM review_locks WHERE source = %s AND topic_id = %s AND sub_topic_id = %s "
+                "AND user_id = %s",
+                (source, topic_id, sub_topic_id, g.user["id"]))
+        db.commit()
+    if force and holder and holder["user_id"] != g.user["id"]:
+        log.warning(f"'{g.user['username']}' ha liberato d'autorità il blocco di '{holder['username']}' su {source}")
+    elif released:
+        log.debug(f"Blocco di {source} liberato da '{g.user['username']}'")
+    return jsonify({"released": released > 0})
 
 
 # ==============================================================================
@@ -864,6 +1013,8 @@ def list_documents():
         "FROM parent_documents p "
         "LEFT JOIN review_status s ON s.source = p.source AND s.topic_id = p.topic_id "
         "AND s.sub_topic_id = p.sub_topic_id "
+        "LEFT JOIN review_locks l ON l.source = p.source AND l.topic_id = p.topic_id "
+        "AND l.sub_topic_id = p.sub_topic_id AND l.expires_at > NOW() "
         "WHERE " + " AND ".join(where)
     )
 
@@ -872,7 +1023,8 @@ def list_documents():
         total = db.one(f"SELECT COUNT(*) AS n {base}", tuple(params))["n"]
         rows = db.all(
             f"SELECT p.source, p.topic_id, p.sub_topic_id, p.file_name, p.metadata, p.created_at, "
-            f"s.status, s.updated_by, s.updated_at AS status_updated_at "
+            f"s.status, s.updated_by, s.updated_at AS status_updated_at, "
+            f"l.user_id AS lock_user_id, COALESCE(l.display_name, l.username) AS locked_by "
             f"{base} ORDER BY p.created_at DESC, p.source LIMIT %s OFFSET %s",
             tuple(params) + (page_size, (page - 1) * page_size),
         )
@@ -896,6 +1048,9 @@ def list_documents():
             "status": r["status"] or "da_revisionare",
             "status_updated_by": r["updated_by"],
             "status_updated_at": _iso(r["status_updated_at"]),
+            # Chi ha il documento aperto in revisione (null se nessuno)
+            "locked_by": r["locked_by"],
+            "locked_by_me": r["lock_user_id"] == g.user["id"],
         })
     return jsonify({"items": items, "total": total, "page": page, "page_size": page_size})
 
@@ -1014,12 +1169,13 @@ def update_content():
               f"segna come revisionato={bool(data.get('mark_reviewed'))}")
 
     with Db() as db:
+        _require_lock(db, source, topic_id, sub_topic_id)
         doc, parents, (text_path, manifest_path, manifest) = _load_document(db, source, topic_id, sub_topic_id)
         if base_hash and base_hash != doc["content_hash"]:
             log.info(f"Conflitto sul testo di {source}: il client ha caricato {base_hash[:12]}, "
                      f"versione attuale {doc['content_hash'][:12]} (modificato da altri nel frattempo)")
             raise ApiError(409, "Il documento è stato modificato da un altro utente. Ricaricalo prima di salvare.",
-                           current_hash=doc["content_hash"])
+                           reason="modified", current_hash=doc["content_hash"])
         if new_content == doc["content"]:
             raise ApiError(400, "Nessuna modifica al testo")
 
@@ -1155,10 +1311,19 @@ def update_metadata():
     source, topic_id, sub_topic_id = _doc_key_from_request(data)
     new_meta = _validate_metadata(data.get("metadata"))
     note = (data.get("note") or "").strip() or None
+    base_hash = data.get("base_metadata_hash")
 
     with Db() as db:
+        _require_lock(db, source, topic_id, sub_topic_id)
         doc, parents, (_, manifest_path, manifest) = _load_document(db, source, topic_id, sub_topic_id,
                                                                      include_content=False)
+        # Concorrenza ottimistica, come per il testo: senza, chi salva un
+        # insieme di metadati caricato prima cancellerebbe in silenzio le
+        # modifiche fatte nel frattempo da altri (es. dopo un blocco scaduto).
+        if base_hash and base_hash != doc["metadata_hash"]:
+            log.info(f"Conflitto sui metadati di {source}: modificati da altri dopo il caricamento")
+            raise ApiError(409, "I metadati sono stati modificati da un altro utente. Ricarica il documento prima di salvare.",
+                           reason="modified")
         if doc["reindex"] and doc["reindex"]["state"] == "pending":
             raise ApiError(409, "Il documento è in re-indicizzazione: attendi il completamento prima di modificare i metadati.")
 
@@ -1255,6 +1420,7 @@ def update_status():
         )
         if not exists:
             raise ApiError(404, "Documento non trovato")
+        _require_lock(db, source, topic_id, sub_topic_id)
         old = db.one(
             "SELECT status FROM review_status WHERE source = %s AND topic_id = %s AND sub_topic_id = %s",
             (source, topic_id, sub_topic_id),

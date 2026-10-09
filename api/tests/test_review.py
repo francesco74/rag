@@ -14,9 +14,26 @@ sys.path[:0] = [str(ROOT / "api" / "src"), str(ROOT)]
 DB_PATH = str(TMP / "db.sqlite")
 
 
+# Blocco dei documenti in SQLite: in un upsert le espressioni vedono tutte i
+# valori VECCHI, quindi la condizione "il blocco è (o diventa) mio" si ripete.
+_LOCK_MINE = "(user_id = excluded.user_id OR expires_at <= CURRENT_TIMESTAMP)"
+_LOCK_UPSERT = (
+    "ON CONFLICT(source, topic_id, sub_topic_id) DO UPDATE SET "
+    f"username = CASE WHEN {_LOCK_MINE} THEN excluded.username ELSE username END, "
+    f"display_name = CASE WHEN {_LOCK_MINE} THEN excluded.display_name ELSE display_name END, "
+    "acquired_at = CASE WHEN expires_at <= CURRENT_TIMESTAMP THEN excluded.acquired_at ELSE acquired_at END, "
+    f"user_id = CASE WHEN {_LOCK_MINE} THEN excluded.user_id ELSE user_id END, "
+    f"expires_at = CASE WHEN {_LOCK_MINE} THEN excluded.expires_at ELSE expires_at END"
+)
+
+
 def translate(sql):
-    sql = sql.replace("%s", "?").replace("NOW()", "CURRENT_TIMESTAMP")
+    sql = sql.replace("%s", "?")
+    sql = re.sub(r"NOW\(\) \+ INTERVAL \? SECOND", "datetime(CURRENT_TIMESTAMP, '+' || ? || ' seconds')", sql)
+    sql = sql.replace("NOW()", "CURRENT_TIMESTAMP").replace(" FOR UPDATE", "")
     sql = sql.replace("AS CHAR)", "AS TEXT)").replace("CHAR_LENGTH(", "LENGTH(")
+    if "INSERT INTO review_locks" in sql:
+        sql = re.sub(r"ON DUPLICATE KEY UPDATE .*", _LOCK_UPSERT, sql)
     sql = re.sub(r"ON DUPLICATE KEY UPDATE .*",
                  "ON CONFLICT(source, topic_id, sub_topic_id) DO UPDATE SET status = excluded.status, "
                  "note = excluded.note, updated_by = excluded.updated_by, updated_at = CURRENT_TIMESTAMP", sql)
@@ -65,6 +82,8 @@ CREATE TABLE review_user_roles (user_id INT, role TEXT, PRIMARY KEY(user_id, rol
 CREATE TABLE review_user_topics (user_id INT, topic_id TEXT, PRIMARY KEY(user_id, topic_id));
 CREATE TABLE review_status (source TEXT, topic_id TEXT, sub_topic_id TEXT, status TEXT, note TEXT,
   updated_by TEXT, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(source, topic_id, sub_topic_id));
+CREATE TABLE review_locks (source TEXT, topic_id TEXT, sub_topic_id TEXT, user_id INT, username TEXT,
+  display_name TEXT, acquired_at TIMESTAMP, expires_at TIMESTAMP, PRIMARY KEY(source, topic_id, sub_topic_id));
 CREATE TABLE review_audit (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   user_id INT, username TEXT, action TEXT, source TEXT, topic_id TEXT, sub_topic_id TEXT,
   old_value TEXT, new_value TEXT, note TEXT, details TEXT);
@@ -238,6 +257,46 @@ check([i["action"] for i in h] == ["status", "content", "metadata"], f"storico {
 e = cl.get(f"/document/history/{h[1]['id']}", headers=H).json
 check(e["old_value"] != e["new_value"] and "errore" in e["new_value"], "voce di storico con prima/dopo")
 
+# --- blocco in modifica: un documento alla volta per revisore ---
+cn = sqlite3.connect(DB_PATH)
+HM, um = login("multi")
+d = cl.get("/document", headers=H, query_string=KEY).json
+check(d["lock"]["held_by_me"] and d["lock_ttl_seconds"] == 300, "chi ha salvato tiene il blocco (TTL 300 s)")
+d2 = cl.get("/document", headers=HM, query_string=KEY).json
+check(d2["lock"]["held_by_me"] is False and d2["lock"]["username"] == "mrossi", "un altro utente vede chi ha il documento")
+r = cl.post("/document/lock", headers=HM, json=KEY)
+check(r.status_code == 200 and r.json["lock"]["username"] == "mrossi" and not r.json["lock"]["held_by_me"],
+      "blocco richiesto da un altro: resta a mrossi")
+r = cl.put("/document/status", headers=HM, json={**KEY, "status": "in_revisione"})
+check(r.status_code == 409 and r.json["reason"] == "locked" and r.json["lock"]["username"] == "mrossi",
+      "modifica di un documento bloccato da altri -> 409 locked")
+it = [i for i in cl.get("/documents?q=strada", headers=HM).json["items"]][0]
+check(it["locked_by"] == "mrossi" and it["locked_by_me"] is False, "elenco: chi ha il documento aperto")
+r = cl.post("/document/lock", headers=H, json=KEY)
+check(r.json["lock"]["held_by_me"], "rinnovo del proprio blocco")
+HL0, _ = login("lettore1")
+check(cl.post("/document/lock", headers=HL0, json=KEY).status_code == 403, "lettore: niente blocco")
+r = cl.put("/document/metadata", headers=H, json={**KEY, "metadata": {**d["metadata"], "x": "1"},
+                                                   "base_metadata_hash": "vecchia"})
+check(r.status_code == 409 and r.json["reason"] == "modified", "metadati modificati nel frattempo -> 409 modified")
+
+# blocco scaduto: passa a chi lo chiede, e chi lo aveva non salva più
+cn.execute("UPDATE review_locks SET expires_at = datetime(CURRENT_TIMESTAMP, '-1 seconds')"); cn.commit()
+check(cl.get("/document", headers=HM, query_string=KEY).json["lock"] is None, "blocco scaduto: documento libero")
+r = cl.post("/document/lock", headers=HM, json=KEY)
+check(r.json["lock"]["held_by_me"] and r.json["lock"]["username"] == "multi", "blocco scaduto: lo prende chi lo chiede")
+r = cl.put("/document/metadata", headers=H, json={**KEY, "metadata": {**d["metadata"], "x": "1"},
+                                                   "base_metadata_hash": d["metadata_hash"]})
+check(r.status_code == 409 and r.json["reason"] == "locked", "chi ha perso il blocco non salva")
+check(cl.delete("/document/lock", headers=H, query_string=KEY).json["released"] is False,
+      "non si libera il blocco di un altro")
+check(cl.delete("/document/lock", headers=H, query_string={**KEY, "force": "1"}).status_code == 403,
+      "liberare d'autorità richiede la gestione utenti")
+HA0, _ = login("admin1")
+check(cl.delete("/document/lock", headers=HA0, query_string={**KEY, "force": "1"}).json["released"],
+      "l'amministratore libera un blocco appeso")
+check(cl.post("/document/lock", headers=HM, json=KEY).json["lock"]["held_by_me"], "poi il documento si riprende")
+
 # --- ruoli e permessi ---
 check(cl.get("/users", headers=H).status_code == 403, "revisore: /users -> 403")
 HA, _ = login("admin1")
@@ -361,6 +420,26 @@ check(anon.get("/files/inesistente/x/y.pdf").status_code == 404, "archivio inesi
 check(bm.get("/files/attiprovincia/determine/sub/x.jpg").status_code == 404,
       "documento indicizzato ma file assente su disco -> 404")
 
+# --- nomi di file con spazi e caratteri speciali ---
+from urllib.parse import quote
+for name in ["Allegato A - Schema DUP 2022 2024.pdf", "atto (1) [copia] perché è.pdf",
+             "50% sconto + IVA #2.pdf", "sotto cartella/file con spazi.pdf"]:
+    (proc / name).parent.mkdir(parents=True, exist_ok=True)
+    (proc / name).write_bytes(b"%PDF " + name.encode())
+    src = f"direct://attiprovincia/determine/{name}"
+    cn.execute("INSERT INTO parent_documents (id, topic_id, sub_topic_id, source, file_name, parent_index, content, metadata) "
+               "VALUES (?, 'attiprovincia', 'determine', ?, ?, 0, 'testo', '{}')", (f"sp-{name}", src, name)); cn.commit()
+    # come il frontend: ogni segmento codificato (Uri.encodeComponent)
+    url = "/files/attiprovincia/determine/" + "/".join(quote(seg, safe="") for seg in name.split("/"))
+    r = bm.get(url)
+    check(r.status_code == 200 and r.data == b"%PDF " + name.encode()
+          and quote(pathlib.PurePosixPath(name).name) in r.headers["Content-Disposition"],
+          f"file con nome {name!r}: scaricato")
+    d = cl.get("/document", headers=HA0, query_string=dict(source=src, topic_id="attiprovincia",
+                                                           sub_topic_id="determine")).json
+    check(d["original_file"] and d["original_file"]["name"] == pathlib.PurePosixPath(name).name,
+          f"file con nome {name!r}: trovato dalla revisione")
+
 # --- metadati "sporchi" (parent migrati da Qdrant con le chiavi di sistema) ---
 from common.utility import split_protected_metadata
 clean, dropped = split_protected_metadata({"oggetto": "x", "content": "t", "source": "s"}, ra.settings.protected_keys)
@@ -440,6 +519,13 @@ check(chat.get("/auth/me").status_code == 401 and chat.get(ATTO).status_code == 
       "dopo il logout dalla chat: niente sessione né documenti riservati")
 check(browser().post("/auth/login", json={"username": "mrossi", "password": "sbagliata"}).status_code == 401,
       "/auth/login con password errata -> 401")
+
+# --- il logout libera i documenti aperti ---
+HDL, _ = login("solodelibere")
+check(cl.post("/document/lock", headers=HDL, json=DKEY).json["lock"]["held_by_me"], "blocco preso prima del logout")
+cl.post("/auth/logout", headers=HDL)
+check(cn.execute("SELECT COUNT(*) FROM review_locks WHERE username = 'solodelibere'").fetchone()[0] == 0,
+      "logout: blocchi liberati")
 
 # --- disattivazione utente invalida il token ---
 cn.execute("UPDATE review_users SET active=0, token_version=token_version+1"); cn.commit()

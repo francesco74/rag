@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'api.dart';
 import 'screens/documents_screen.dart';
 import 'screens/login_screen.dart';
+import 'screens/maintenance_screen.dart';
 import 'screens/no_access_screen.dart';
 import 'settings.dart';
 
@@ -28,8 +29,9 @@ class ReviewApp extends StatelessWidget {
   }
 }
 
-/// Mostra il login, l'elenco documenti o l'avviso di accesso non abilitato
-/// a seconda della sessione e dei permessi dell'utente.
+/// Verifica che il servizio risponda (altrimenti pagina di manutenzione),
+/// poi mostra il login, l'elenco documenti o l'avviso di accesso non
+/// abilitato a seconda della sessione e dei permessi dell'utente.
 class _SessionGate extends StatefulWidget {
   const _SessionGate();
 
@@ -38,15 +40,27 @@ class _SessionGate extends StatefulWidget {
 }
 
 class _SessionGateState extends State<_SessionGate> {
-  late final Future<bool> _restore = ReviewApi.instance.restoreSession();
+  late Future<bool> _start = _connect();
+
+  /// false = servizio non disponibile. La sessione si ripristina solo a
+  /// servizio raggiungibile: altrimenti un errore di rete la cancellerebbe.
+  Future<bool> _connect() async {
+    if (!await ReviewApi.instance.isAvailable()) return false;
+    await ReviewApi.instance.restoreSession();
+    return true;
+  }
 
   @override
   Widget build(BuildContext context) {
     return FutureBuilder<bool>(
-      future: _restore,
+      future: _start,
       builder: (context, snap) {
         if (snap.connectionState != ConnectionState.done) {
           return const Scaffold(body: Center(child: CircularProgressIndicator()));
+        }
+        if (snap.data != true) {
+          return MaintenanceScreen(
+              onRetry: () => setState(() => _start = _connect()));
         }
         return ValueListenableBuilder<ReviewUser?>(
           valueListenable: ReviewApi.instance.currentUser,

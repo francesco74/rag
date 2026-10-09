@@ -6,7 +6,7 @@ from celery import Celery
 from celery.signals import setup_logging
 from celery.signals import worker_process_init, worker_shutdown
 from celery.schedules import crontab
-from common.utility import normalize_ws
+from common.utility import clean_ocr_text, normalize_ws
 from mysql.connector import pooling
 from qdrant_client import QdrantClient, models
 import math
@@ -2791,7 +2791,10 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
             source = p_doc.get("source", "Fonte_Sconosciuta")
             file_name = p_doc.get("file_name", "File_Sconosciuto")
             sub_topic_id = p_doc.get("sub_topic_id", "")
-            content = p_doc.get("content", "").strip()
+            # Rientri e allineamenti dell'OCR (&nbsp; a decine) sono token
+            # sprecati per l'LLM: si tolgono qui, prima di misurare e ritagliare
+            # i passaggi, così lo spazio recuperato va ad altri documenti.
+            content = clean_ocr_text(p_doc.get("content", "")).strip()
 
             # Data del documento (per "Date:") e metadati da mostrare al
             # generatore, dal JSON dei metadati salvato in MySQL.
@@ -2799,8 +2802,13 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
 
             if content:
                 pid = p_doc.get("id")
+                # Pezzi ripuliti come il parent, così si ritrovano nel testo
+                # pulito; gli offset si riferiscono al testo originale e non
+                # valgono più (resta la ricerca testuale, tollerante agli spazi).
                 matched_snippets = [
-                    s for s in parent_top_snippets.get(pid, []) if s.get("content")
+                    {**{k: v for k, v in s.items() if k not in ("start_char", "end_char")},
+                     "content": clean_ocr_text(s["content"])}
+                    for s in parent_top_snippets.get(pid, []) if s.get("content")
                 ]
                 q_idx = pid_to_query_idx.get(pid, 0)
                 # Testi delle sottoquery che hanno recuperato questo parent:

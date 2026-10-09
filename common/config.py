@@ -81,6 +81,10 @@ class Settings:
     # Pagina di login proposta a chi apre un documento riservato senza
     # essere autenticato.
     files_login_url: str
+    # Revisione: un documento aperto da un revisore è bloccato per gli altri.
+    # Il frontend rinnova il blocco finché il documento resta aperto; senza
+    # rinnovi (scheda chiusa, PC spento) scade dopo questi secondi.
+    review_lock_ttl_seconds: int
 
     hostname: str
 
@@ -412,6 +416,7 @@ def load_settings() -> Settings:
                                 not in ("0", "false", "no", "off"),
         files_x_accel_prefix = os.environ.get("FILES_X_ACCEL_PREFIX", "").strip(),
         files_login_url = os.environ.get("FILES_LOGIN_URL", "/revisione/").strip() or "/revisione/",
+        review_lock_ttl_seconds = max(60, int(os.environ.get("REVIEW_LOCK_TTL_SECONDS") or 300)),
 
         hostname = os.environ.get("HOSTNAME", socket.gethostname()),
 

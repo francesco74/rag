@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:js_interop';
 
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
@@ -8,15 +9,24 @@ import 'settings.dart';
 
 /// Errore restituito dal servizio di revisione.
 class ApiException implements Exception {
-  ApiException(this.statusCode, this.message, {this.details = const []});
+  ApiException(this.statusCode, this.message,
+      {this.details = const [], this.reason, this.lock});
 
   final int statusCode;
   final String message;
   final List<String> details;
 
+  /// Per i 409: "locked" (documento in revisione da un altro utente) oppure
+  /// "modified" (salvato da altri dopo il caricamento).
+  final String? reason;
+
+  /// Con reason "locked": chi ha il documento.
+  final DocLock? lock;
+
   bool get isUnauthorized => statusCode == 401;
   bool get isForbidden => statusCode == 403;
   bool get isConflict => statusCode == 409;
+  bool get isLocked => statusCode == 409 && reason == 'locked';
 
   @override
   String toString() =>
@@ -32,6 +42,10 @@ abstract final class Permission {
   static const editMetadata = 'documenti.metadati';
   static const changeStatus = 'documenti.stato';
   static const manageUsers = 'utenti.gestione';
+
+  /// Chi ha almeno uno di questi permessi apre i documenti in modifica
+  /// (e li blocca per gli altri).
+  static const editing = [editText, editMetadata, changeStatus];
 }
 
 class ReviewUser {
@@ -95,7 +109,9 @@ class DocumentSummary {
         data = j['data']?.toString(),
         indexedAt = j['indexed_at'] as String?,
         status = j['status'] as String,
-        statusUpdatedBy = j['status_updated_by'] as String?;
+        statusUpdatedBy = j['status_updated_by'] as String?,
+        lockedBy = j['locked_by'] as String?,
+        lockedByMe = j['locked_by_me'] as bool? ?? false;
 
   final DocKey key;
   final String? fileName;
@@ -106,6 +122,10 @@ class DocumentSummary {
   final String? indexedAt;
   final String status;
   final String? statusUpdatedBy;
+
+  /// Chi ha il documento aperto in revisione (null se nessuno).
+  final String? lockedBy;
+  final bool lockedByMe;
 }
 
 class DocumentPage {
@@ -149,6 +169,26 @@ class OriginalFile {
       mimeType.startsWith('text/');
 }
 
+/// Blocco in modifica: un documento è aperto in revisione da un utente alla
+/// volta; gli altri lo consultano in sola lettura.
+class DocLock {
+  DocLock.fromJson(Map<String, dynamic> j)
+      : heldByMe = j['held_by_me'] as bool? ?? false,
+        username = j['username'] as String,
+        displayName = (j['display_name'] ?? j['username']) as String,
+        since = j['since'] as String?,
+        expiresAt = j['expires_at'] as String?;
+
+  static DocLock? maybe(Object? j) =>
+      j is Map ? DocLock.fromJson(Map<String, dynamic>.from(j)) : null;
+
+  final bool heldByMe;
+  final String username;
+  final String displayName;
+  final String? since;
+  final String? expiresAt;
+}
+
 class ReindexState {
   ReindexState.fromJson(Map<String, dynamic> j)
       : state = j['state'] as String,
@@ -187,7 +227,10 @@ class ReviewDocument {
             : ReindexState.fromJson(j['reindex'] as Map<String, dynamic>),
         content = j['content'] as String? ?? '',
         contentOrigin = j['content_origin'] as String?,
-        contentHash = j['content_hash'] as String?;
+        contentHash = j['content_hash'] as String?,
+        metadataHash = j['metadata_hash'] as String?,
+        lock = DocLock.maybe(j['lock']),
+        lockTtlSeconds = j['lock_ttl_seconds'] as int? ?? 300;
 
   final DocKey key;
   final String? fileName;
@@ -203,6 +246,9 @@ class ReviewDocument {
   final String content;
   final String? contentOrigin;
   final String? contentHash;
+  final String? metadataHash;
+  final DocLock? lock;
+  final int lockTtlSeconds;
 
   String get title =>
       (metadata['oggetto'] as String?)?.trim().isNotEmpty == true
@@ -244,6 +290,17 @@ class ReviewApi {
   String? _token;
 
   String? get _storedToken => web.window.sessionStorage.getItem(_tokenKey);
+
+  /// Il backend risponde? Usa il /health dell'API (senza autenticazione):
+  /// 200 se il servizio è attivo e il database raggiungibile.
+  Future<bool> isAvailable() async {
+    try {
+      final res = await http.get(Uri.parse(AppSettings.healthUrl));
+      return res.statusCode == 200;
+    } catch (_) {
+      return false;
+    }
+  }
 
   /// Ripristina la sessione salvata, se ancora valida.
   Future<bool> restoreSession() async {
@@ -346,11 +403,41 @@ class ReviewApi {
     return ReviewDocument.fromJson(res['document'] as Map<String, dynamic>);
   }
 
-  Future<ReviewDocument> saveMetadata(
-      DocKey key, Map<String, dynamic> metadata, {String? note}) async {
-    final res = await _request('PUT', '/document/metadata',
-        body: {...key.toJson(), 'metadata': metadata, 'note': note});
+  Future<ReviewDocument> saveMetadata(DocKey key, Map<String, dynamic> metadata,
+      {required String? baseHash, String? note}) async {
+    final res = await _request('PUT', '/document/metadata', body: {
+      ...key.toJson(),
+      'metadata': metadata,
+      'base_metadata_hash': baseHash,
+      'note': note,
+    });
     return ReviewDocument.fromJson(res['document'] as Map<String, dynamic>);
+  }
+
+  /// Prende o rinnova il blocco del documento. Ritorna il blocco attivo:
+  /// [DocLock.heldByMe] dice se è nostro o di chi lo sta revisionando.
+  Future<DocLock?> acquireLock(DocKey key) async =>
+      DocLock.maybe((await _request('POST', '/document/lock',
+          body: key.toJson()))['lock']);
+
+  /// Libera il blocco; con [force] (gestione utenti) anche quello di un altro.
+  Future<void> releaseLock(DocKey key, {bool force = false}) =>
+      _request('DELETE', '/document/lock',
+          query: {...key.toJson(), if (force) 'force': '1'});
+
+  /// Libera il blocco mentre la pagina si chiude (scheda chiusa, ricarica):
+  /// una richiesta normale verrebbe interrotta, una "keepalive" no. Se non
+  /// parte comunque, il blocco scade da solo.
+  void releaseLockOnUnload(DocKey key) {
+    final token = _token;
+    if (token == null) return;
+    final uri = Uri.parse('${AppSettings.apiUrl}/document/lock')
+        .replace(queryParameters: key.toJson());
+    try {
+      final headers = web.Headers()..append('Authorization', 'Bearer $token');
+      web.window.fetch(uri.toString().toJS,
+          web.RequestInit(method: 'DELETE', headers: headers, keepalive: true));
+    } catch (_) {}
   }
 
   Future<void> setStatus(DocKey key, String status, {String? note}) =>
@@ -384,6 +471,7 @@ class ReviewApi {
         'GET' => await http.get(uri, headers: headers),
         'POST' => await http.post(uri, headers: headers, body: encoded),
         'PUT' => await http.put(uri, headers: headers, body: encoded),
+        'DELETE' => await http.delete(uri, headers: headers),
         _ => throw ArgumentError(method),
       };
     } catch (e) {
@@ -408,6 +496,8 @@ class ReviewApi {
       (data['error'] ?? 'Errore ${res.statusCode}').toString(),
       details: (data['details'] as List?)?.map((e) => e.toString()).toList() ??
           const [],
+      reason: data['reason'] as String?,
+      lock: DocLock.maybe(data['lock']),
     );
   }
 }

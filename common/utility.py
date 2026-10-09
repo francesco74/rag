@@ -117,6 +117,61 @@ def normalize_ws(text: str) -> str:
         return text
     return _WS_RE.sub(' ', text).strip()
 
+# Spazio non separabile scritto dall'OCR come entità HTML o come carattere.
+_NBSP = r'(?:&nbsp;|&#160;|&#xa0;|\xa0)'
+_NBSP_RE = re.compile(_NBSP, re.IGNORECASE)
+_LEADING_RE = re.compile(rf'^(?:[ \t]|{_NBSP})*', re.IGNORECASE)
+_MARK_RE = re.compile(r'</?mark\s*>', re.IGNORECASE)
+_GAP_RE = re.compile(r' {3,}')            # colonne allineate a spazi
+_SPACES_RE = re.compile(r' {2,}')
+_BLANK_LINES_RE = re.compile(r'\n{3,}')
+
+
+def clean_ocr_text(text: str) -> str:
+    """
+    Toglie dal testo OCR gli spazi usati per imitare l'impaginazione, senza
+    perdere la struttura Markdown né le colonne di dati.
+
+    L'OCR riproduce rientri e allineamenti con sequenze di &nbsp; (decine per
+    una firma allineata a destra): per l'LLM sono solo token sprecati, perché
+    non "vede" la pagina. Regole, riga per riga:
+      - rientro iniziale fatto con &nbsp; (impaginazione): tolto. Un rientro
+        di soli spazi normali resta: in Markdown annida elenchi e codice;
+      - 3 o più spazi dentro la riga (colonne allineate): una tabulazione, che
+        l'LLM legge come "colonna successiva" ("Repairs  £45   £12");
+      - 2 spazi dentro la riga (es. dopo il punto, a macchina): uno;
+      - nelle righe di tabella Markdown (| ... |) gli spazi multipli sono solo
+        imbottitura delle celle: uno;
+      - spazi a fine riga: tolti; più di una riga vuota di fila: una;
+      - tag <mark> dell'OCR: tolti, il testo che racchiudono resta.
+    I blocchi di codice (```) restano come sono.
+    """
+    if not text:
+        return text
+    text = _MARK_RE.sub('', text)
+    out = []
+    in_code = False
+    for line in text.split('\n'):
+        if line.lstrip().startswith('```'):
+            in_code = not in_code
+            out.append(line.rstrip())
+            continue
+        if in_code:
+            out.append(line)
+            continue
+        lead = _LEADING_RE.match(line).group(0)
+        body = line[len(lead):]
+        # Rientro con &nbsp; = impaginazione dell'OCR; solo spazi = Markdown
+        indent = '' if _NBSP_RE.search(lead) else lead.replace('\t', '    ')
+        body = _NBSP_RE.sub(' ', body).replace('\t', '   ').rstrip()
+        if body.startswith('|'):
+            body = _SPACES_RE.sub(' ', body)
+        else:
+            body = _SPACES_RE.sub(' ', _GAP_RE.sub('\t', body))
+        out.append(indent + body)
+    return _BLANK_LINES_RE.sub('\n\n', '\n'.join(out)).strip('\n')
+
+
 def clean_iso_date(date_raw: Optional[str]) -> Optional[str]:
     """
     Normalizza una data proveniente da Sicr@Web al formato ISO 'YYYY-MM-DD'.

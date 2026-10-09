@@ -41,6 +41,7 @@ Gli endpoint sono già dentro `app.py`: non c'è un nuovo servizio da pubblicare
 | `AUTH_SECRET_KEY` | **Obbligatoria**, almeno 32 caratteri casuali (es. `openssl rand -hex 32`). Firma i token di sessione e i link temporanei; è pensata per essere condivisa dai futuri servizi con login (ognuno separa i propri token con un salt diverso). Va solo nell'API, mai nei frontend. Se manca, le rotte `/review` rispondono 503 e la chat continua a funzionare. Il vecchio nome `REVIEW_SECRET_KEY` è ancora accettato |
 | `ALLOWED_ORIGINS` | Aggiungi l'URL del frontend di revisione, per il CORS |
 | `REVIEW_SESSION_HOURS` | Durata della sessione, default 10 |
+| `REVIEW_LOCK_TTL_SECONDS` | Un documento aperto da un revisore è bloccato per gli altri (sola lettura); il frontend rinnova il blocco ogni terzo di questo tempo. Senza rinnovi (scheda chiusa, PC spento) scade dopo questi secondi. Default 300, minimo 60. Richiede la tabella `review_locks` (`misc/migrations/review_locks.sql`) |
 | `FILES_X_ACCEL_PREFIX` | Prefisso della location `internal` di nginx da cui inviare i documenti (in k8s `/_protected_files/`, vedi sotto). Vuoto: i file li invia l'API (sviluppo senza nginx) |
 | `FILES_LOGIN_URL` | Pagina di login proposta a chi apre un documento riservato senza essere autenticato, default `/revisione/` |
 | `SESSION_COOKIE_SECURE` | Default `true`: il cookie di sessione viaggia solo su HTTPS. `false` solo per lo sviluppo in http su un host diverso da localhost |

@@ -34,7 +34,7 @@ from tenacity import (
 
 from common.db_logger import MySQLLogHandler, get_db_connection, init_db_pool
 from common.config import settings
-from common.utility import split_protected_metadata
+from common.utility import clean_ocr_text, split_protected_metadata
 
 # ==============================================================================
 # 1. CONFIGURATION & LOGGING SETUP
@@ -329,6 +329,10 @@ async def process_single_file_async(topic_id, sub_topic_id, json_path, root_fold
         try:
             # Lettura del testo — necessaria tutta in RAM per lo splitting
             full_text = await asyncio.to_thread(text_file_path.read_text, encoding='utf-8')
+            # Rientri e allineamenti dell'OCR (&nbsp; a decine) non entrano in
+            # parent, chunk ed embedding. Il file .md su disco resta com'è: la
+            # revisione mostra al revisore l'impaginazione dell'OCR.
+            full_text = clean_ocr_text(full_text)
             if not full_text.strip():
                 log.warning(f"Contenuto file vuoto per '{text_file_path.name}'. Scartato.")
                 await finalize_file_move(json_path, root_folder, topic_id, sub_topic_id, error_msg="Contenuto file vuoto.")

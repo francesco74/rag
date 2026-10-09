@@ -42,6 +42,11 @@ class AppSettings {
     return Uri.parse('$api/').resolve('../files').toString();
   }
 
+  /// Verifica di funzionamento: il /health dell'API, lo stesso della chat.
+  /// Si ricava da REVIEW_API_URL: .../api/review -> .../api/health.
+  static String get healthUrl =>
+      Uri.parse('$apiUrl/').resolve('../health').toString();
+
   static String get projectName {
     final value = envConfigJS?.PROJECT_NAME;
     return (value == null || value.isEmpty) ? _defaultProjectName : value;

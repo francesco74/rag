@@ -272,6 +272,25 @@ CREATE TABLE IF NOT EXISTS review_status (
     KEY idx_status (topic_id, sub_topic_id, status)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
+CREATE TABLE IF NOT EXISTS review_locks (
+    -- Un documento aperto da un revisore è bloccato per gli altri finché il
+    -- frontend rinnova il blocco; scade da solo dopo REVIEW_LOCK_TTL_SECONDS.
+    -- Le righe scadute restano finché qualcuno non riprende il documento:
+    -- contano solo quelle con expires_at > NOW().
+    source        VARCHAR(255) NOT NULL,
+    topic_id      VARCHAR(255) NOT NULL,
+    sub_topic_id  VARCHAR(255) NOT NULL,
+    user_id       INT          NOT NULL,
+    username      VARCHAR(100) NOT NULL,
+    display_name  VARCHAR(255),
+    acquired_at   TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    expires_at    TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (source, topic_id, sub_topic_id),
+    KEY idx_user (user_id),
+    CONSTRAINT fk_review_locks_user FOREIGN KEY (user_id)
+        REFERENCES review_users (id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
 CREATE TABLE IF NOT EXISTS review_audit (
     id            BIGINT AUTO_INCREMENT PRIMARY KEY,
     created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,

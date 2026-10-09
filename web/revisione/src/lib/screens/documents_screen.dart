@@ -271,11 +271,28 @@ class _DocumentsScreenState extends State<DocumentsScreen> {
             crossAxisAlignment: CrossAxisAlignment.end,
             children: [
               StatusChip(d.status),
-              if (d.statusUpdatedBy != null)
+              // Chi ha il documento aperto conta più di chi ne ha cambiato
+              // lo stato: una riga sola, la tile ha altezza fissa.
+              if (d.lockedBy == null && d.statusUpdatedBy != null)
                 Padding(
                   padding: const EdgeInsets.only(top: 2),
                   child: Text(d.statusUpdatedBy!,
                       style: theme.textTheme.bodySmall),
+                ),
+              if (d.lockedBy != null)
+                Padding(
+                  padding: const EdgeInsets.only(top: 2),
+                  child: Row(mainAxisSize: MainAxisSize.min, children: [
+                    Icon(Icons.lock_person_outlined,
+                        size: 14, color: theme.colorScheme.tertiary),
+                    const SizedBox(width: 4),
+                    Text(
+                        d.lockedByMe
+                            ? 'Aperto da te'
+                            : 'In revisione da ${d.lockedBy}',
+                        style: theme.textTheme.bodySmall
+                            ?.copyWith(color: theme.colorScheme.tertiary)),
+                  ]),
                 ),
             ],
           ),
