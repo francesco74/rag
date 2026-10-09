@@ -240,7 +240,7 @@ CREATE TABLE IF NOT EXISTS review_users (
 
 -- Ruoli degli utenti di revisione: un utente può averne più d'uno. I nomi
 -- dei ruoli e i permessi che concedono sono definiti in
--- api/src/review_permissions.py (VARCHAR e non ENUM: un nuovo ruolo non
+-- common/review_permissions.py (VARCHAR e non ENUM: un nuovo ruolo non
 -- richiede di modificare lo schema).
 CREATE TABLE IF NOT EXISTS review_user_roles (
     user_id  INT         NOT NULL,

@@ -12,6 +12,8 @@ I sistemi RAG tradizionali (_Naïve RAG_) soffrono di limitazioni strutturali e 
 
 Questo sistema risolve tali sfide combinando un'architettura gerarchica dei dati **Parent-Child** (Parent Document Retriever) per conservare il contesto originario , una pipeline di ingestion guidata da eventi asincroni (**RabbitMQ**), un motore di retrieval basato su **Reranker Cross-Encoder locale** in ambiente Celery protetto da deadlock, un sistema di **Analisi Concettuale** per l'espansione dei sinonimi della Pubblica Amministrazione , un algoritmo di **Ripartizione e Redistribuzione Attiva delle Quote di Contesto**, e un **Ciclo di Autocorrezione con Grader CoT** (Chain of Thought) a feedback automatico.
 
+Attorno al motore di risposta, un sottosistema di **revisione documentale** (applicazione web `revisione` e rotte `/review` dell'API) permette al personale abilitato di correggere i testi e i metadati indicizzati, con ruoli, archivi assegnati, storico e blocco in modifica; la stessa autenticazione governa l'accesso ai **file originali** (`/files`) degli archivi riservati (capitolo 6).
+
 ## 2. Topologia dei Servizi ed Event-Driven Workflow
 
 Il sistema adotta una topologia a microservizi debolmente accoppiati, progettati per garantire scalabilità orizzontale, tolleranza ai guasti e isolamento dei carichi computazionali.
@@ -65,14 +67,36 @@ Il sistema adotta una topologia a microservizi debolmente accoppiati, progettati
 
 ```
 
+Frontend e accesso ai documenti (stessa API, stesso database):
+
+```
+ ┌──────────────────┐   ┌──────────────────┐        ┌────────────────────────────┐
+ │  Chat (Flutter)  │   │ Revisione        │        │ nginx                      │
+ │  attiamministr., │   │ (Flutter Web)    │        │  /api/*  ──► API Gateway   │
+ │  archiviogreenl. │   │                  │        │  /_protected_files/ (int.) │
+ └───┬──────────┬───┘   └────────┬─────────┘        └──────────────▲─────────────┘
+     │ /chat    │ /files, /auth  │ /review, /auth, /files           │ X-Accel-Redirect
+     ▼          ▼                ▼                                  │
+ ┌───────────────────────────────────────────────────────────────┐  │
+ │ API Gateway (app.py): blueprint review / auth / files ────────┼──┘
+ └───────┬───────────────────────────────┬───────────────────────┘
+         │ correzione del testo          │ metadati: MySQL + set_payload Qdrant
+         ▼ (pacchetto in watch/ + RabbitMQ: "da-indicizzare")
+ ┌─────────────────┐
+ │  Worker Ingest  │  rigenera parent e chunk del documento
+ └─────────────────┘
+```
+
 ### I Componenti Centrali:
 
-1. **API Gateway (`app.py` - Flask)**: Espone le interfacce REST protette da Bearer Token. Gestisce il bootstrap caricando le rotte e i topic dinamici, convalida le richieste di chat, raccoglie i feedback e delega in modalità non bloccante la computazione pesante a Celery, rispondendo istantaneamente con un codice `202 Accepted` per l'avvio del polling.
+1. **API Gateway (`app.py` - Flask)**: Espone le interfacce REST della chat protette da Bearer Token (`API_SECRET_KEY`) e registra i blueprint `review` (`/review`), `auth` (`/auth`) e `files` (`/files`), che si autenticano da sé con le credenziali personali degli utenti (`SELF_AUTHENTICATED_PREFIXES`) e non accettano il token della chat. Gestisce il bootstrap caricando le rotte e i topic dinamici, convalida le richieste di chat, raccoglie i feedback e delega in modalità non bloccante la computazione pesante a Celery, rispondendo istantaneamente con un codice `202 Accepted` per l'avvio del polling.
 2. **Celery Worker (`worker.py`)**: Il vero motore di ricerca e generazione. Gestisce la trasformazione semantica della query, la ricerca ibrida parallela, il riordinamento Cross-Encoder locale, la generazione strutturata e l'auditing qualitativo della risposta (Grader).
 3. **Estrattore Massivo (`estrattore.py` - CLI / CronJob)**: Il ponte di collegamento con la suite Sicr@Web dell'Ente Locale. Invia richieste SOAP ai WS di ricerca ed estrazione, gestisce l'autenticazione applicativa ed estrae i flussi binari in sicurezza.
 4. **Wrapper Diretti (`direct.py` - CLI / Daemon)**: Scansiona la cartella di ingresso locale per i documenti caricati manualmente, mantiene la gerarchia delle cartelle convertendola in copie `topic_id/sub_topic_id` e pubblica gli eventi su RabbitMQ.
 5. **Convertitore Documentale (`converter.py` - Worker Async)**: Elabora asincronamente i PDF e le immagini. Esegue l'estrazione testuale nativa o l'OCR avanzato tramite Gemini Vision, con fallback asincrono su Google Cloud Vision API in caso di blocco delle policy di sicurezza.
 6. **Worker Ingest (`ingest.py` - Worker Async)**: Frammenta i documenti normalizzati in strutture gerarchiche Parent-Child, genera gli embedding vettoriali e popola in modo transazionale MySQL e Qdrant.
+7. **Revisione (`web/revisione` - Flutter Web, `review_routes.py`)**: Applicazione di correzione di testi, metadati e stato di revisione, con autenticazione, ruoli, archivi assegnati, storico e blocco in modifica (capitolo 6).
+8. **Download dei documenti (`files_routes.py` + nginx)**: Unico punto di accesso ai file originali per chat e revisione. L'API decide l'accesso (archivio pubblico o utente autenticato e abilitato) e delega l'invio del file a nginx tramite `X-Accel-Redirect`.
 
 ## 3. Pipeline d'Ingestione Documentale End-to-End
 
@@ -126,16 +150,21 @@ Il worker di ingestion consuma l'evento sulla coda `da-indicizzare`, applicando 
 
 1. **Risoluzione dei Parametri dal DB**:
    - Recupera i parametri di chunking interrogando la tabella MySQL `sub_topics`. Se non presenti, applica i default di sistema (`chunk_size = 500`, `chunk_overlap = 100`, `parent_chunk_size = 1500`, `use_markdown_splitter = True`).
-2. **Splitting Gerarchico Parent-Child**:
+   - Le chiavi di sistema (`settings.protected_keys`) eventualmente presenti tra i `metadati` del manifest vengono scartate con un WARNING (`split_protected_metadata`): i campi di sistema li imposta l'ingest.
+2. **Pulizia del testo OCR (`clean_ocr_text`, `common/utility.py`)**:
+   - Prima dello splitting il testo viene ripulito degli spazi con cui l'OCR imita l'impaginazione: rientri fatti con `&nbsp;` (decine per una firma allineata a destra) rimossi; sequenze di 3+ spazi dentro la riga (colonne allineate) sostituite da una tabulazione; doppi spazi ridotti a uno; imbottitura delle celle delle tabelle Markdown, spazi finali, righe vuote ripetute e tag `<mark>` eliminati. Rientri di soli spazi normali (elenchi annidati) e blocchi di codice restano invariati.
+   - Il file `.md` su disco **non** viene modificato: la revisione mostra al revisore l'impaginazione originale dell'OCR. La pulizia vale solo per parent, chunk ed embedding.
+   - I documenti indicizzati prima dell'introduzione della pulizia si ripassano con `utils/reindex_topic.py` (capitolo 10).
+3. **Splitting Gerarchico Parent-Child**:
    - **Parent Splitting**: Se abilitato, divide il documento Markdown tramite `MarkdownHeaderTextSplitter` basandosi sugli header logici (`#` fino a `####`), catturando la gerarchia nei metadati. Successivamente, utilizza `RecursiveCharacterTextSplitter` con il tokenizer di Tiktoken (`cl100k_base`) per generare blocchi ampi coerenti (Parent).
    - **Child Splitting**: Ciascun blocco Parent viene frammentato in blocchi Child più piccoli e sovrapposti (`chunk_size` e `chunk_overlap`) per consentire una ricerca semantica millimetrica.
-3. **Idempotenza Transazionale MySQL**:
+4. **Idempotenza Transazionale MySQL**:
    - Per garantire che la re-ingestione di un documento modificato non lasci record duplicati, il worker esegue un'operazione atomica in MySQL: prima esegue una `DELETE` su `parent_documents` basata sulla chiave `source`, `topic_id` e `sub_topic_id`, poi esegue una `executemany` per inserire massivamente i nuovi Parent Documents.
-4. **Generazione Embedding in Batch ed Ingestione Qdrant**:
+5. **Generazione Embedding in Batch ed Ingestione Qdrant**:
    - I blocchi Child vengono inviati in batch asincroni alle API Google GenAI per generare vettori a 768 dimensions via `gemini-embedding-001`. Il processo è protetto da un `AsyncLimiter` impostato a 1000 richieste/minuto e gestisce gli errori `ResourceExhausted` (429) e `ServiceUnavailable` (503) tramite retry con backoff esponenziale.
-5. **Prevenzione OOM (Batch Flush su Qdrant)**:
+6. **Prevenzione OOM (Batch Flush su Qdrant)**:
    - Al fine di proteggere la memoria RAM durante l'ingestione di file Markdown di grandissime dimensioni, i punti Child vengono assemblati e accumulati in un buffer. Non appena il buffer supera i 500 punti, viene eseguito un _flush intermedio_ verso Qdrant (`qdrant_client.upsert`), svuotando la memoria prima di procedere.
-6. **Qdrant Garbage Collection**:
+7. **Qdrant Garbage Collection**:
    - Per rimuovere i "vettori fantasma" (i vecchi frammenti Child rimasti nel Vector DB dopo che il file originale è stato aggiornato), il sistema esegue una query di cancellazione mirata (`qdrant_client.delete`), rimuovendo tutti i punti associati allo stesso `source` ma dotati di un `_ingestion_id` obsoleto (diverso dall'ID univoco di sessione appena generato).
 
 ## 4. Motore di Retrieval Avanzato & Reranking
@@ -145,18 +174,23 @@ Il processo di recupero e ordinamento dei contesti all'interno di `worker.py` su
 ### A. Trasformazione delle Query ed Espansione Semantica
 
 1. **Riscrittura Conversazionale**: Il modello configurato in `QUERY_REWRITER_MODEL_NAME`, invocato tramite l'adapter provider-agnostico, analizza fino a `MAX_HISTORY_ITEMS` messaggi di cronologia, riscrive la domanda in forma autoconsistente (`standalone_query`), la scompone in sotto-quesiti distinti (`search_queries`, fino a `MAX_SUB_QUERIES`), estrae parole chiave lessicali (`keywords`) e — per le domande aggregative — l'elenco delle entità che la risposta deve coprire (`coverage_targets`).
-2. **Lookup Semantico del Concetto**:
-   - Il sistema esegue l'embedding della query standalone e interroga la collezione Qdrant `conceptual_dictionary`.
-   - Vengono considerati **tutti** i concetti sopra `QDRANT_CONCEPT_THRESHOLD` (`0.80`) fino a un massimo di `QDRANT_CONCEPT_MAX_HITS` (`3`), non soltanto il migliore: una domanda può legittimamente insistere su più macro-aree.
-   - Gli alias dei concetti verificati vengono **iniettati nel prompt del rewriter** tramite `format_verified_concepts()`, che li presenta come vocabolario disponibile invece di sostituirli meccanicamente nella query. È il rewriter a decidere come usarli, tipicamente generando una sotto-query per ciascun comune di una macro-area (es. "Versilia" → Viareggio, Forte dei Marmi, Pietrasanta, Camaiore, Massarosa).
-   - `collect_concept_aliases()` aggiunge gli stessi alias al set di keyword usate dalla ricerca sintattica.
+2. **Lookup del Concetto (`find_concepts`)**: avviene **prima** del rewriter, che riceve i concetti trovati come vocabolario verificato. Due livelli, uniti senza doppioni:
+   - **Per nome** (`get_concepts_by_name`): un concetto il cui nome compare nella domanda corrente come parola intera, senza distinzione di maiuscole (es. "Versilia", "Piana di Lucca"), è preso con certezza. Gli alias da soli **non** fanno scattare il concetto: "scuole di Viareggio" non deve allargarsi a tutti i comuni della Versilia. Il dizionario è piccolo e si legge per intero a ogni domanda.
+   - **Per similarità** (`get_concepts_by_similarity`): embedding (`SEMANTIC_SIMILARITY`) del testo di lookup — la domanda corrente più gli ultimi due turni della conversazione, per agganciare i follow-up brevi — confrontato con la collezione Qdrant `conceptual_dictionary`. Vengono considerati **tutti** i concetti sopra `QDRANT_CONCEPT_THRESHOLD` (`0.80`) fino a `QDRANT_CONCEPT_MAX_HITS` (`3`). Il confronto misura il significato dell'intera frase: una domanda lunga o una cronologia estesa può restare sotto soglia anche se il nome del concetto è presente, ed è il motivo del livello per nome.
+   - Gli alias dei concetti verificati vengono **iniettati nel prompt del rewriter** tramite `format_verified_concepts()`, che li presenta come vocabolario disponibile invece di sostituirli meccanicamente nella query. È il rewriter a decidere come usarli: per un concetto geografico genera una sotto-query per **ogni** comune elencato, anche oltre `MAX_SUB_QUERIES` (unica eccezione al limite), con lo stesso tema richiesto dall'utente per ciascun luogo, e riempie `coverage_targets` con i comuni; i sinonimi di un concetto tematico non restringono il tema di un singolo luogo (prompt `query_rewriter`).
+   - `collect_concept_aliases()` aggiunge gli stessi alias al set di keyword, e i concetti stessi vengono passati a `retrieve_chunks(concepts=...)`: nella ricerca sintattica gli alias di un concetto valgono come **alternative** (vedi 4.B).
 
 ### B. Ricerca Ibrida Parallela e Reranking Locale via ONNX Cross-Encoder
 
 Per massimizzare il rendimento ed evitare colli di bottiglia, la ricerca dei frammenti candidati avviene in parallelo sfruttando un pool di thread concorrenti (`ThreadPoolExecutor`):
 
 1. **Ricerca Semantica**: Query vettoriali parallele su Qdrant (`document_chunks`) per ciascuna sotto-query, con soglia `QDRANT_SEMANTIC_THRESHOLD` (`0.60`), raggruppamento per `content_hash` (deduplica dei chunk identici) e filtro su `topic_id` / `sub_topic_id` attivi. Il client Qdrant è istanziato con `timeout=10` secondi. Il margine è necessario perché `safe_vector_search` è _fail-soft_: in caso di eccezione registra l'errore e restituisce una lista vuota senza ritentare, quindi una search andata in timeout costa l'**intera** sotto-query e con essa la copertura dell'entità corrispondente.
-2. **Ricerca Sintattica**: In parallelo, una ricerca full-text lessicale (`MatchText`) sulle keyword, con scroll paginato e deduplica per `content_hash` fino a `QDRANT_SYNTACTIC_SIZE` candidati unici. I risultati confluiscono tra i candidati della query principale (indice 0).
+2. **Ricerca Sintattica a Combinazioni (`safe_keyword_search`)**: In parallelo, una ricerca full-text (`MatchText` sull'indice testuale di `content`) che riempie fino a `QDRANT_SYNTACTIC_SIZE` posti con candidati unici (deduplica per `content_hash`). I risultati confluiscono tra i candidati della query principale (indice 0). Lo scroll di Qdrant **non ordina per pertinenza** (restituisce i punti in ordine di id, cioè UUID casuali), quindi l'ordine lo danno le combinazioni:
+   - **Gruppi** (`build_keyword_groups`): gli alias di ogni concetto trovato formano **un gruppo in OR** (nome + alias), perché sono alternative e non requisiti — un pezzo che cita sia "Garfagnana" sia "Barga" è tipicamente un DUP che elenca tutti i comuni, non un atto più pertinente. Ogni altra keyword è un gruppo a sé; quelle che coincidono con un alias confluiscono nel suo gruppo.
+   - **Conteggi** (`plan_keyword_combinations`): con `count` esatto (pochi ms ciascuno) si contano i pezzi di ogni combinazione in AND dei gruppi, livello per livello, per i `KEYWORD_MAX_GROUPS` (6, costante) gruppi più rari: al massimo 63 conteggi, in parallelo. Una combinazione che contiene una sotto-combinazione a zero risultati non si conta.
+   - **Ordine di riempimento**: prima le combinazioni con più gruppi, poi, a parità, le più rare. Una combinazione con più di `KEYWORD_MAX_HITS` (1000) pezzi è troppo generica — lo scroll ne restituirebbe un campione casuale — e si salta: "lavori" da sola no, "lavori + scuole + {versilia | viareggio | …}" sì. Se nessuna combinazione è sotto soglia si usa la più specifica.
+   - **Distribuzione geografica**: in una combinazione che contiene un concetto geografico i posti si dividono fra i luoghi del concetto, perché un comune con molti atti non li prenda tutti.
+   - Log: `[KEYWORD] Gruppi: …(conteggi)` e `[KEYWORD] Combinazioni usate, in ordine: …`.
 3. **Recupero condizionale dei vettori**: I vettori dei chunk vengono richiesti a Qdrant (`with_vectors=True`) **solo quando `mmr_lambda < 1.0`**, cioè solo quando MMR li userà davvero. Nel profilo del tentativo 0 la diversificazione è disattivata, quindi trasferire e mediare gli embedding sarebbe lavoro interamente sprecato. Il risparmio non è marginale: la serializzazione JSON dei vettori di 30 gruppi per sotto-query è la voce dominante della latenza delle search.
 4. **Pool ONNX pre-caricato (Deadlock Protection)**:
    - Il Cross-Encoder locale (`mmarco-mMiniLMv2-L12-H384-v1`) viene inizializzato **una sola volta per processo, subito dopo il fork**, dentro l'hook `worker_process_init`. Il pre-caricamento tiene i ~7 secondi di init fuori dalla latenza percepita: il costo si paga all'avvio del processo, non sulla prima query che questo si trova a servire.
@@ -185,6 +219,9 @@ La selezione avviene in tre stadi distinti: **quali** documenti entrano, **quant
 2. **Slot liberi**: se una sotto-query non produce risultati (nessun documento per quel comune, o una search fallita), la sua quota resterebbe inutilizzata:
    $$\text{Slot Liberi} = (\text{parents\_per\_query} \times N_{\text{queries}}) - N_{\text{selezionati}}$$
 3. **Redistribuzione**: gli slot liberi vengono riassegnati attingendo alle riserve delle altre sotto-query tramite `select_with_mmr()`. Con `mmr_lambda = 1.0` (tentativo 0) la funzione va in **bypass** e si comporta come un ranking puro per score; con `lam < 1.0` penalizza i candidati troppo simili ai Parent già selezionati, confrontando i centroidi dei loro chunk con soglia `MMR_SIMILARITY_THRESHOLD` (`0.92`). La quota garantita non viene **mai** toccata da MMR: il centroide è un vettore-proxy, e non è abbastanza affidabile da giustificare l'esclusione di un documento rilevante.
+
+4. **Posti extra per pertinenza** (`EXTRA_PARENTS`): la quota fissa per sotto-query taglierebbe gli elenchi ("tutti gli incarichi affidati a…") anche quando il reranker giudica pertinenti molti più documenti. Si aggiungono quindi i parent non ancora scelti con probabilità del reranker ≥ `EXTRA_PARENTS_MIN_PROB` (`0.5`), dal più pertinente, fino al tetto `MAX_SUB_QUERIES × PARENTS_PER_QUERY`; ogni extra va alla sotto-query che lo ha giudicato meglio. Log: `[EXTRA]`.
+5. **Rilevanza dei parent** (`CONTEXT_SCORE_SOURCE`): per le quote di contesto, MMR e l'ordine dei core si usa di default la **probabilità del reranker** del miglior chunk del parent (`rerank`), non la similarità vettoriale (`vector`): quest'ultima è compressa in un intervallo stretto e non distingue un atto pertinente da uno che ne condivide solo il lessico. Log: `[SCORE]`.
 
 #### C.2 Ripartizione del budget di caratteri (`allocate_context_budget`)
 
@@ -225,6 +262,11 @@ Un guardrail in `load_settings()` alza il ratio fino a `CONTEXT_OVERFLOW_RATIO` 
 
 Il Parent non viene troncato ciecamente: `compute_core_spans()` individua nel testo integrale le posizioni dei chunk che hanno vinto il rerank (tramite offset memorizzati o, in mancanza, ricerca testuale tollerante agli spazi), i blocchi contigui vengono fusi e attorno ai core si espande il contesto fino a esaurire il budget assegnato. Il taglio arretra fino al confine indicato da `CONTEXT_SNAP_BOUNDARY` (`sentence` | `paragraph` | `none`) per non spezzare il testo a metà frase. Le porzioni omesse sono segnalate al modello con un marcatore esplicito.
 
+#### C.5 Testo ripulito e dati di catalogo nel contesto
+
+- **Pulizia OCR**: all'assemblaggio del contesto il testo di ogni parent passa da `clean_ocr_text` (stesse regole dell'ingestione, vedi §3 Fase C), **prima** di calcolare fabbisogni e finestre: lo spazio recuperato va ad altri documenti. Anche i chunk usati per localizzare i core vengono ripuliti allo stesso modo e i loro offset scartati (si riferiscono al testo originale): la localizzazione passa dalla ricerca testuale tollerante agli spazi. Così la pulizia vale da subito anche per i documenti indicizzati prima della sua introduzione.
+- **Metadati del documento** (`CONTEXT_METADATA`): il primo passaggio incluso di ogni documento porta una riga `Metadati del documento: …` con i suoi dati di catalogo (esclusi `CONTEXT_METADATA_EXCLUDE`, chiavi di sistema, `Header N` e campi con `_` iniziale; valori accorciati a `CONTEXT_METADATA_MAX_VALUE_CHARS`). Gli altri passaggi dello stesso documento portano solo il rimando `Stesso documento di: N`. I prompt dei topic spiegano al modello che i metadati descrivono l'intero atto e servono a citarlo con precisione, mentre fatti, importi e date di eventi vanno tratti dal testo. Il costo è contabilizzato nel budget e riportato nel log `[ALLOC]` (`metadati N chars`).
+
 ## 5. Generazione con Autovalutazione & Ciclo di Autocorrezione (Self-Correction Loop)
 
 Una volta ricomposto il contesto mediante il recupero dei Parent Documents da MySQL, il sistema avvia un loop di generazione controllata e auto-correzione a più livelli:
@@ -260,7 +302,77 @@ Una volta ricomposto il contesto mediante il recupero dei Parent Documents da My
    - **In caso di successo**: la risposta viene salvata nella collezione `semantic_cache` di Qdrant, con chiave che include topic, sotto-topic e filtri applicati per non inquinare la cache tra contesti diversi.
    - **In caso di fallimento definitivo**: il sistema salva la sessione in `chat_feedback` con voto `0` e dicitura `"Auto-Log: Risposta non trovata o non soddisfacente"`, abilitando analisi offline e fine-tuning dei prompt o della base documentale.
 
-## 6. Schema del Database Relazionale (MySQL)
+## 6. Revisione Documentale, Autenticazione e Accesso ai File
+
+Il sottosistema di revisione vive nell'API (`review_routes.py`, `files_routes.py`) e nel frontend `web/revisione` (Flutter Web). Non c'è un servizio separato: le rotte sono blueprint di `app.py`, che condividono pool MySQL, client Qdrant e configurazione.
+
+### A. Autenticazione
+
+- **Utenti** in `review_users`, password con hash Werkzeug. Il login (`POST /review/auth/login`, anche come `/auth/login` per la chat) emette un token firmato con `itsdangerous` (`AUTH_SECRET_KEY`, salt `review-auth`) valido `REVIEW_SESSION_HOURS` ore e contenente `token_version`. Senza `AUTH_SECRET_KEY` le rotte rispondono 503 e la chat continua a funzionare.
+- **Revoca**: logout, cambio password e disattivazione incrementano `token_version`, invalidando subito tutte le sessioni dell'utente (nessuna blacklist). Ruoli, archivi e stato dell'utente si rileggono a ogni richiesta, quindi una revoca vale senza nuovo login.
+- **Trasporto**: la revisione usa l'header `Authorization: Bearer`; il login imposta inoltre il cookie HttpOnly `rag_session` (SameSite=Lax, `Secure` salvo `SESSION_COOKIE_SECURE=false`), accettato **solo** da `/files` e da `/auth/me|logout`. È così che la chat apre i documenti riservati senza mai leggere il token da JavaScript; le rotte `/review` che modificano dati non accettano il cookie (nessun rischio CSRF).
+- **Separazione dalla chat**: le rotte `/review`, `/auth` e `/files` non accettano `API_SECRET_KEY`, e il token di un revisore non apre `/chat`.
+
+### B. Ruoli, permessi e archivi
+
+`common/review_permissions.py` definisce i permessi e i ruoli che li concedono; un utente può avere più ruoli (`review_user_roles`) e i suoi permessi sono l'unione. Endpoint e frontend verificano **permessi**, mai nomi di ruolo.
+
+| Permesso | Consente |
+| --- | --- |
+| `documenti.lettura` | Elenco, dettaglio, storico, file originali |
+| `documenti.testo` | Correzione del testo e re-indicizzazione |
+| `documenti.metadati` | Modifica dei metadati |
+| `documenti.stato` | Cambio dello stato di revisione |
+| `utenti.gestione` | Elenco utenti, sblocco forzato dei documenti |
+| `topic.tutti` | Tutti gli archivi senza assegnazione |
+
+Ruoli: `lettore`, `correttore`, `catalogatore`, `validatore`, `revisore` (testo + metadati + stato), `admin` (tutto). Senza `topic.tutti` un utente lavora solo sugli archivi in `review_user_topics`: tutte le rotte sul singolo documento passano da `_doc_key_from_request`, che lo verifica.
+
+### C. Rotte principali (`/review`)
+
+| Rotta | Funzione |
+| --- | --- |
+| `GET /topics`, `GET /documents` | Archivi visibili; elenco documenti (un parent 0 per documento) con ricerca su source, nome file e metadati, filtro per stato, chi ha il documento aperto (`locked_by`). |
+| `GET /document` | Testo, metadati, stato, file originale, stato di re-indicizzazione, blocco, `content_hash` e `metadata_hash`. |
+| `PUT /document/content` | Correzione del testo (concorrenza ottimistica su `base_hash`). |
+| `PUT /document/metadata` | Sostituzione dei metadati (concorrenza ottimistica su `base_metadata_hash`). |
+| `PUT /document/status` | Stato: `da_revisionare` \| `in_revisione` \| `revisionato`. |
+| `GET /document/history[/<id>]` | Storico da `review_audit`, con valore prima/dopo. |
+| `POST` / `DELETE /document/lock` | Presa/rinnovo e rilascio del blocco in modifica (`force=1` con `utenti.gestione`). |
+| `GET /users` | Utenti con ruoli e archivi (`utenti.gestione`). |
+
+### D. Correzione del testo e re-indicizzazione
+
+1. Il testo mostrato viene, in ordine, dalla correzione ancora in attesa di indicizzazione (`review_audit`), dal pacchetto `.md` in `processed/` (trovato tramite il manifest con lo stesso `source`), oppure — per i dati migrati senza pacchetto — dalla concatenazione dei parent.
+2. Al salvataggio il pacchetto (`.md` + manifest `.json` con i metadati attuali da MySQL) viene scritto in `watch/` nella stessa posizione relativa che ha in `processed/` (scrittura atomica, prima il testo poi il manifest) e viene pubblicato `{"json_manifest_path": …}` sulla coda `da-indicizzare`. L'ingest, già idempotente, rigenera parent e chunk e riporta il pacchetto in `processed/`. Se RabbitMQ non è raggiungibile il pacchetto viene rimosso e la richiesta fallisce con 503: nulla resta a metà.
+3. Lo stato di re-indicizzazione si ricava senza tabelle aggiuntive: `pending` finché l'ultima correzione in `review_audit` è più recente del `created_at` dei parent, `error` se il manifest compare in `ingestion/error/`. Il frontend interroga periodicamente e avvisa al termine.
+
+### E. Metadati
+
+I metadati vivono in `parent_documents.metadata` e nel payload dei chunk su Qdrant: si aggiornano entrambi (`set_payload` / `delete_payload` filtrati per `source`, `topic_id`, `sub_topic_id`; nessun embedding da ricalcolare) e si allinea il manifest in `processed/`, così una futura re-indicizzazione non riporta indietro i valori. Le chiavi di sistema e le `Header N` sono protette sia in lettura sia in scrittura; le date devono essere ISO `AAAA-MM-GG`, perché i filtri temporali della chat le confrontano come stringhe. Durante una re-indicizzazione in corso la modifica è rifiutata (409).
+
+### F. Concorrenza e blocco in modifica
+
+- **Blocco** (`review_locks`): chi ha almeno un permesso di modifica prende il blocco all'apertura del documento e il frontend lo rinnova ogni terzo di `REVIEW_LOCK_TTL_SECONDS`; senza rinnovi scade da solo. Gli altri utenti vedono il documento in sola lettura con il nome di chi lo revisiona. Il rilascio avviene all'uscita dal documento, alla chiusura della pagina (`fetch` con `keepalive` su `pagehide`) e al logout (tutti i blocchi dell'utente).
+- **Presa atomica**: un'unica `INSERT … ON DUPLICATE KEY UPDATE`, che sfrutta l'ordine di valutazione delle assegnazioni di MySQL (`user_id` cambia per penultimo, `expires_at` per ultimo e solo se il blocco è ora del richiedente), senza `DELETE` preventiva dei blocchi scaduti, che con due richieste contemporanee produrrebbe un deadlock da gap lock. Gli orari sono quelli del database (`NOW()`), non dei pod.
+- **Salvataggi**: testo, metadati e stato chiamano `_require_lock`, che prende il blocco se libero e mantiene la riga bloccata (`SELECT … FOR UPDATE`) fino al commit: due salvataggi simultanei sullo stesso documento si mettono in fila. Senza blocco la risposta è `409` con `reason: "locked"` e il titolare; con dati cambiati nel frattempo è `409` con `reason: "modified"`.
+
+### G. Download dei documenti (`/files`)
+
+`GET /files/<topic>/<sub_topic>/<path:file_name>[?download=1]` è l'unico accesso ai file originali, usato da chat e revisione:
+
+- **Accesso**: archivio con `topics.public_access = TRUE` → chiunque; altrimenti utente autenticato (cookie o header) con `documenti.lettura` e l'archivio assegnato. L'autorizzazione precede la ricerca del documento, così un anonimo non può scoprire quali file esistano in un archivio riservato. Ai browser gli errori arrivano come pagina HTML (con il link di login `FILES_LOGIN_URL` sul 401), ai client come JSON.
+- **Solo originali indicizzati**: il nome deve corrispondere a un documento in `parent_documents`; testi estratti e manifest non sono mai raggiungibili, e i percorsi fuori da `processed/` sono rifiutati.
+- **Invio**: con `FILES_X_ACCEL_PREFIX` l'API risponde con `X-Accel-Redirect: <prefisso><percorso URL-encoded>` e il file lo invia nginx da una location `internal` (`/_protected_files/` → `alias /data/processed/`), senza occupare i worker Python; senza prefisso lo invia l'API (sviluppo). Nomi con spazi, accenti e caratteri come `%`, `+`, `#`, `?` sono gestiti lungo tutto il percorso (frontend → nginx → Flask → `X-Accel-Redirect`). I vecchi link `/downloads/...` delle chat sono rediretti a `/api/files/...`.
+- **Cache**: `public, max-age=3600` per gli archivi pubblici, `private, no-store` per i riservati.
+
+> **Limite**: la riservatezza di un archivio protegge l'apertura del file originale, non il contenuto delle risposte. La chat di un topic risponde usando il testo di tutti i suoi documenti; i documenti che non devono comparire nelle risposte vanno indicizzati in un topic (e una chat) separato.
+
+### H. Frontend `revisione`
+
+Flutter Web con configurazione a runtime (`docker-entrypoint.sh` → `env-config.js`: `REVIEW_API_URL`, `FILES_URL`, `BASE_HREF`, `PROJECT_NAME`), così la stessa immagine funziona sotto qualunque percorso e dominio. All'avvio verifica il `/health` dell'API (ricavato da `REVIEW_API_URL`: `/api/review` → `/api/health`) e mostra la pagina di manutenzione se non risponde. L'editor del testo lavora sui blocchi Markdown nella vista formattata (`MdDocument`, `RichBlockController`) riscrivendo solo il blocco modificato, con il sorgente disponibile su richiesta; il file originale è mostrato in un iframe accanto al testo. Installazione e variabili: `web/revisione/README.md`.
+
+## 7. Schema del Database Relazionale (MySQL)
 
 Il database adotta il motore di archiviazione **InnoDB** con set di caratteri **utf8mb4** per la piena conformità con i caratteri speciali e i metadati complessi estratti.
 
@@ -277,9 +389,17 @@ Il database adotta il motore di archiviazione **InnoDB** con set di caratteri **
    └──────────────┘
 
 
-┌──────────────────┐      ┌──────────────────┐      ┌──────────────────┐
-│  parent_docs     │      │  chat_feedback   │      │   system_logs    │
-└──────────────────┘      └──────────────────┘      └──────────────────┘
+┌──────────────────┐      ┌──────────────────┐      ┌──────────────────┐      ┌──────────────────┐
+│  parent_docs     │      │  chat_feedback   │      │   system_logs    │      │   rag_metrics    │
+└──────────────────┘      └──────────────────┘      └──────────────────┘      └──────────────────┘
+
+   ┌──────────────┐  1..N  ┌───────────────────┐   ┌──────────────────┐   ┌──────────────────┐
+   │ review_users ├───────►│ review_user_roles │   │  review_status   │   │   review_audit   │
+   └──────┬───┬───┘        └───────────────────┘   └──────────────────┘   └──────────────────┘
+          │   │     1..N   ┌───────────────────┐   ┌──────────────────┐
+          │   └───────────►│ review_user_topics│   │   review_locks   │◄── FK user_id
+          │                └───────────────────┘   └──────────────────┘
+          └──────────────────────────────────────────────────┘
 ```
 
 ### Dettaglio Tabelle, Vincoli e Indici composti:
@@ -289,6 +409,7 @@ Il database adotta il motore di archiviazione **InnoDB** con set di caratteri **
    - `description` (TEXT, NOT NULL)
    - `aliases` (TEXT, NULL)
    - `prompt` (VARCHAR(100), NULL)
+   - `public_access` (BOOLEAN, NOT NULL, DEFAULT FALSE) - _File originali scaricabili da chiunque (TRUE) o solo da utenti autenticati e abilitati all'archivio (FALSE), vedi §6.G_.
 2. **`sub_topics`**: Configura a runtime i parametri di splitting per ciascun sotto-argomento.
    - `id` (INT AUTO_INCREMENT PRIMARY KEY)
    - `topic_id` (VARCHAR(100) NOT NULL)
@@ -327,10 +448,26 @@ Il database adotta il motore di archiviazione **InnoDB** con set di caratteri **
    - `line_no` (INT, NULL)
    - `pod_name` (VARCHAR(255), DEFAULT NULL)
    - _Indici_: `INDEX idx_log_level (log_level)`, `INDEX idx_created_at (created_at)`.
+6. **`rag_metrics`**: Metriche per richiesta della chat.
+   - `task_id`, `topic_id`, `query_preview`, `cache_hit`, `is_satisfactory`, `total_attempts`, `duration_ms`, `created_at`
+   - `attempts_detail` (JSON): per tentativo, query riscritta, parametri di retrieval effettivi e conteggi di candidati e parent (vuoto per i cache hit). In `misc/mysql_schema.sql` sono raccolte le query di analisi tipiche.
+7. **`review_users`**: Utenti di revisione e chat.
+   - `id`, `username` (UNIQUE), `display_name`, `password_hash`, `active`, `created_at`, `last_login_at`
+   - `token_version` (INT): incrementato a logout, cambio password e disattivazione; invalida i token già emessi.
+8. **`review_user_roles`** (`user_id`, `role`, PK composta) e **`review_user_topics`** (`user_id`, `topic_id`, PK composta): ruoli e archivi assegnati, con FK `ON DELETE CASCADE` su `review_users`. I ruoli sono `VARCHAR` e non `ENUM`: un ruolo nuovo non richiede di modificare lo schema.
+9. **`review_status`**: Stato di revisione per documento.
+   - PK (`source`, `topic_id`, `sub_topic_id`); `status` ENUM(`da_revisionare`, `in_revisione`, `revisionato`); `note`, `updated_by`, `updated_at`. L'assenza di riga vale `da_revisionare`.
+10. **`review_audit`**: Storico di ogni modifica.
+    - `action` ENUM(`content`, `metadata`, `status`), utente, documento, `old_value` / `new_value` (testo completo, JSON dei metadati o stato), `note`, `details` (JSON).
+    - _Indici_: `idx_doc (source, topic_id, sub_topic_id, created_at)`, `idx_user (username, created_at)`. È anche la fonte dello stato di re-indicizzazione (§6.D).
+11. **`review_locks`**: Blocco in modifica.
+    - PK (`source`, `topic_id`, `sub_topic_id`); `user_id` (FK `ON DELETE CASCADE`), `username`, `display_name`, `acquired_at`, `expires_at`. Contano solo le righe con `expires_at > NOW()`: quelle scadute restano finché qualcuno non riprende il documento.
 
-## 7. Mappatura Dettagliata delle Variabili di Configurazione (`config.py`)
+Le modifiche allo schema dei database già installati sono in `misc/migrations/` (es. `review_locks.sql`, `parent_metadata_cleanup.sql`).
 
-La configurazione centralizzata raccoglie e convalida le variabili d'ambiente nella dataclass immutabile `Settings` (72 campi).
+## 8. Mappatura Dettagliata delle Variabili di Configurazione (`config.py`)
+
+La configurazione centralizzata raccoglie e convalida le variabili d'ambiente nella dataclass immutabile `Settings` (94 campi).
 
 > ### ⚠ Precedenza delle fonti di configurazione
 >
@@ -448,7 +585,20 @@ I default puntano a modelli Gemini, ma sono appunto default: `worker.py` non con
 | `context_hard_cap_chars` | _derivato_               | `int`   | `MAX_CONTEXT_CHARS × 1.20` | **Non leggibile da env.** Calcolato in `load_settings()`; è il valore che `build_context()` usa come rete di sicurezza finale.                                                                   |
 | `context_snap_boundary`  | `CONTEXT_SNAP_BOUNDARY`  | `str`   | `"sentence"`               | Confine su cui arretrare il taglio: `sentence` \| `paragraph` \| `none`. Costo zero, nessuna espansione.                                                                                         |
 
-### F. Risorse di Calcolo e Concorrenza
+### F. Revisione, Autenticazione e Accesso ai File
+
+| Proprietà | Variabile d'Ambiente | Tipo | Default | Impatto |
+| --- | --- | :--- | --- | --- |
+| `auth_secret_key` | `AUTH_SECRET_KEY` (o il vecchio `REVIEW_SECRET_KEY`) | `str` | `""` | Firma dei token di sessione. Almeno 32 caratteri casuali, solo nell'API. Vuota: rotte `/review`, `/auth` e download riservati rispondono 503, la chat funziona. |
+| `session_cookie_secure` | `SESSION_COOKIE_SECURE` | `bool` | `true` | Cookie `rag_session` solo su HTTPS. `false` solo per lo sviluppo in http su un host diverso da localhost. |
+| _N/A_ (`review_routes.py`) | `REVIEW_SESSION_HOURS` | `int` | `10` | Durata di una sessione. |
+| `review_lock_ttl_seconds` | `REVIEW_LOCK_TTL_SECONDS` | `int` | `300` (min `60`) | Durata del blocco in modifica senza rinnovi; il frontend lo rinnova ogni terzo di questo tempo. |
+| `files_x_accel_prefix` | `FILES_X_ACCEL_PREFIX` | `str` | `""` | Prefisso della location `internal` di nginx per `X-Accel-Redirect` (in k8s `/_protected_files/`). Vuoto: i file li invia l'API. |
+| `files_login_url` | `FILES_LOGIN_URL` | `str` | `"/revisione/"` | Pagina di login proposta da `/files` a chi apre un documento riservato senza sessione. |
+
+L'API deve inoltre montare in lettura/scrittura lo stesso volume dati di converter e ingest (`processed/`, `watch/`, `ingestion/error/`).
+
+### G. Risorse di Calcolo e Concorrenza
 
 Questi quattro parametri devono essere **coerenti tra loro e con le risorse effettivamente concesse al processo**: sono la causa più frequente di sovrasottoscrizione della CPU.
 
@@ -463,13 +613,13 @@ Questi quattro parametri devono essere **coerenti tra loro e con le risorse effe
 >
 > Va però considerato che il pool **non aggiunge capacità di calcolo, la ridistribuisce**: con 2 core per processo, `pool=2` dà due istanze a 1 thread ciascuna, `pool=1` dà una istanza a 2 thread intra-op. Quando si è memory-bound, `pool=1` è una configurazione legittima e va valutata misurando, non esclusa a priori.
 
-## 8. Funzionalità Mancanti e Sviluppi Possibili
+## 9. Funzionalità Mancanti e Sviluppi Possibili
 
 Elenco delle capacità che il sistema oggi non offre e che rappresenterebbero un'estensione significativa. Non è un piano di lavoro: le voci sono indipendenti fra loro e ordinate per area, non per priorità.
 
-### 8.1 Indipendenza dal fornitore di embedding
+### 9.1 Indipendenza dal fornitore di embedding
 
-Riscrittura, generazione e grading sono già provider-agnostici (§7.C). La generazione dei vettori no: è vincolata a Google tramite una costante interna, quindi anche adottando integralmente un altro fornitore per gli LLM il sistema continua a richiedere credenziali Google.
+Riscrittura, generazione e grading sono già provider-agnostici (§8.C). La generazione dei vettori no: è vincolata a Google tramite una costante interna, quindi anche adottando integralmente un altro fornitore per gli LLM il sistema continua a richiedere credenziali Google.
 
 Rendere l'embedding configurabile alla pari degli altri stadi consentirebbe di scegliere il fornitore in base a criteri propri — costo, residenza del dato, qualità sulla lingua italiana amministrativa — indipendentemente da quale modello genera le risposte. Per un ente pubblico la voce ha anche una valenza di sovranità del dato: gli embedding sono l'unica componente che richiede l'invio dell'**intero corpus** a un servizio esterno, non solo delle query.
 
@@ -477,35 +627,35 @@ Va tenuto presente che la dimensione del vettore è fissata alla creazione della
 
 > _Nota documentale_: la dimensionalità dichiarata in §3 (768) va confermata leggendola dalla collection, poiché il modello in uso supporta dimensioni configurabili.
 
-### 8.2 Esperienza di interrogazione
+### 9.2 Esperienza di interrogazione
 
 - **Risposta in streaming.** Oggi il client invia la domanda, riceve `202 Accepted` e interroga ciclicamente lo stato finché il task non è concluso: da trenta secondi a oltre un minuto di attesa senza alcun riscontro intermedio. Lo streaming incrementale dei token, o quantomeno la pubblicazione dello stato di avanzamento della pipeline ("riformulazione", "ricerca", "sintesi"), cambierebbe radicalmente la percezione del sistema a parità di tempo di calcolo.
 - **Filtri espliciti per l'utente.** Il motore supporta già filtri su intervalli di date, valori esatti e liste di metadati, ma sono raggiungibili solo per via programmatica. Esporli nell'interfaccia — "solo determine del 2024", "solo atti del Settore Viabilità" — sposterebbe una capacità già presente dal codice all'utente finale.
 - **Citazioni puntuali.** Le risposte citano il documento di provenienza per nome file. Poiché i frammenti conservano la posizione nel testo originale, sarebbe possibile portare l'utente **al punto esatto** del documento, evidenziando il passaggio da cui l'affermazione deriva. Per un contesto amministrativo, dove la verificabilità della fonte conta quanto la risposta, è probabilmente l'aggiunta di maggior valore percepito.
 - **Continuità documentale nel dialogo.** La cronologia conversazionale trasporta solo il testo scambiato. I documenti recuperati al turno precedente non restano disponibili, quindi una domanda di approfondimento ("e cosa dice l'articolo 3 di quell'atto?") innesca una ricerca completamente nuova, che può non ripescare lo stesso documento.
 
-### 8.3 Ricerca e qualità dei risultati
+### 9.3 Ricerca e qualità dei risultati
 
 - **Fusione ibrida dei ranking.** Le ricerche semantica e lessicale coesistono, ma i risultati della seconda vengono semplicemente accodati ai candidati della query principale. Una fusione formale dei due ranking — Reciprocal Rank Fusion o equivalente — sfrutterebbe la complementarità dei due segnali invece di privilegiare arbitrariamente uno dei due percorsi.
 - **Ricerca esatta su identificatori.** Domande su CIG, numeri di determina, protocolli e date sono ricerche di **identificatori**, non di concetti, e la similarità vettoriale è lo strumento sbagliato: un codice alfanumerico non ha vicini semantici significativi. Un percorso dedicato che estragga in ingestione i metadati strutturati e li interroghi per corrispondenza esatta darebbe risposte deterministiche dove oggi si affida alla fortuna del retrieval.
 - **Deduplica dei contenuti quasi identici.** Il corpus amministrativo contiene ampie porzioni ricorrenti (formule di rito, riferimenti normativi, clausole standard). Capita che più frammenti pressoché identici occupino le prime posizioni del riordinamento, consumando budget di contesto senza aggiungere informazione. Una deduplica sui contenuti — non solo sull'identità esatta, già gestita — libererebbe spazio per materiale complementare.
 - **Ricerca su tabelle e allegati strutturati.** Gli atti amministrativi contengono quadri economici, elenchi di interventi e piani particellari. La conversione in Markdown ne preserva l'aspetto ma non la struttura: una domanda che richieda di aggregare valori attraverso più tabelle non è oggi servibile in modo affidabile.
 
-### 8.4 Valutazione e miglioramento continuo
+### 9.4 Valutazione e miglioramento continuo
 
 - **Insieme di riferimento per la valutazione.** Il comportamento del sistema dipende da una decina di soglie numeriche (similarità, quote di contesto, probabilità minima, diversificazione). Senza un insieme di domande con i documenti attesi, ogni taratura è una scommessa: non è possibile sapere se una modifica migliora il sistema o sposta soltanto il problema. È la funzionalità mancante con il maggior effetto abilitante su tutte le altre.
 - **Sfruttamento attivo del feedback.** I giudizi degli utenti e le sessioni fallite sono registrati, ma restano materiale di sola consultazione. Potrebbero alimentare un insieme di risposte verificate da preferire, o segnalare automaticamente le domande ricorrenti che il sistema non sa servire.
 - **Analisi delle lacune di archivio.** Il valutatore registra, per ogni risposta, le entità richieste su cui non ha trovato nulla. Un'entità che ricorre sistematicamente in quell'elenco indica un buco di **ingestione**, non di ricerca. Un rapporto periodico su quel dato trasformerebbe un'informazione già raccolta in una segnalazione azionabile verso chi cura il corpus.
 - **Cruscotto operativo.** Le metriche per richiesta sono persistite ma non presentate: tempi per stadio, tasso di riuso della cache, tentativi medi, frequenza dei troncamenti. Renderle visibili permetterebbe di accorgersi di un degrado prima che lo segnali un utente.
 
-### 8.5 Esercizio, sicurezza e conformità
+### 9.5 Esercizio, sicurezza e conformità
 
-- **Verifiche di stato del servizio.** Il sistema non espone alcun endpoint o comando che attesti la propria operatività: né l'API Gateway né il worker dichiarano di aver completato l'inizializzazione e di essere in grado di servire. Qualunque supervisore — l'`HEALTHCHECK` di Docker, le sonde di liveness e readiness di Kubernetes, il monitoraggio di un servizio di sistema — può quindi solo constatare che il processo esiste, non che funzioni. Un controllo che verifichi la raggiungibilità di database e indice vettoriale e l'avvenuto caricamento del riordinatore renderebbe visibili all'esterno i malfunzionamenti che oggi restano confinati ai log.
-- **Controllo degli accessi per documento.** L'API è protetta da un unico token condiviso: chiunque possa interrogare il sistema vede l'intero corpus indicizzato. La segmentazione per argomento e sotto-argomento esiste già come struttura, ma non è legata a un'identità. Per un ente con atti a diversa visibilità è probabilmente il limite più rilevante in vista di un'apertura a una platea più ampia.
+- **Verifiche di stato del servizio.** L'API espone `GET /health` (senza autenticazione), usato da chat e revisione per la pagina di manutenzione, ma verifica solo il pool MySQL: non l'indice vettoriale, né il worker Celery e l'avvenuto caricamento del riordinatore, né la presenza di `AUTH_SECRET_KEY`. Un supervisore — `HEALTHCHECK` di Docker, sonde di Kubernetes — non può quindi ancora distinguere un servizio pronto da uno che risponde ma non può servire una domanda.
+- **Controllo degli accessi sul contenuto delle risposte.** Utenti, ruoli e archivi assegnati esistono (§6) e proteggono l'apertura dei file originali degli archivi riservati, ma la chat è ancora protetta da un unico token condiviso e risponde usando il testo di tutti i documenti del topic. Legare il retrieval all'identità dell'utente (filtrare i parent per archivio o per documento in base ai suoi permessi) è il passo necessario per servire con la stessa chat atti a diversa visibilità.
 - **Tracciabilità delle risposte.** In ambito amministrativo può essere necessario ricostruire a posteriori che cosa il sistema ha risposto, a chi, sulla base di quali documenti e con quale versione dei prompt. Gli elementi sono in parte già registrati, ma non in una forma pensata per essere consultata come registro.
 - **Espurgo e diritto all'oblio.** Non esiste un percorso per rimuovere selettivamente un documento e tutte le sue tracce — frammenti vettoriali, documenti padre, voci di cache semantica che potrebbero riprodurne il contenuto.
 
-### 8.6 Ottimizzazioni note
+### 9.6 Ottimizzazioni note
 
 Interventi che non aggiungono funzionalità ma riducono tempi o costi, elencati per completezza:
 
@@ -514,7 +664,7 @@ Interventi che non aggiungono funzionalità ma riducono tempi o costi, elencati 
 - **Chiamate di embedding**: tre viaggi di rete sequenziali per richiesta, accorpabili.
 - **Trasporto verso il database vettoriale**: il protocollo binario ridurrebbe la latenza sui profili che trasferiscono vettori.
 
-### 8.7 Parità tra fornitori
+### 9.7 Parità tra fornitori
 
 L'adapter normalizza le differenze fra SDK, ma la copertura non è uniforme. Da considerare prima di un cambio di fornitore:
 
@@ -528,7 +678,7 @@ L'adapter normalizza le differenze fra SDK, ma la copertura non è uniforme. Da 
 
 La diagnostica del troncamento descritta in §5.2 distingue le cause grazie ai token di ragionamento, disponibili solo su Gemini: sugli altri fornitori degrada a una segnalazione generica.
 
-## 9. Manutenzione, Monitoraggio e Scheduled Task
+## 10. Manutenzione, Monitoraggio e Scheduled Task
 
 ### Configurazione Celery (`worker.py`)
 
@@ -581,9 +731,12 @@ Due avvertenze sulla lettura dei sintomi:
 - **CronJob orario di pulizia cache semantica (`prune_semantic_cache`)**: task periodico di Celery Beat che rimuove da `semantic_cache` i record con timestamp superiore a `MAX_AGE_SECONDS` (24 ore), prevenendo l'obsolescenza dei contesti normativi.
 - **Metriche per richiesta (`rag_metrics`)**: ogni task registra tentativi, cache hit, parametri di retrieval effettivi e `missing_targets` del Grader. Sui volumi, questi ultimi distinguono un problema di **ingestion** (documenti mai indicizzati per un'entità) da uno di **soglie** (presenti ma non agganciati dal retrieval).
 - **Retry delle API con backoff e jitter**: le interazioni con API LLM, embedding e vector DB sono protette da `tenacity`. Su rate-limit (429) o indisponibilità (503) si applica un backoff esponenziale con jitter casuale, che impedisce fenomeni di risonanza tra pod concorrenti.
+- **Script di amministrazione** (`utils/`, da eseguire nel pod dell'API con `python -m utils.<nome>`):
+  - `manage_review_users`: utenti (`add`, `password`, `disable`/`enable`, `list`), ruoli (`grant`, `revoke`, `roles`), archivi assegnati (`allow`, `deny`) e accesso pubblico/riservato degli archivi (`topics`, `public`, `private`).
+  - `reindex_topic <topic>`: ripassa dall'ingestione i documenti già indicizzati di un archivio, copiando i pacchetti da `processed/` a `watch/` e pubblicandoli su `da-indicizzare` a lotti (`--batch`, `--max-pending` sulla profondità della coda). Di default solo i documenti il cui testo **indicizzato** contiene ancora `&nbsp;` o `<mark>` (rilanciandolo riprende da dove era arrivato; `--all` per tutti); salta i pacchetti già in `watch/` (correzioni della revisione in sospeso) e segnala i documenti indicizzati senza pacchetto su disco. `--dry-run` per vedere cosa farebbe. Dopo una re-indicizzazione estesa conviene svuotare la cache semantica (`qdrant_semantic_cache_reset`).
 - **Upgrade Infrastrutturale**: i miglioramenti di velocità sotto carico massivo richiederanno hardware dedicato (GPU/TPU) per svincolare l'Ente dalle code di elaborazione condivise.
 
-## 10. Requisiti di Sistema e Dipendenze Python (`requirements.txt`)
+## 11. Requisiti di Sistema e Dipendenze Python (`requirements.txt`)
 
 Per consentire la corretta esecuzione del sistema in ambienti containerizzati (come Docker o Kubernetes), è essenziale mappare accuratamente tutte le librerie software utilizzate dai diversi moduli dell'applicazione. Di seguito viene fornito il contenuto del file `requirements.txt` seguito da un'analisi dell'utilizzo di ciascun pacchetto.
 
