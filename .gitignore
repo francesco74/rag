@@ -4,6 +4,7 @@
 !saga_extract/
 !detect_boilerplate/
 !common/
+!utils/
 !api/
 !web/
 !web/greenlees/
@@ -22,6 +23,7 @@
 !web/revisione/
 !web/revisione/src/
 
+
 !ingestion/**
 !api/**
 !saga_extract/**
@@ -38,6 +40,7 @@
 !web/provincia/src/assets/html/**
 !converter/**
 !direct/**
+!utils/**
 !web/revisione/**
 
 !web/greenlees/docker-entrypoint.sh
