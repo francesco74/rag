@@ -1,11 +1,15 @@
 """Controlli sui file in ingresso, comuni a direct.py e al caricamento dall'amministrazione."""
 
+import io
 import logging
+import zipfile
 
 log = logging.getLogger("INTAKE")
 
 # Estensioni ammesse per il contenuto FINALE (dopo eventuale sbustamento p7m).
-SUPPORTED_EXTENSIONS = {".pdf", ".txt", ".md", ".png", ".jpg", ".jpeg"}
+# Documenti d'ufficio: testo e fogli di calcolo, in formato Microsoft e OpenDocument.
+OFFICE_EXTENSIONS = {".docx", ".odt", ".xlsx", ".ods"}
+SUPPORTED_EXTENSIONS = {".pdf", ".txt", ".md", ".png", ".jpg", ".jpeg"} | OFFICE_EXTENSIONS
 # Estensioni accettate in INGRESSO: le stesse ammesse, più ".p7m" (buste di
 # firma digitale CAdES/PKCS7, sbustate prima di verificare il tipo reale).
 INPUT_EXTENSIONS = SUPPORTED_EXTENSIONS | {".p7m"}
@@ -18,13 +22,33 @@ _MAGIC_BYTES = (
     (b"\x89PNG\r\n\x1a\n", ".png"),
     (b"\xff\xd8\xff", ".jpg"),
 )
+# OpenDocument dichiara il tipo nel file "mimetype" dell'archivio zip.
+_ODF_TYPES = {"application/vnd.oasis.opendocument.text": ".odt",
+              "application/vnd.oasis.opendocument.spreadsheet": ".ods"}
+
+
+def _office_type(content: bytes) -> str | None:
+    """docx, xlsx, odt e ods sono archivi zip: il tipo si riconosce da cosa contengono."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(content)) as archive:
+            names = set(archive.namelist())
+            if "mimetype" in names:
+                return _ODF_TYPES.get(archive.read("mimetype").decode("ascii", "ignore").strip())
+            if "word/document.xml" in names:
+                return ".docx"
+            if "xl/workbook.xml" in names:
+                return ".xlsx"
+    except (zipfile.BadZipFile, KeyError, OSError):
+        return None
+    return None
 
 
 def detect_extension_from_content(content: bytes) -> str | None:
     """
-    Rileva l'estensione reale in base ai magic bytes iniziali. Restituisce
+    Rileva l'estensione reale in base ai magic bytes iniziali e, per gli archivi
+    zip, al loro contenuto (docx, xlsx, odt, ods: serve il file intero). Restituisce
     None se il contenuto non corrisponde a nessuno dei formati binari
-    riconosciuti (.pdf/.png/.jpg) — i formati testuali (.txt/.md) non hanno
+    riconosciuti — i formati testuali (.txt/.md) non hanno
     una firma binaria affidabile e in pratica non ha senso attendersi che
     una busta di firma digitale li incapsuli, quindi non vengono rilevati
     qui: un simile contenuto verrebbe scartato come "non supportato".
@@ -32,6 +56,8 @@ def detect_extension_from_content(content: bytes) -> str | None:
     for magic, ext in _MAGIC_BYTES:
         if content.startswith(magic):
             return ext
+    if content.startswith(b"PK\x03\x04"):
+        return _office_type(content)
     return None
 
 

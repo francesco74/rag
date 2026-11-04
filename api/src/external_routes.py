@@ -6,7 +6,7 @@ con utils/manage_api_keys.py) inviate come `Authorization: Bearer <chiave>`.
     GET  /external/v1/topics/<topic>/documents        documenti del topic, a pagine, con i metadati
     GET  /external/v1/topics/<topic>/documents/<id>   testo del documento presente nel database
     POST /external/v1/convert                         converte un documento in Markdown o testo
-    GET  /external/v1/convert/<job_id>                stato e risultato della conversione
+    GET  /external/v1/convert/<job_id>                stato e risultato della conversione (una volta sola)
 
 I topic limitano la consultazione; per la conversione basta una chiave valida,
 perché non legge nulla dell'archivio. La conversione è asincrona (una scansione
@@ -43,7 +43,7 @@ bp.register_error_handler(ApiError, _handle_api_error)
 bp.register_error_handler(Exception, _handle_unexpected)
 
 CONVERSIONS_FOLDER = pathlib.Path(settings.data_folder) / "conversions"
-CONVERT_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".txt", ".md"}
+CONVERT_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".txt", ".md", ".docx", ".odt", ".xlsx", ".ods"}
 JOB_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 # Intestazioni di sezione del singolo frammento: non descrivono il documento.
 HEADER_KEY_RE = re.compile(r"^Header \d+$")
@@ -251,4 +251,8 @@ def get_conversion(job_id):
     if status["status"] == "completed":
         markdown = (job_dir / "result.md").read_text(encoding="utf-8")
         response["content"] = markdown_to_text(markdown) if job["format"] == "text" else markdown
+    if status["status"] in ("completed", "failed"):
+        # Consegnato l'esito, sul server non resta nulla del documento.
+        shutil.rmtree(job_dir, ignore_errors=True)
+        log.info(f"[{g.api_key['name']}] conversione {job_id}: esito consegnato, lavoro cancellato")
     return jsonify(response)

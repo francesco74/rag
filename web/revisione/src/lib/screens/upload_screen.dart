@@ -8,7 +8,7 @@ import '../api.dart';
 import '../widgets/common.dart';
 import '../widgets/user_menu.dart';
 
-const _accept = '.pdf,.txt,.md,.png,.jpg,.jpeg,.p7m';
+const _accept = '.pdf,.txt,.md,.png,.jpg,.jpeg,.docx,.odt,.xlsx,.ods,.p7m';
 
 /// Un file da inviare e le sottocartelle di origine ('' se scelto da solo).
 class _Pick {
@@ -318,7 +318,7 @@ class _UploadScreenState extends State<UploadScreen> {
             const SizedBox(width: 12),
             Expanded(
                 child: Text('oppure trascinali in questa pagina. Le cartelle conservano le sottocartelle. '
-                    'PDF, immagini, testo e .p7m, massimo $_maxMb MB l\'uno.')),
+                    'PDF, immagini, testo, Word, Excel, OpenDocument e .p7m, massimo $_maxMb MB l\'uno.')),
           ]),
           CheckboxListTile(
             contentPadding: EdgeInsets.zero,

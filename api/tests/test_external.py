@@ -154,17 +154,31 @@ check(cl.get(f"{BASE}/convert/..%2f..", headers=H("chiave-atti")).status_code ==
 d = TMP / "conversions" / job
 (d / "result.md").write_text("# Titolo\n\n**testo**")
 (d / "status.json").write_text(json.dumps({"status": "completed"}))
+check(cl.get(f"{BASE}/convert/{job}", headers=H("chiave-atti")).status_code == 404 and d.exists(),
+      "un'altra chiave non lo ritira né lo cancella")
 check(cl.get(f"{BASE}/convert/{job}", headers=H("chiave-nessun-topic")).json["content"] == "# Titolo\n\n**testo**", "risultato in Markdown")
+check(not d.exists(), "consegnato il risultato, il lavoro è cancellato")
+check(cl.get(f"{BASE}/convert/{job}", headers=H("chiave-nessun-topic")).status_code == 404, "si ritira una volta sola")
 d2 = TMP / "conversions" / r2.json["job_id"]
 (d2 / "result.md").write_text("# Titolo\n\n**testo**")
 (d2 / "status.json").write_text(json.dumps({"status": "completed"}))
 check(cl.get(f"{BASE}/convert/{r2.json['job_id']}", headers=H("chiave-nessun-topic")).json["content"] == "Titolo\n\ntesto", "risultato in testo semplice")
-(d2 / "status.json").write_text(json.dumps({"status": "failed", "code": "conversion_failed", "error": "x"}))
-r = cl.get(f"{BASE}/convert/{r2.json['job_id']}", headers=H("chiave-nessun-topic"))
-check(r.json["code"] == "conversion_failed" and "content" not in r.json, "errore del lavoro riportato")
-os.utime(d2, (1, 1))
+r3 = upload()
+d3 = TMP / "conversions" / r3.json["job_id"]
+(d3 / "status.json").write_text(json.dumps({"status": "running"}))
+check(cl.get(f"{BASE}/convert/{r3.json['job_id']}", headers=H("chiave-nessun-topic")).json["status"] == "running" and d3.exists(),
+      "in corso: il lavoro resta")
+(d3 / "status.json").write_text(json.dumps({"status": "failed", "code": "conversion_failed", "error": "x"}))
+r = cl.get(f"{BASE}/convert/{r3.json['job_id']}", headers=H("chiave-nessun-topic"))
+check(r.json["code"] == "conversion_failed" and "content" not in r.json and not d3.exists(), "errore riportato, poi cancellato")
+r4 = upload(name="foglio.xlsx")
+check(r4.status_code == 202, "fogli di calcolo accettati")
+r5 = upload(name="lettera.odt")
+check(r5.status_code == 202, "OpenDocument accettati")
+d5 = TMP / "conversions" / r5.json["job_id"]
+os.utime(d5, (1, 1))
 ex._remove_expired_jobs()
-check(not d2.exists() and d.exists(), "i lavori scaduti si cancellano")
+check(not d5.exists() and (TMP / "conversions" / r4.json["job_id"]).exists(), "i lavori mai ritirati scadono")
 
 print("\nRISULTATO:", "FALLITO" if FAILED else "TUTTO OK")
 sys.exit(1 if FAILED else 0)

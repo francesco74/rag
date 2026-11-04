@@ -26,6 +26,7 @@ from dotenv import load_dotenv
 from common.config import settings
 from common.upload_status import FAILED, PROCESSING, mark_upload, record_ocr
 from common.utility import CONVERSION_QUEUE, CONVERSION_QUEUE_ARGS, EXTERNAL_OCR_MARKER
+from office import OFFICE_EXTENSIONS, office_to_markdown
 from ocr_provider import OcrBlockedError, OcrTransientError, clean_transcription, get_external_fallback, get_ocr_provider
 import html
 import re
@@ -228,6 +229,7 @@ LEGACY_EXTRACTION_TIMEOUT = 300.0  # 5 minuti - TENTATIVO 2: libreria SENZA layo
                                     # anzi essere più lenta. Il vero paracadute è il TENTATIVO 3 (OCR), quindi
                                     # non ha senso tenere timeout alti sui primi due livelli: tanto vale arrivare
                                     # prima all'OCR, che funziona indipendentemente da quanto è "brutta" la pagina.
+OFFICE_TIMEOUT = 300.0             # 5 minuti - conversione di un documento d'ufficio
 FALLBACK_OCR_TIMEOUT = 300.0       # 5 minuti - rasterizzazione di TUTTE le pagine per il fallback OCR (TENTATIVO 3)
 
 # Limiter asincrono: gestisce internamente la concorrenza garantendo max OCR_RATE_PER_MINUTE chiamate/minuto
@@ -667,6 +669,9 @@ async def convert_file_to_markdown(attached_file_path: Path, filename: str) -> s
         return await extract_hybrid_markdown_from_pdf_async(attached_file_path, file_bytes=pdf_bytes)
     elif attached_ext in [".txt", ".md"]:
         return attached_file_path.read_text(encoding="utf-8", errors="ignore")
+    elif attached_ext in OFFICE_EXTENSIONS:
+        # Processo separato: pandoc o un foglio enorme non devono bloccare il converter.
+        return await asyncio.to_thread(_run_killable, office_to_markdown, (attached_file_path,), OFFICE_TIMEOUT)
     elif attached_ext in IMG_EXTENSIONS:
         log.info(f"Rilevata immagine {filename}. Avvio OCR nativo...")
         _count_pages(total=1)

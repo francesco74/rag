@@ -401,12 +401,12 @@ Sotto `/external/v1`, con chiavi proprie in `Authorization: Bearer`. Le chiavi s
 | `GET /topics` | Topic abilitati per la chiave, con le sottocategorie. |
 | `GET /topics/<topic>/documents` | Documenti del topic, a pagine (`page`, `page_size` fino a 200, `sub_topic_id`), con `id` e metadati utili. |
 | `GET /topics/<topic>/documents/<id>` | Testo del documento presente nel database (parent in ordine) e metadati. Il testo corretto in revisione compare a ingestione completata. |
-| `POST /convert` | `multipart/form-data`: `file` (pdf, png, jpg, jpeg, txt, md), `format=markdown\|text`. Risponde `202` con `job_id`. Basta una chiave valida, anche senza topic. |
-| `GET /convert/<job_id>` | Stato (`queued`, `running`, `completed`, `failed`) e, a fine lavoro, `content`. Visibile solo alla chiave che lo ha creato. |
+| `POST /convert` | `multipart/form-data`: `file` (pdf, png, jpg, jpeg, txt, md, docx, odt, xlsx, ods), `format=markdown\|text`. Risponde `202` con `job_id`. Basta una chiave valida, anche senza topic. |
+| `GET /convert/<job_id>` | Stato (`queued`, `running`, `completed`, `failed`) e, a fine lavoro, `content`. Visibile solo alla chiave che lo ha creato. L'esito finale (`completed` o `failed`) si consegna una volta sola: subito dopo il lavoro viene cancellato e una nuova richiesta risponde `404`. |
 
 Un topic non abilitato risponde `403`. I metadati esposti escludono chiavi di sistema, `Header N`, campi con `_` iniziale, valori vuoti e i campi tecnici di `CONTEXT_METADATA_EXCLUDE`.
 
-La conversione è asincrona: l'API salva il file in `/data/conversions/<job_id>/` e accoda il lavoro su `da-convertire-api`; il converter usa la stessa pipeline dei documenti (testo nativo e OCR) e scrive `status.json` e `result.md`. Il file ricevuto si cancella a fine lavoro, i lavori dopo `CONVERT_RETENTION_HOURS`. Le conversioni usano solo il modello OCR configurato: se una pagina non riesce, il lavoro fallisce con `code: conversion_failed`. Le API esterne non hanno ancora un limite di richieste per chiave.
+La conversione è asincrona: l'API salva il file in `/data/conversions/<job_id>/` e accoda il lavoro su `da-convertire-api`; il converter usa la stessa pipeline dei documenti (testo nativo e OCR) e scrive `status.json` e `result.md`. Il file ricevuto si cancella a fine lavoro, il risultato appena consegnato; quelli mai ritirati dopo `CONVERT_RETENTION_HOURS`. I documenti d'ufficio (`converter/src/office.py`) non passano dall'OCR: docx e odt con pandoc, xlsx e ods con pandas, un foglio per sezione `##` con la prima riga piena come intestazione; le immagini incorporate si ignorano. Le conversioni usano solo il modello OCR configurato: se una pagina non riesce, il lavoro fallisce con `code: conversion_failed`. Le API esterne non hanno ancora un limite di richieste per chiave.
 
 ### J. Siti della chat (`site_routes.py`)
 
@@ -669,7 +669,7 @@ I default puntano a modelli Gemini, ma sono appunto default: il codice del motor
 | `files_x_accel_prefix` | `FILES_X_ACCEL_PREFIX` | `str` | `""` | Prefisso della location `internal` di nginx per `X-Accel-Redirect` (in k8s `/_protected_files/`). Vuoto: i file li invia l'API. |
 | `files_login_url` | `FILES_LOGIN_URL` | `str` | `"/amministrazione/"` | Pagina di login proposta da `/files` a chi apre un documento riservato senza sessione. |
 | `convert_max_upload_mb` | `CONVERT_MAX_UPLOAD_MB` | `int` | `50` | Dimensione massima dei documenti da convertire. Va tenuta sotto `client_max_body_size` di nginx (`/api/`: 60 MB). |
-| `convert_retention_hours` | `CONVERT_RETENTION_HOURS` | `int` | `48` | Ore di conservazione dei lavori di conversione e delle trascrizioni esterne non usate. |
+| `convert_retention_hours` | `CONVERT_RETENTION_HOURS` | `int` | `48` | Ore di conservazione dei lavori di conversione mai ritirati e delle trascrizioni esterne non usate. |
 | `login_max_failures` | `LOGIN_MAX_FAILURES` | `int` | `5` (min `1`) | Tentativi di login falliti di fila dopo cui un nome utente è bloccato. |
 | `login_lockout_seconds` | `LOGIN_LOCKOUT_SECONDS` | `int` | `900` (min `60`) | Durata del blocco; un fallimento più vecchio non conta più. |
 | `login_ip_max_failures` | `LOGIN_IP_MAX_FAILURES` | `int` | `20` (min `1`) | Come sopra, per indirizzo IP (su nomi diversi). Attivo solo con `TRUSTED_PROXY_HOPS > 0`. |

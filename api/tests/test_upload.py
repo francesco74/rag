@@ -129,6 +129,23 @@ for bad, why in [(("x.exe", PDF), "estensione"), (("../x.pdf", PDF), "percorso")
                  (("x.pdf", b"non un pdf"), "contenuto diverso dall'estensione"), (("x.pdf", b""), "vuoto"),
                  (("x.txt", b"\xff\xfe\x00"), "testo non UTF-8"), (("x.p7m", b"non una busta"), "busta non valida")]:
     check(post(data=bad[1], name=bad[0]).status_code == 422, f"rifiutato: {why}")
+import zipfile as _zip
+
+
+def office_zip(**members):
+    buffer = io.BytesIO()
+    with _zip.ZipFile(buffer, "w") as archive:
+        for member, content in members.items():
+            archive.writestr(member.replace("__", "/").replace("_dot_", "."), content)
+    return buffer.getvalue()
+
+
+DOCX = office_zip(word__document_dot_xml="<w/>", **{"[Content_Types]_dot_xml": "<t/>"})
+ODS = office_zip(mimetype="application/vnd.oasis.opendocument.spreadsheet", content_dot_xml="<c/>")
+check(post(data=DOCX, name="finto.xlsx").status_code == 422, "docx chiamato xlsx: rifiutato")
+check(post(data=ODS, name="finto.odt").status_code == 422, "ods chiamato odt: rifiutato")
+check(post(data=b"PK\x03\x04 rotto", name="rotto.docx").status_code == 422, "archivio rotto: rifiutato")
+check(not list(STAGING.glob("*")), "i documenti d'ufficio rifiutati non lasciano tracce")
 check(post(data=b"%PDF-" + b"x" * (1024 * 1024)).status_code == 413, "oltre il limite -> 413")
 check(not list(STAGING.glob("*")), "i file rifiutati non lasciano tracce")
 check(not sent, "nulla in coda")
@@ -190,6 +207,15 @@ c.commit()
 for f in list(STAGING.glob("*")):
     f.unlink()
 sent.clear()
+
+for upload_name, upload_data in (("relazione.docx", DOCX), ("tabella.ods", ODS)):
+    r = post(name=upload_name, data=upload_data)
+    check(r.status_code == 201 and (STAGING / upload_name).read_bytes() == upload_data, f"caricato {upload_name}")
+    finish(source=f"direct://atti/determine/{upload_name}")
+sent.clear()
+
+c.execute("DELETE FROM document_uploads WHERE file_name IN ('relazione.docx', 'tabella.ods')")
+c.commit()
 
 # --- coda non raggiungibile
 send_fails = True

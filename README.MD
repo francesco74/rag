@@ -364,7 +364,7 @@ I ruoli sono fissi: l'amministratore li assegna, ma non può crearne di nuovi n�
 Dal sito di amministrazione, la voce **Caricamento** della barra laterale è disponibile per archivisti e amministratori:
 
 1. si scelgono archivio e sottocategoria, tra quelli assegnati;
-2. si trascinano o si scelgono i file (PDF, immagini, testo, buste firmate `.p7m`), e si controlla il riepilogo di numero e dimensione;
+2. si trascinano o si scelgono i file (PDF, immagini, testo, documenti Word e OpenDocument `.docx`/`.odt`, fogli di calcolo `.xlsx`/`.ods`, buste firmate `.p7m`), e si controlla il riepilogo di numero e dimensione;
 3. Per conservare le sottocartelle di origine, ad esempio l'ordine dell'inventario, usa **Scegli una cartella** o trascina la cartella: il percorso resta nel nome del documento e compare nelle fonti della chat. I file di tipo non ammesso che contiene vengono ignorati.
 4. **Carica e avvia l'ingestione** invia i file: l'indicizzazione parte da sola e si può chiudere la pagina.
 

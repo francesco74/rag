@@ -17,3 +17,9 @@ aio_pika>=8.0.0
 mysql-connector-python==9.5.0
 
 asn1crypto>=1.5.1
+
+# Documenti d'ufficio: pandoc (incluso nel pacchetto) per docx/odt, pandas per xlsx/ods
+pypandoc_binary>=1.13
+pandas>=2.0
+openpyxl>=3.1
+odfpy>=1.4

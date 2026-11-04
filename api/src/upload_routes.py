@@ -23,7 +23,7 @@ import pika
 from flask import Blueprint, g, jsonify, request
 
 from common.config import settings
-from common.file_intake import (INPUT_EXTENSIONS, detect_extension_from_content, try_extract_from_pkcs7,
+from common.file_intake import (INPUT_EXTENSIONS, OFFICE_EXTENSIONS, detect_extension_from_content, try_extract_from_pkcs7,
                                 unwrapped_name)
 from common.review_permissions import PERM_UPLOAD
 from common.upload_status import INDEXED, FAILED, NOT_SENT, PROCESSING, QUEUED
@@ -106,12 +106,15 @@ def _check_content(temp_path, name):
             content = None
         detected = detect_extension_from_content(content) if content else None
         if not detected:
-            raise ApiError(422, f"'{name}': la busta firmata non è valida o non contiene un PDF o un'immagine")
+            raise ApiError(422, f"'{name}': la busta firmata non è valida o non contiene un formato ammesso")
         temp_path.write_bytes(content)
         return unwrapped_name(name, detected)
-    with open(temp_path, "rb") as f:
-        head = f.read(16)
-    detected = detect_extension_from_content(head)
+    if suffix in OFFICE_EXTENSIONS:
+        # Archivi zip: il tipo si legge dal loro contenuto.
+        detected = detect_extension_from_content(temp_path.read_bytes())
+    else:
+        with open(temp_path, "rb") as f:
+            detected = detect_extension_from_content(f.read(16))
     if suffix in (".txt", ".md"):
         try:
             temp_path.read_text(encoding="utf-8")

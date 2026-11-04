@@ -25,7 +25,7 @@ import pymupdf
 from common.db_logger import get_db_connection, init_db_pool
 from converter import ARCHIVE_DIR, IMG_EXTENSIONS, inspect_page, try_extract_pdf_from_pkcs7
 
-TEXT_EXTENSIONS = (".txt", ".md")
+TEXT_EXTENSIONS = (".txt", ".md", ".docx", ".odt", ".xlsx", ".ods")
 FORK = mp.get_context("fork")
 
 
@@ -62,7 +62,7 @@ def count_pdf_pages(path, timeout):
 
 
 def count_pages(path, timeout):
-    """Come il converter: un'immagine passa sempre dall'OCR, un testo mai."""
+    """Come il converter: un'immagine passa sempre dall'OCR, un testo o un documento d'ufficio mai."""
     suffix = path.suffix.lower()
     if suffix in IMG_EXTENSIONS:
         return 1, 1

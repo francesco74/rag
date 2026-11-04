@@ -234,6 +234,35 @@ check("lavoro esterno: esito", json.loads((job_dir / "status.json").read_text())
 check("lavoro esterno: ogni pagina", (job_dir / "result.md").read_text(), "pagina 1\n\n---\n\npagina 2")
 converter._external_transcribe_page = real_page
 
+# --- Documenti d'ufficio: testo e tabelle senza OCR
+import datetime, openpyxl, pandas, pypandoc
+from common.file_intake import detect_extension_from_content
+office_dir = pathlib.Path(tempfile.mkdtemp())
+source_md = "# Determina\n\nIl **dirigente** dispone.\n\n| Voce | Importo |\n|---|---|\n| Pulizie | 1.200,00 |\n"
+for ext in ("docx", "odt"):
+    pypandoc.convert_text(source_md, ext, format="md", outputfile=str(office_dir / f"atto.{ext}"))
+workbook = openpyxl.Workbook()
+workbook.active.title = "Spese"
+for row in (["Data", "Voce", "Importo"], [datetime.date(2026, 3, 1), "Pulizie", 1200.5], [None, None, None],
+            [datetime.date(2026, 4, 2), "a | b", 800]):
+    workbook.active.append(row)
+workbook.create_sheet("Vuoto")
+workbook.save(office_dir / "conti.xlsx")
+pandas.DataFrame([["Comune", "Abitanti"], ["Lucca", 89000]]).to_excel(
+    office_dir / "comuni.ods", engine="odf", header=False, index=False, sheet_name="Comuni")
+for name in ("atto.docx", "atto.odt", "conti.xlsx", "comuni.ods"):
+    check(f"ufficio: tipo riconosciuto {name}", detect_extension_from_content((office_dir / name).read_bytes()),
+          pathlib.Path(name).suffix)
+for ext in ("docx", "odt"):
+    text = asyncio.run(converter.convert_file_to_markdown(office_dir / f"atto.{ext}", f"atto.{ext}"))
+    check(f"ufficio: {ext} con titolo, grassetto e tabella",
+          ("# Determina" in text, "**dirigente**" in text, "| Pulizie" in text and "1.200,00" in text), (True, True, True))
+check("ufficio: xlsx", asyncio.run(converter.convert_file_to_markdown(office_dir / "conti.xlsx", "conti.xlsx")),
+      "## Spese\n\n| Data | Voce | Importo |\n|---|---|---|\n| 2026-03-01 | Pulizie | 1200.5 |\n| 2026-04-02 | a \\| b | 800 |")
+check("ufficio: ods", asyncio.run(converter.convert_file_to_markdown(office_dir / "comuni.ods", "comuni.ods")),
+      "## Comuni\n\n| Comune | Abitanti |\n|---|---|\n| Lucca | 89000 |")
+check("ufficio: zip qualsiasi non è un documento", detect_extension_from_content(b"PK\x03\x04 non un archivio"), None)
+
 # --- Conteggio delle pagine OCR
 async def counted(path, name):
     stats = {"ocr": 0, "total": 0}
