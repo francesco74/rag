@@ -6,6 +6,8 @@ from pathlib import Path
 
 import aio_pika
 from common.config import settings
+from common.file_intake import (INPUT_EXTENSIONS, SUPPORTED_EXTENSIONS, detect_extension_from_content,
+                                try_extract_from_pkcs7, unwrapped_name)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - WRAPPER - %(levelname)s - %(message)s')
 log = logging.getLogger("WrapperDiretti")
@@ -16,80 +18,6 @@ STAGING_DIR = DATA_FOLDER / "staging"
 
 INPUT_DIR.mkdir(parents=True, exist_ok=True)
 STAGING_DIR.mkdir(parents=True, exist_ok=True)
-
-# Estensioni ammesse per il contenuto FINALE (dopo eventuale sbustamento p7m).
-SUPPORTED_EXTENSIONS = {".pdf", ".txt", ".md", ".png", ".jpg", ".jpeg"}
-# Estensioni accettate in INGRESSO: le stesse ammesse, più ".p7m" (buste di
-# firma digitale CAdES/PKCS7, sbustate prima di verificare il tipo reale).
-INPUT_EXTENSIONS = SUPPORTED_EXTENSIONS | {".p7m"}
-
-# Magic bytes dei formati supportati, per rilevare il tipo reale del
-# contenuto DOPO lo sbustamento (un file .p7m non dice nulla sul contenuto
-# che incapsula finché non lo si apre).
-_MAGIC_BYTES = (
-    (b"%PDF-", ".pdf"),
-    (b"\x89PNG\r\n\x1a\n", ".png"),
-    (b"\xff\xd8\xff", ".jpg"),
-)
-
-
-def detect_extension_from_content(content: bytes) -> str | None:
-    """
-    Rileva l'estensione reale in base ai magic bytes iniziali. Restituisce
-    None se il contenuto non corrisponde a nessuno dei formati binari
-    riconosciuti (.pdf/.png/.jpg) — i formati testuali (.txt/.md) non hanno
-    una firma binaria affidabile e in pratica non ha senso attendersi che
-    una busta di firma digitale li incapsuli, quindi non vengono rilevati
-    qui: un simile contenuto verrebbe scartato come "non supportato".
-    """
-    for magic, ext in _MAGIC_BYTES:
-        if content.startswith(magic):
-            return ext
-    return None
-
-
-# NOTA MANUTENZIONE: funzione duplicata intenzionalmente da converter.py/
-# estrattore.py (stessa logica identica) — direct.py, converter.py ed
-# estrattore.py sono deployable indipendenti senza un pacchetto comune
-# importabile da tutti. Se la si modifica in un punto, replicare la
-# modifica anche negli altri due.
-def try_extract_from_pkcs7(file_bytes: bytes, filename: str = "") -> bytes | None:
-    """
-    Tenta di interpretare file_bytes come busta di firma PKCS7/CMS (CAdES) e,
-    se lo è, ne estrae il contenuto incapsulato.
-
-    Restituisce:
-    - None se file_bytes NON è una struttura PKCS7 valida — il chiamante
-      deve trattarlo come anomalo per un file dichiarato ".p7m" (a
-      differenza di converter.py, dove None per un file .pdf significa
-      semplicemente "PDF nativo già in chiaro", qui l'estensione .p7m
-      dichiara esplicitamente che ci si aspettava una busta).
-    - i bytes del contenuto estratto, se file_bytes è una busta PKCS7 di
-      tipo signed_data e l'estrazione riesce.
-
-    Solleva ValueError se la struttura è riconosciuta come PKCS7 signed_data
-    ma l'estrazione del contenuto incapsulato fallisce.
-    """
-    from asn1crypto.cms import ContentInfo
-
-    try:
-        content_info = ContentInfo.load(file_bytes)
-    except Exception:
-        return None
-
-    if content_info['content_type'].native != 'signed_data':
-        return None
-
-    try:
-        signed_data = content_info['content']
-        encap_content_info = signed_data['encap_content_info']
-        raw_content = encap_content_info['content'].native
-        extracted_bytes = raw_content if isinstance(raw_content, bytes) else encap_content_info['content'].chosen.contents
-        log.debug("Sbustamento P7M completato per %s", filename)
-        return extracted_bytes
-    except Exception as e:
-        log.error("Fallimento sbustamento P7M per %s: %s", filename, str(e))
-        raise ValueError(f"Decodifica P7M fallita: {str(e)}")
 
 async def scan_and_wrap(channel: aio_pika.Channel):
     """
@@ -178,11 +106,7 @@ async def scan_and_wrap(channel: aio_pika.Channel):
             # Nome finale: rimuove ".p7m" e usa l'estensione rilevata.
             # "fattura.pdf.p7m" -> "fattura.pdf" (già corretta)
             # "fattura.p7m" -> "fattura.pdf" (estensione mancante, aggiunta)
-            stripped_name = file_path.stem  # rimuove solo ".p7m"
-            if stripped_name.lower().endswith(detected_ext):
-                final_filename = stripped_name
-            else:
-                final_filename = f"{stripped_name}{detected_ext}"
+            final_filename = unwrapped_name(file_path.name, detected_ext)
 
             log.info(f"✓ Sbustato '{rel_path}' -> '{final_filename}' (rilevato: {detected_ext}).")
 

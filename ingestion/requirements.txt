@@ -3,6 +3,8 @@ python-dotenv==1.0.1
 qdrant-client>=1.18.0
 langchain-text-splitters>=0.2.0
 google-genai>=0.1.0
+openai>=1.40,<3
+mistralai>=2,<3
 tenacity>=8.2.0
 typeguard>=2.17.0
 aiolimiter

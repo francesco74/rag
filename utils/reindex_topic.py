@@ -20,7 +20,7 @@ Si saltano:
   - i documenti non presenti in parent_documents (mai indicizzati o falliti:
     non è compito di questo script);
   - senza --all, i documenti il cui testo INDICIZZATO (parent_documents) non
-    contiene &nbsp; né <mark>: già puliti, o la pulizia non cambierebbe nulla
+    contiene &nbsp;, <mark> né <u>: già puliti, o la pulizia non cambierebbe nulla
     di rilevante. Il criterio guarda l'indice e non il .md (che non viene mai
     pulito): rilanciando lo script si riprende da dove si era arrivati.
 
@@ -56,7 +56,7 @@ PROCESSED_FOLDER = settings.data_folder / "processed"
 WATCH_FOLDER = settings.data_folder / "watch"
 # Ciò che la pulizia dell'OCR toglie davvero (spazi a fine riga e simili non
 # valgono una re-indicizzazione), cercato nel testo già indicizzato.
-DIRTY_MARKERS = ("&nbsp;", "&#160;", "\xa0", "<mark>")
+DIRTY_MARKERS = ("&nbsp;", "&#160;", "\xa0", "<mark>", "<u>")
 
 
 def find_packages(topic_id, sub_topic_id=None):
@@ -133,7 +133,7 @@ def main():
     ap.add_argument("topic_id")
     ap.add_argument("--sub-topic", help="solo questa sottocategoria")
     ap.add_argument("--all", action="store_true",
-                    help="tutti i documenti, non solo quelli con &nbsp; o <mark> nel testo")
+                    help="tutti i documenti, non solo quelli con &nbsp;, <mark> o <u> nel testo")
     ap.add_argument("--limit", type=int, help="al massimo N documenti (per una prova)")
     ap.add_argument("--batch", type=int, default=200, help="messaggi per lotto (default 200)")
     ap.add_argument("--max-pending", type=int, default=50,
@@ -147,7 +147,7 @@ def main():
     in_scope = {k for k in indexed if not args.sub_topic or k[1] == args.sub_topic}
     print(f"Archivio '{args.topic_id}'{f' / {args.sub_topic}' if args.sub_topic else ''}: "
           f"{len(in_scope)} documenti indicizzati, "
-          f"{len({k for k in dirty if k in in_scope})} con &nbsp; o <mark> nel testo indicizzato.")
+          f"{len({k for k in dirty if k in in_scope})} con &nbsp;, <mark> o <u> nel testo indicizzato.")
 
     todo, seen = [], set()
     skipped = {"già in watch/": [], "non indicizzati": [], "testo indicizzato già pulito": []}
@@ -174,7 +174,7 @@ def main():
             if len(items) > 10:
                 print(f"    ... e altri {len(items) - 10}")
     print(f"Da re-indicizzare: {len(todo)}"
-          f"{'' if args.all else ' (testo indicizzato con &nbsp; o <mark>)'}"
+          f"{'' if args.all else ' (testo indicizzato con &nbsp;, <mark> o <u>)'}"
           f"{f', limite {args.limit}' if args.limit else ''}.")
     missing = in_scope - seen
     if missing and not args.limit:

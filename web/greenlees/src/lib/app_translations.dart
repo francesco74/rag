@@ -249,6 +249,12 @@ class AppTranslations {
       AppLang.it: "Credenziali non valide.",
       AppLang.en: "Invalid credentials.",
     },
+    'login_locked': {
+      AppLang.it:
+          "Troppi tentativi di accesso falliti: accesso bloccato per qualche minuto. Riprova più tardi.",
+      AppLang.en:
+          "Too many failed sign-in attempts: access is blocked for a few minutes. Please try again later.",
+    },
     'login_unreachable': {
       AppLang.it: "Servizio non raggiungibile, riprova tra poco.",
       AppLang.en: "Service unreachable, please try again shortly.",

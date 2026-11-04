@@ -1,0 +1,228 @@
+# Sistema completo in locale, compilato dal codice sorgente. Istruzioni in misc/local/README.md.
+#
+#   cp misc/local/env.example .env.local      # poi inserire API_LLM_KEY
+#   docker compose --env-file .env.local up -d --build
+#
+#   http://greenlees.localhost:8081  chat Archivio Greenlees
+#   http://atti.localhost:8081       chat Atti amministrativi
+#   http://localhost:8081/amministrazione/ amministrazione e revisione dei documenti
+#
+
+x-backend: &backend
+  env_file: .env.local
+  environment: &backend-env
+    MYSQL_SERVICE_HOST: mysql
+    MYSQL_SERVICE_PORT: "3306"
+    MYSQL_DATABASE: rag
+    MYSQL_USER: raguser
+    REDIS_HOST: redis
+    REDIS_PORT: "6379"
+    BROKER_HOST: rabbitmq
+    BROKER_PORT: "5672"
+    QDRANT_HOST: qdrant
+    QDRANT_PORT: "6333"
+    DATA_FOLDER: /data
+    # Sicr@Web non serve in locale, ma config.py pretende le variabili.
+    DOCWS_RICERCA_ENDPOINT: http://non-usato
+    DOCWS_ATTI_ENDPOINT: http://non-usato
+    DOCWS_CODICE_AMMINISTRAZIONE: locale
+    DOCWS_CODICE_AOO: locale
+    RUOLO_DOCWS: locale
+    FILES_X_ACCEL_PREFIX: /_protected_files/
+    SESSION_COOKIE_SECURE: "false"
+    TRUSTED_PROXY_HOPS: "1"    # solo il gateway davanti all'API
+    # Dimensionato per un PC: un processo, un'istanza del reranker.
+    CPU_LIMIT: "4"
+    CELERY_CONCURRENCY: "1"
+    RERANKER_POOL_SIZE: "1"
+    MAX_RERANKER_THREAD: "1"
+    MAX_CONTEXT_CHARS: "150000"
+  restart: unless-stopped
+
+x-api-image: &api-image
+  image: rag/api:local
+  volumes:
+    - rag_data:/data
+
+services:
+  # ---------------------------------------------------------------- infrastruttura
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?manca in .env.local}
+      MYSQL_DATABASE: rag
+      MYSQL_USER: raguser
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?manca in .env.local}
+    volumes:
+      - mysql_data:/var/lib/mysql
+      # Eseguiti solo alla prima creazione del volume, in ordine di nome.
+      - ./misc/mysql_schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+      - ./misc/local/seed.sql:/docker-entrypoint-initdb.d/02-seed.sql:ro
+    ports:
+      - "127.0.0.1:3307:3306"
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uraguser -p$$MYSQL_PASSWORD --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+    restart: unless-stopped
+
+  redis:
+    image: redis:alpine
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: ${BROKER_USERNAME:?manca in .env.local}
+      RABBITMQ_DEFAULT_PASS: ${BROKER_PASSWORD:?manca in .env.local}
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    ports:
+      - "127.0.0.1:15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_running"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+    restart: unless-stopped
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    volumes:
+      - qdrant_data:/qdrant/storage
+    ports:
+      - "127.0.0.1:6333:6333"
+    restart: unless-stopped
+
+  # Collection e indici di Qdrant, code di RabbitMQ. Idempotente: gira a ogni avvio e termina.
+  setup:
+    <<: [*backend, *api-image]
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    command: sh -c "python -m utils.setup_qdrant && python -m utils.setup_rabbitmq"
+    environment:
+      <<: *backend-env
+      BROKER_PORT: "15672"   # setup_rabbitmq usa l'API di gestione HTTP, non AMQP
+    restart: "no"
+    depends_on:
+      rabbitmq: { condition: service_healthy }
+      qdrant: { condition: service_started }
+
+  # ---------------------------------------------------------------- backend
+  api:
+    <<: [*backend, *api-image]
+    depends_on: &backend-deps
+      mysql: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      setup: { condition: service_completed_successfully }
+
+  worker:
+    <<: [*backend, *api-image]
+    command: python -m celery -A worker.celery_app worker --loglevel=info --concurrency=1
+    depends_on: *backend-deps
+
+  celery-beat:
+    <<: [*backend, *api-image]
+    command: python -m celery -A worker.celery_app beat --loglevel=info --schedule=/tmp/celerybeat-schedule
+    depends_on: *backend-deps
+
+  ingestion:
+    <<: *backend
+    build:
+      context: .
+      dockerfile: ingestion/Dockerfile
+    image: rag/ingestion:local
+    volumes:
+      - rag_data:/data
+    depends_on: *backend-deps
+
+  # Documenti nuovi: si copiano in /data/direct/<topic>/<sub_topic>/ dentro il volume.
+  # Senza credenziali Google parte comunque: fallisce solo ciò che richiede Vision.
+  converter:
+    <<: *backend
+    build:
+      context: .
+      dockerfile: converter/Dockerfile
+    image: rag/converter:local
+    environment:
+      <<: *backend-env
+      GOOGLE_APPLICATION_CREDENTIALS: /var/secrets/google/credentials.json
+    volumes:
+      - rag_data:/data
+      - ${GOOGLE_CREDENTIALS_DIR:-./misc/local/no-google}:/var/secrets/google:ro
+    depends_on: *backend-deps
+
+  # Comando, non servizio: scansiona /data/direct e termina.
+  #   docker compose --env-file .env.local run --rm direct
+  direct:
+    <<: *backend
+    profiles: [tools]
+    restart: "no"
+    build:
+      context: .
+      dockerfile: direct/Dockerfile
+    image: rag/direct:local
+    volumes:
+      - rag_data:/data
+    depends_on: *backend-deps
+
+  # ---------------------------------------------------------------- frontend
+  # Immagine unica: il sito lo decide il dominio (tabella chat_sites).
+  chat:
+    build: web/chat
+    image: rag/web-chat:local
+    restart: unless-stopped
+
+  revisione:
+    build: web/revisione
+    image: rag/web-revisione:local
+    environment:
+      BASE_HREF: /amministrazione/
+      REVIEW_API_URL: /api/review
+    restart: unless-stopped
+
+  # Gateway come k8s/nginx.yaml: API, revisione e file riservati sotto ogni sito.
+  gateway:
+    image: nginx:alpine
+    volumes:
+      - ./misc/local/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./misc/local/nginx-routes.conf:/etc/nginx/rag-routes.conf:ro
+      - rag_data:/data:ro
+    ports:
+      - "127.0.0.1:8081:8081"
+    depends_on:
+      - api
+      - revisione
+      - chat
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------- debug
+  # Solo per le prove in locale, raggiungibile solo da questo computer.
+  phpmyadmin:
+    image: phpmyadmin:5.2.3
+    environment:
+      PMA_HOST: mysql
+      PMA_PORT: "3306"
+      UPLOAD_LIMIT: 256M
+    ports:
+      - "127.0.0.1:8082:80"
+    depends_on:
+      mysql: { condition: service_healthy }
+    restart: unless-stopped
+
+volumes:
+  mysql_data:
+  redis_data:
+  rabbitmq_data:
+  qdrant_data:
+  rag_data:

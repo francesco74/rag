@@ -1,4 +1,4 @@
-# Revisione documenti
+# Sito di amministrazione e revisione documenti
 
 Endpoint `/review` dell'API (`api/src/review_routes.py`, registrati in `app.py`) e interfaccia web (`web/revisione/`) per i revisori che controllano i documenti indicizzati nel RAG. Servono a:
 
@@ -41,9 +41,11 @@ Gli endpoint sono già dentro `app.py`: non c'è un nuovo servizio da pubblicare
 | `AUTH_SECRET_KEY` | **Obbligatoria**, almeno 32 caratteri casuali (es. `openssl rand -hex 32`). Firma i token di sessione e i link temporanei; è pensata per essere condivisa dai futuri servizi con login (ognuno separa i propri token con un salt diverso). Va solo nell'API, mai nei frontend. Se manca, le rotte `/review` rispondono 503 e la chat continua a funzionare. Il vecchio nome `REVIEW_SECRET_KEY` è ancora accettato |
 | `ALLOWED_ORIGINS` | Aggiungi l'URL del frontend di revisione, per il CORS |
 | `REVIEW_SESSION_HOURS` | Durata della sessione, default 10 |
+| `LOGIN_MAX_FAILURES` / `LOGIN_LOCKOUT_SECONDS` | Protezione del login: dopo 5 tentativi falliti di fila sullo stesso nome utente (anche inesistente) quel nome è bloccato per 900 secondi, anche con la password giusta. Sblocco manuale: `python -m utils.manage_review_users unlock <utente>`. Richiede la tabella `review_login_failures` (`misc/migrations/review_login_failures.sql`) |
+| `TRUSTED_PROXY_HOPS` / `LOGIN_IP_MAX_FAILURES` | Numero di proxy fidati davanti all'API che aggiungono `X-Forwarded-For` (in k8s di solito 2: ingress + nginx). Con un valore > 0 l'API conosce l'IP reale del client (anche nei log) e blocca un IP dopo 20 tentativi falliti, anche su nomi diversi. Default 0: limite per IP disattivato, perché l'API vedrebbe l'IP del proxy, uguale per tutti. Un valore più alto del reale permette al client di falsificare il proprio IP |
 | `REVIEW_LOCK_TTL_SECONDS` | Un documento aperto da un revisore è bloccato per gli altri (sola lettura); il frontend rinnova il blocco ogni terzo di questo tempo. Senza rinnovi (scheda chiusa, PC spento) scade dopo questi secondi. Default 300, minimo 60. Richiede la tabella `review_locks` (`misc/migrations/review_locks.sql`) |
 | `FILES_X_ACCEL_PREFIX` | Prefisso della location `internal` di nginx da cui inviare i documenti (in k8s `/_protected_files/`, vedi sotto). Vuoto: i file li invia l'API (sviluppo senza nginx) |
-| `FILES_LOGIN_URL` | Pagina di login proposta a chi apre un documento riservato senza essere autenticato, default `/revisione/` |
+| `FILES_LOGIN_URL` | Pagina di login proposta a chi apre un documento riservato senza essere autenticato, default `/amministrazione/` |
 | `SESSION_COOKIE_SECURE` | Default `true`: il cookie di sessione viaggia solo su HTTPS. `false` solo per lo sviluppo in http su un host diverso da localhost |
 | `DATA_FOLDER` + volume | **Novità per l'API:** deve montare lo stesso volume dati di converter e ingest, in lettura/scrittura (servono `processed/`, `watch/` e `ingestion/error/`) |
 
@@ -55,11 +57,8 @@ Ogni utente può avere più ruoli: i suoi permessi sono l'unione di quelli dei r
 
 | Ruolo | Lettura | Testo | Metadati | Stato | Utenti |
 |---|:-:|:-:|:-:|:-:|:-:|
-| `lettore` | ✓ | | | | |
-| `correttore` | ✓ | ✓ | | | |
-| `catalogatore` | ✓ | | ✓ | | |
-| `validatore` | ✓ | | | ✓ | |
-| `revisore` | ✓ | ✓ | ✓ | ✓ | |
+| `revisore` | ✓ | ✓ | | ✓ | |
+| `archivista` | ✓ | ✓ | ✓ | ✓ | |
 | `admin` | ✓ | ✓ | ✓ | ✓ | ✓ |
 
 Ruoli e permessi sono definiti in `common/review_permissions.py`: per cambiare cosa può fare un ruolo, o aggiungerne uno, basta modificare quel file (il database salva solo i nomi dei ruoli).
@@ -67,9 +66,9 @@ Ruoli e permessi sono definiti in `common/review_permissions.py`: per cambiare c
 ```bash
 docker exec -it <container-api> python -m utils.manage_review_users add mrossi --name "Mario Rossi"   # ruolo revisore
 docker exec -it <container-api> python -m utils.manage_review_users add admin --role admin
-docker exec -it <container-api> python -m utils.manage_review_users add lbianchi --role correttore --role validatore
-docker exec -it <container-api> python -m utils.manage_review_users grant mrossi validatore   # aggiunge ruoli
-docker exec -it <container-api> python -m utils.manage_review_users revoke mrossi validatore  # toglie ruoli
+docker exec -it <container-api> python -m utils.manage_review_users add lbianchi --role archivista
+docker exec -it <container-api> python -m utils.manage_review_users grant mrossi archivista   # aggiunge ruoli
+docker exec -it <container-api> python -m utils.manage_review_users revoke mrossi archivista  # toglie ruoli
 docker exec -it <container-api> python -m utils.manage_review_users roles    # ruoli disponibili e permessi
 docker exec -it <container-api> python -m utils.manage_review_users list
 docker exec -it <container-api> python -m utils.manage_review_users password mrossi   # chiude le sessioni aperte
@@ -125,10 +124,10 @@ Attenzione: rendere riservato un archivio protegge i **file originali**, non le 
 
 ```bash
 docker build -t rag-revisione web/revisione
-docker run -e BASE_HREF=/revisione/ -e REVIEW_API_URL=/api/review -e PROJECT_NAME="Revisione documenti" -p 8080:80 rag-revisione
+docker run -e BASE_HREF=/amministrazione/ -e REVIEW_API_URL=/api/review -e PROJECT_NAME="Amministrazione" -p 8080:80 rag-revisione
 ```
 
-- `BASE_HREF` è il percorso sotto cui il reverse proxy pubblica l'app (es. `/revisione/`, come in `k8s/nginx.yaml`; predefinito `/`, la radice del sito). Si imposta all'avvio del container, non nella build: la stessa immagine funziona sotto qualunque percorso. Deve coincidere con la `location` del proxy: se è sbagliato il browser carica i file dell'app dalla radice del sito e si apre l'applicazione sbagliata.
+- `BASE_HREF` è il percorso sotto cui il reverse proxy pubblica l'app (es. `/amministrazione/`, come in `k8s/nginx.yaml`; predefinito `/`, la radice del sito). Si imposta all'avvio del container, non nella build: la stessa immagine funziona sotto qualunque percorso. Deve coincidere con la `location` del proxy: se è sbagliato il browser carica i file dell'app dalla radice del sito e si apre l'applicazione sbagliata.
 - `FILES_URL` (facoltativa): indirizzo di `/files` dell'API; se assente si ricava da `REVIEW_API_URL` (`/api/review` → `/api/files`).
 - `REVIEW_API_URL` può essere assoluto (`https://ia.ente.it/api/review`) o relativo al sito (`/api/review`): relativo, la stessa immagine funziona su più domini senza richieste CORS. Deve terminare con `/review`, il prefisso delle rotte di revisione.
 
@@ -159,3 +158,7 @@ Tutti i percorsi hanno il prefisso `/review`. `/auth/login`, `/auth/me` e `/auth
 | GET | `/document/history` | `documenti.lettura` | Storico del documento |
 | GET | `/document/history/<id>` | `documenti.lettura` | Voce di storico con i valori prima e dopo |
 | GET | `/users` | `utenti.gestione` | Elenco utenti con i rispettivi ruoli e archivi |
+
+## Amministrazione
+
+Chi ha il ruolo `admin` trova nella barra laterale la voce **Amministrazione**: utenti, archivi e sottocategorie, siti della chat, credenziali dei sistemi esterni. Il primo amministratore si crea da riga di comando (`manage_review_users add admin --role admin`).

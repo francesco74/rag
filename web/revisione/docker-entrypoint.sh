@@ -3,8 +3,8 @@ set -e
 
 HTML=/usr/share/nginx/html
 
-# Percorso sotto cui il reverse proxy pubblica l'app (es. /revisione/ con la
-# location /revisione/ di k8s/nginx.yaml). Diventa il <base href> di
+# Percorso sotto cui il reverse proxy pubblica l'app (es. /amministrazione/ con la
+# location /amministrazione/ di k8s/nginx.yaml). Diventa il <base href> di
 # index.html: da lì il browser carica main.dart.js e gli altri file. Se non
 # corrisponde alla location del proxy, si apre l'applicazione sbagliata.
 BASE_HREF="${BASE_HREF:-/}"
@@ -23,7 +23,7 @@ echo "Base href: $BASE_HREF"
 cat <<EOC > "$HTML/env-config.js"
 window.ENV_CONFIG = {
   REVIEW_API_URL: "${REVIEW_API_URL:-http://localhost:5000/review}",
-  PROJECT_NAME: "${PROJECT_NAME:-Revisione documenti}",
+  PROJECT_NAME: "${PROJECT_NAME:-Amministrazione}",
   FILES_URL: "${FILES_URL:-}"
 };
 EOC

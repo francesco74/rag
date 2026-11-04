@@ -22,6 +22,10 @@ Supported providers (set via EMBEDDING_PROVIDER env var, default: gemini):
               embed_query/embed_for_semantic_query/il lato documento chiamano
               tutti lo stesso identico endpoint.
   mistral   — Mistral AI (mistral-embed). Simmetrico come OpenAI.
+  local     — sentence-transformers dentro il processo (nell'immagine dell'API,
+              non in quella dell'ingestione).
+  vllm      — modello servito da vLLM (LOCAL_VLLM_EMBEDDING_MODEL), con lo
+              stesso protocollo di OpenAI. Simmetrico.
 
 Ogni provider espone un attributo `dimension`: è la dimensionalità dei vettori
 prodotti, da usare per configurare VectorParams(size=...) in Qdrant quando si
@@ -276,8 +280,8 @@ class MistralEmbeddingProvider(EmbeddingProvider):
 
     def __init__(self):
         try:
-            from mistralai import Mistral
-            from mistralai.models import SDKError
+            from mistralai.client import Mistral
+            from mistralai.client.errors import SDKError
         except ImportError:
             raise RuntimeError("mistralai package not installed.")
         self._client = Mistral(api_key=settings.api_llm_key)
@@ -404,6 +408,54 @@ class LocalEmbeddingProvider(EmbeddingProvider):
 
 
 # ==============================================================================
+# VLLM PROVIDER
+# ==============================================================================
+class VLLMEmbeddingProvider(OpenAIEmbeddingProvider):
+    """
+    vLLM parla il protocollo di OpenAI: cambiano indirizzo e modello. La
+    dimensione è quella nativa del modello, da dichiarare in EMBEDDING_DIMENSION
+    (bge-m3: 1024): a differenza di OpenAI non si può chiedere una troncatura.
+    """
+
+    def __init__(self):
+        try:
+            from openai import OpenAI, AsyncOpenAI, RateLimitError, APIStatusError
+        except ImportError:
+            raise RuntimeError("openai package not installed.")
+        if not settings.local_vllm_embedding_model:
+            raise ValueError("EMBEDDING_PROVIDER='vllm' richiede LOCAL_VLLM_EMBEDDING_MODEL.")
+        self.model_name = settings.local_vllm_embedding_model
+        self.dimension = settings.embedding_dimension
+        base_url = settings.local_vllm_embedding_base_url or settings.local_vllm_base_url
+        api_key = settings.local_vllm_api_key or "not-needed"
+        self._client = OpenAI(api_key=api_key, base_url=base_url)
+        self._async_client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+        self._RateLimitError = RateLimitError
+        self._APIStatusError = APIStatusError
+        log.info(f"✓ VLLMEmbeddingProvider initialized (model={self.model_name}, dim={self.dimension}).")
+
+    def _embed_sync(self, texts):
+        try:
+            response = self._client.embeddings.create(model=self.model_name, input=texts)
+            return [d.embedding for d in response.data]
+        except (self._RateLimitError, self._APIStatusError) as e:
+            self._raise_if_rate_limited(e)
+
+    async def embed_documents_batch(self, texts):
+        if not texts:
+            return []
+
+        async def _attempt():
+            try:
+                response = await self._async_client.embeddings.create(model=self.model_name, input=texts)
+                return [d.embedding for d in response.data]
+            except (self._RateLimitError, self._APIStatusError) as e:
+                self._raise_if_rate_limited(e)
+
+        return await _retry_with_backoff_async(_attempt)
+
+
+# ==============================================================================
 # PUBLIC API
 # ==============================================================================
 _EMBEDDING_PROVIDERS = {
@@ -411,6 +463,7 @@ _EMBEDDING_PROVIDERS = {
     "openai":  OpenAIEmbeddingProvider,
     "mistral": MistralEmbeddingProvider,
     "local":   LocalEmbeddingProvider,
+    "vllm":    VLLMEmbeddingProvider,
 }
 
 _PROVIDER_INSTANCE = None  # set once in init_embedding()

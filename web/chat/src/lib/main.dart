@@ -1,0 +1,1916 @@
+import 'dart:convert';
+import 'dart:async'; // Aggiunto per il Timer del Progressive Delay
+import 'package:flutter/material.dart';
+import 'package:http/http.dart' as http;
+import 'package:flutter_html/flutter_html.dart'; // For rendering HTML
+import 'package:url_launcher/url_launcher.dart'; // For opening links
+import 'settings.dart'; // Import the settings file
+import 'app_translations.dart'; // Import the translations file
+import 'chat_auth.dart';
+import 'login_dialog.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter/semantics.dart';
+import 'package:tutorial_coach_mark/tutorial_coach_mark.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'dart:html' as html;
+
+void main() {
+  runApp(const SiteGate());
+}
+
+/// Chiede al backend quale sito corrisponde al dominio, poi avvia la chat.
+class SiteGate extends StatefulWidget {
+  const SiteGate({super.key});
+
+  @override
+  State<SiteGate> createState() => _SiteGateState();
+}
+
+class _SiteGateState extends State<SiteGate> {
+  late Future<bool> _site = AppSettings.load();
+
+  @override
+  Widget build(BuildContext context) {
+    return FutureBuilder<bool>(
+      future: _site,
+      builder: (context, snap) {
+        if (snap.connectionState != ConnectionState.done) {
+          return const MaterialApp(
+            debugShowCheckedModeBanner: false,
+            home: Scaffold(body: Center(child: CircularProgressIndicator())),
+          );
+        }
+        if (snap.data == true) return const AiChatApp();
+        final lang = _detectBrowserLanguage();
+        final notConfigured = snap.hasData;
+        return MaterialApp(
+          debugShowCheckedModeBanner: false,
+          home: Scaffold(
+            body: Center(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(AppTranslations.get(
+                      notConfigured ? 'site_not_configured' : 'site_unavailable', lang)),
+                  if (!notConfigured) ...[
+                    const SizedBox(height: 12),
+                    OutlinedButton(
+                      onPressed: () => setState(() => _site = AppSettings.load()),
+                      child: Text(AppTranslations.get('retry', lang)),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+// 1. Define our custom themes
+enum AppTheme { light, dark, highContrast }
+
+// 2. Create the Notifier (defaults to light)
+final ValueNotifier<AppTheme> themeNotifier = ValueNotifier(AppTheme.light);
+final ValueNotifier<AppLang> langNotifier = ValueNotifier(
+  _detectBrowserLanguage(),
+);
+
+/// Single source of truth for theme cycling.
+/// Referenced by both the keyboard shortcut and the AppBar icon button.
+void _cycleTheme() {
+  if (themeNotifier.value == AppTheme.light) {
+    themeNotifier.value = AppTheme.dark;
+  } else if (themeNotifier.value == AppTheme.dark) {
+    themeNotifier.value = AppTheme.highContrast;
+  } else {
+    themeNotifier.value = AppTheme.light;
+  }
+}
+
+// Status enum for feedback
+enum FeedbackStatus { none, like, dislike }
+
+class ToggleThemeIntent extends Intent {
+  const ToggleThemeIntent();
+}
+
+AppLang _detectBrowserLanguage() {
+  // Prende la stringa della lingua (es. "it-IT" o "en-US")
+  final String browserLang = html.window.navigator.language.toLowerCase();
+
+  if (browserLang.startsWith('it')) {
+    return AppLang.it;
+  }
+  // Default in inglese per tutti gli altri casi
+  return AppLang.en;
+}
+
+class AiChatApp extends StatelessWidget {
+  const AiChatApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return ValueListenableBuilder<AppTheme>(
+      valueListenable: themeNotifier,
+      builder: (_, AppTheme currentTheme, __) {
+        return ValueListenableBuilder<AppLang>(
+          valueListenable: langNotifier,
+          builder: (_, AppLang currentLang, __) {
+            final langCode = currentLang == AppLang.it ? 'it' : 'en';
+            // Aggiorna l'attributo <html lang="..."> del browser
+            html.document.documentElement?.lang = langCode;
+
+            // Define the 3 themes dynamically
+            ThemeData activeTheme;
+            switch (currentTheme) {
+              case AppTheme.light:
+                activeTheme = ThemeData(
+                  colorScheme: ColorScheme.fromSeed(
+                    seedColor: Colors.blue,
+                    brightness: Brightness.light,
+                  ),
+                  textSelectionTheme: TextSelectionThemeData(
+                    selectionColor: Colors.blue.withAlpha(70),
+                    selectionHandleColor: Colors.blue,
+                  ),
+                  useMaterial3: true,
+                );
+                break;
+              case AppTheme.dark:
+                activeTheme = ThemeData(
+                  colorScheme: ColorScheme.fromSeed(
+                    seedColor: Colors.blue,
+                    brightness: Brightness.dark,
+                  ),
+                  textSelectionTheme: TextSelectionThemeData(
+                    selectionColor: Colors.white.withAlpha(100),
+                    selectionHandleColor: Colors.white,
+                  ),
+                  useMaterial3: true,
+                );
+                break;
+              case AppTheme.highContrast:
+                // High contrast uses a pure black background, pure white text, and bright yellow accents
+                activeTheme = ThemeData(
+                  colorScheme: const ColorScheme.highContrastDark(
+                    primary: Colors.yellowAccent,
+                    onPrimary: Colors.black,
+                    secondary: Colors.cyanAccent,
+                    surface: Colors.black,
+                    onSurface: Colors.white,
+                    error: Colors.redAccent,
+                  ),
+                  textSelectionTheme: TextSelectionThemeData(
+                    selectionColor: Colors.yellowAccent.withAlpha(100),
+                    selectionHandleColor: Colors.yellowAccent,
+                  ),
+                  useMaterial3: true,
+                );
+                break;
+            }
+
+            return Shortcuts(
+              shortcuts: <ShortcutActivator, Intent>{
+                // Binds Alt + T (or Option + T on Mac) to our Intent
+                const SingleActivator(LogicalKeyboardKey.keyT, alt: true):
+                    const ToggleThemeIntent(),
+              },
+              child: Actions(
+                actions: <Type, Action<Intent>>{
+                  ToggleThemeIntent: CallbackAction<ToggleThemeIntent>(
+                    onInvoke: (ToggleThemeIntent intent) {
+                      _cycleTheme();
+                      return null;
+                    },
+                  ),
+                },
+                child: MaterialApp(
+                  title: AppSettings.projectName, // Uses your external settings
+                  debugShowCheckedModeBanner: false,
+                  theme: activeTheme, // Applies the selected theme
+                  home: const ChatScreen(),
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+}
+
+// Data model for a chat message
+class ChatMessage {
+  final String text;
+  final bool isUser;
+  final String? topic;
+  final List<Map<String, dynamic>> sources;
+  final bool isError;
+  final bool isSystemMessage; // Exclude from history sent to LLM
+  final String role; // 'user' or 'model'
+
+  // Store feedback state
+  FeedbackStatus feedback;
+  bool isSourcesExpanded;
+
+  ChatMessage({
+    required this.text,
+    this.isUser = false,
+    this.topic,
+    this.sources = const [],
+    this.isError = false,
+    this.isSystemMessage = false,
+    this.isSourcesExpanded = false,
+    this.feedback = FeedbackStatus.none,
+  }) : role = isUser ? 'user' : 'model';
+}
+
+class ChatScreen extends StatefulWidget {
+  const ChatScreen({super.key});
+
+  @override
+  State<ChatScreen> createState() => _ChatScreenState();
+}
+
+Widget _buildTutorialText(String title, String desc) {
+  return Column(
+    mainAxisSize: MainAxisSize.min,
+    crossAxisAlignment: CrossAxisAlignment.start,
+    children: [
+      Text(
+        title,
+        style: const TextStyle(
+          fontWeight: FontWeight.bold,
+          color: Colors.white,
+          fontSize: 20,
+        ),
+      ),
+      Padding(
+        padding: const EdgeInsets.only(top: 10.0),
+        child: Text(desc, style: const TextStyle(color: Colors.white)),
+      ),
+    ],
+  );
+}
+
+class _ChatScreenState extends State<ChatScreen> {
+  final TextEditingController _textController = TextEditingController();
+  final ScrollController _scrollController = ScrollController();
+  final List<ChatMessage> _messages = [];
+  bool _isLoading = false;
+  bool _isMaintenanceMode = false;
+  final FocusNode _textFocusNode = FocusNode();
+
+  final GlobalKey _filterKey = GlobalKey();
+  final GlobalKey _langKey = GlobalKey();
+  final GlobalKey _themeKey = GlobalKey();
+  final GlobalKey _deleteKey = GlobalKey();
+  final GlobalKey _sendKey = GlobalKey();
+
+  TutorialCoachMark? _tutorialCoachMark;
+  List<TargetFocus> _targets = [];
+
+  Map<String, String> _subTopicDescriptions = {};
+  Map<String, String> _subTopicLongDescriptions = {};
+  Map<String, Map<String, dynamic>> _subTopicStats = {};
+  List<String> _availableSubTopicIds = [];
+  Set<String> _selectedSubTopics = {};
+  bool _allowSubtopicSelection = false;
+  DateTime? _dateFrom;
+  DateTime? _dateTo;
+  bool _includeUndatedDocs = true;
+  // Ricerca approfondita: il server analizza più fonti per ogni domanda
+  // (RERANK_MAX_SIZE invece di RERANK_SIZE).
+  bool _deepSearch = false;
+
+  /// Filtri diversi dalla situazione iniziale (tutte le serie, nessun
+  /// periodo, ricerca normale), per il pallino sul pulsante "Filtri".
+  List<String> get _activeFilters => [
+        if (_deepSearch) AppTranslations.get('filter_kind_deep', langNotifier.value),
+        if (_allowSubtopicSelection &&
+            _availableSubTopicIds.isNotEmpty &&
+            !_selectedSubTopics.containsAll(_availableSubTopicIds))
+          AppTranslations.get('filter_kind_series', langNotifier.value),
+        if (_dateFrom != null || _dateTo != null)
+          AppTranslations.get('filter_kind_period', langNotifier.value),
+      ];
+
+  // --- STATO PER PROGRESSIVE DELAY ---
+  Timer? _longWaitTimer;
+  Timer? _veryLongWaitTimer; // Terzo messaggio di attesa, per code ancora più lunghe
+  String? _dynamicLoadingMessage;
+
+  @override
+  void initState() {
+    super.initState();
+    _addWelcomeMessage();
+    _fetchConfig();
+    // Accesso facoltativo: serve solo per i documenti degli archivi riservati.
+    ChatAuth.instance.restore();
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _checkFirstRun();
+    });
+  }
+
+  Future<void> _checkFirstRun() async {
+    final prefs = await SharedPreferences.getInstance();
+    bool isFirstRun = prefs.getBool('tutorial_seen') ?? false;
+
+    if (!isFirstRun) {
+      await Future.delayed(const Duration(milliseconds: 500));
+      _showTutorial();
+      await prefs.setBool('tutorial_seen', true);
+    } else {
+      debugPrint("Tutorial già visto, non mostro di nuovo.");
+    }
+  }
+
+  void _initTutorialTargets() {
+    _targets.clear();
+
+    // 1. Filtro Serie
+    _targets.add(
+      TargetFocus(
+        identify: "FilterTarget",
+        keyTarget: _filterKey,
+        alignSkip: Alignment.topRight,
+        contents: [
+          TargetContent(
+            align: ContentAlign.bottom,
+            builder: (context, controller) => _buildTutorialText(
+              AppTranslations.get('filter_subtopics', langNotifier.value),
+              AppTranslations.get('filter_subtopics_desc', langNotifier.value),
+            ),
+          ),
+        ],
+      ),
+    );
+
+    // 2. Cambio Lingua
+    _targets.add(
+      TargetFocus(
+        identify: "LangTarget",
+        keyTarget: _langKey,
+        contents: [
+          TargetContent(
+            align: ContentAlign.bottom,
+            builder: (context, controller) => _buildTutorialText(
+              AppTranslations.get('change_language', langNotifier.value),
+              AppTranslations.get('change_language_desc', langNotifier.value),
+            ),
+          ),
+        ],
+      ),
+    );
+
+    // 3. Tema
+    _targets.add(
+      TargetFocus(
+        identify: "ThemeTarget",
+        keyTarget: _themeKey,
+        contents: [
+          TargetContent(
+            align: ContentAlign.bottom,
+            builder: (context, controller) => _buildTutorialText(
+              AppTranslations.get('change_theme', langNotifier.value),
+              AppTranslations.get('change_theme_desc', langNotifier.value),
+            ),
+          ),
+        ],
+      ),
+    );
+
+    _targets.add(
+      TargetFocus(
+        identify: "DeleteTarget",
+        keyTarget: _deleteKey,
+        contents: [
+          TargetContent(
+            align: ContentAlign.bottom,
+            builder: (context, controller) => _buildTutorialText(
+              AppTranslations.get('delete_chat', langNotifier.value),
+              AppTranslations.get('delete_chat_desc', langNotifier.value),
+            ),
+          ),
+        ],
+      ),
+    );
+
+    _targets.add(
+      TargetFocus(
+        identify: "SendTarget",
+        keyTarget: _sendKey,
+        contents: [
+          TargetContent(
+            align: ContentAlign.bottom,
+            builder: (context, controller) => _buildTutorialText(
+              AppTranslations.get('send_question', langNotifier.value),
+              AppTranslations.get('send_question_desc', langNotifier.value),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showTutorial() {
+    _initTutorialTargets();
+    _tutorialCoachMark = TutorialCoachMark(
+      targets: _targets,
+      colorShadow: Colors.black,
+      opacityShadow: 0.85,
+      paddingFocus: 10,
+      textSkip: AppTranslations.get('skip', langNotifier.value).toUpperCase(),
+      onClickTarget: (target) =>
+          debugPrint("Target cliccato: ${target.identify}"),
+    )..show(context: context);
+  }
+
+  Future<void> _fetchConfig() async {
+    try {
+      final response = await http.post(
+        Uri.parse("${AppSettings.apiUrl}/config"),
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: jsonEncode({"topic_id": AppSettings.getTopicId}),
+      );
+
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body);
+        final List rawSubTopics = data['sub_topics'];
+
+        setState(() {
+          _allowSubtopicSelection = data['allow_subtopic_selection'] ?? false;
+          _availableSubTopicIds = rawSubTopics
+              .map((item) => item['id'].toString())
+              .toList();
+          _subTopicDescriptions = {
+            for (var item in rawSubTopics)
+              item['id'].toString(): item['desc'].toString(),
+          };
+          _subTopicLongDescriptions = {
+            for (var item in rawSubTopics)
+              item['id'].toString(): (item['desc_long'] ?? '').toString(),
+          };
+          _subTopicStats = {
+            for (var item in rawSubTopics)
+              item['id'].toString(): {
+                "doc_count": item['doc_count'] ?? 0,
+                "since_year": item['since_year'],
+              },
+          };
+
+          _selectedSubTopics = _availableSubTopicIds.toSet();
+          _isMaintenanceMode = false;
+        });
+      } else {
+        setState(() {
+          _isMaintenanceMode = true;
+        });
+      }
+    } catch (e) {
+      debugPrint("Errore critico configurazione: $e");
+      setState(() {
+        _isMaintenanceMode = true;
+      });
+    }
+  }
+
+  /// Adds the initial system welcome message
+  void _addWelcomeMessage() {
+    _messages.insert(
+      0,
+      ChatMessage(
+        text: AppTranslations.get('welcome_msg', langNotifier.value),
+        isSystemMessage: true,
+      ),
+    );
+  }
+
+  Future<void> _promptFeedbackComment(ChatMessage message, bool isLike) async {
+    if (message.isUser || message.isError || message.isSystemMessage) return;
+
+    setState(() {
+      message.feedback = isLike ? FeedbackStatus.like : FeedbackStatus.dislike;
+    });
+
+    final TextEditingController commentController = TextEditingController();
+
+    await showDialog(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: Text(
+            isLike
+                ? AppTranslations.get('like_msg', langNotifier.value)
+                : AppTranslations.get('dislike_msg', langNotifier.value),
+          ),
+          content: TextField(
+            controller: commentController,
+            maxLines: 3,
+            decoration: InputDecoration(
+              hintText: AppTranslations.get('comment_hint', langNotifier.value),
+              border: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(8.0),
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: Text(AppTranslations.get('skip', langNotifier.value)),
+            ),
+            ElevatedButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: Text(AppTranslations.get('submit', langNotifier.value)),
+            ),
+          ],
+        );
+      },
+    );
+
+    await _sendFeedback(message, isLike, commentController.text.trim());
+  }
+
+  Widget _buildMaintenancePage() {
+    final theme = Theme.of(context);
+    return Scaffold(
+      body: Center(
+        child: Padding(
+          padding: const EdgeInsets.all(32.0),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(
+                Icons.construction,
+                size: 80,
+                color: theme.colorScheme.primary,
+              ),
+              const SizedBox(height: 24),
+              Text(
+                AppTranslations.get('maintenance_mode', langNotifier.value),
+                style: theme.textTheme.headlineMedium!.copyWith(
+                  fontWeight: FontWeight.bold,
+                ),
+                textAlign: TextAlign.center,
+              ),
+              const SizedBox(height: 16),
+              Text(
+                AppTranslations.get('maintenance_msg', langNotifier.value),
+                style: theme.textTheme.bodyLarge,
+                textAlign: TextAlign.center,
+              ),
+              const SizedBox(height: 32),
+              ElevatedButton.icon(
+                onPressed: () {
+                  setState(() => _isMaintenanceMode = false);
+                  _fetchConfig(); // Riprova la configurazione
+                },
+                icon: const Icon(Icons.refresh),
+                label: Text(
+                  AppTranslations.get('retry_connection', langNotifier.value),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// Una riga per serie con documenti: "<desc>: <count> documenti, a partire dal <year>".
+  List<String> _subtopicStatLines() {
+    final lang = langNotifier.value;
+    return [
+      for (final id in _availableSubTopicIds)
+        if ((_subTopicStats[id]?['doc_count'] ?? 0) > 0)
+          AppTranslations.get(
+                  _subTopicStats[id]!['since_year'] != null ? 'subtopic_stat_with_year' : 'subtopic_stat_no_year', lang)
+              .replaceAll('{desc}', _subTopicDescriptions[id] ?? id)
+              .replaceAll('{count}', _subTopicStats[id]!['doc_count'].toString())
+              .replaceAll('{year}', _subTopicStats[id]!['since_year'].toString()),
+    ];
+  }
+
+  /// Home del sito, dall'alto: testo descrittivo, statistiche, pulsanti, limiti del sistema.
+  Widget _buildProjectInfoHeader() {
+    final theme = Theme.of(context);
+    final lang = langNotifier.value;
+    final description = AppSettings.welcomeHtml[lang.name] ??
+        AppSettings.welcomeHtml['it'] ??
+        '<h1>${const HtmlEscape().convert(AppSettings.projectName)}</h1>';
+    final stats = _subtopicStatLines();
+
+    return Container(
+      margin: const EdgeInsets.only(bottom: 24.0, top: 16.0),
+      padding: const EdgeInsets.fromLTRB(24, 8, 24, 24),
+      decoration: BoxDecoration(
+        color: theme.colorScheme.surfaceContainerHighest.withAlpha(128),
+        borderRadius: BorderRadius.circular(16.0),
+        border: Border.all(color: theme.colorScheme.outlineVariant, width: 1),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Html(
+            data: description,
+            extensions: [
+              TagExtension(
+                tagsToExtend: {"a"},
+                builder: (extensionContext) {
+                  final url = extensionContext.attributes['href'];
+                  return Semantics(
+                    link: true,
+                    child: InkWell(
+                      onTap: () {
+                        if (url != null) _launchUrl(url);
+                      },
+                      child: Text(
+                        extensionContext.element?.text ?? 'Link',
+                        style: TextStyle(
+                          color: theme.colorScheme.primary,
+                          decoration: TextDecoration.underline,
+                        ),
+                      ),
+                    ),
+                  );
+                },
+              ),
+            ],
+            style: {
+              "body": Style(
+                margin: Margins.zero,
+                backgroundColor: Colors.transparent,
+                color: theme.colorScheme.onSurface,
+                fontFamily: 'sans-serif',
+                textAlign: TextAlign.center,
+              ),
+              "h1": Style(
+                fontSize: FontSize(22.0),
+                fontWeight: FontWeight.bold,
+                color: theme.colorScheme.primary,
+                margin: Margins.only(bottom: 4.0),
+              ),
+              "p": Style(
+                fontSize: FontSize(16.0),
+                color: theme.colorScheme.onSurfaceVariant,
+                margin: Margins.only(bottom: 12.0),
+              ),
+            },
+          ),
+          if (stats.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            Text(
+              AppTranslations.get('home_stats_title', lang),
+              textAlign: TextAlign.center,
+              style: theme.textTheme.titleSmall!.copyWith(fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 4),
+            for (final line in stats)
+              Text(line, textAlign: TextAlign.center, style: theme.textTheme.bodyMedium),
+          ],
+          if (AppSettings.buttons.isNotEmpty) ...[
+            const SizedBox(height: 16),
+            Wrap(
+              alignment: WrapAlignment.center,
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                for (final button in AppSettings.buttons)
+                  OutlinedButton(
+                    style: OutlinedButton.styleFrom(
+                      side: BorderSide(color: theme.colorScheme.primary, width: 1.5),
+                      foregroundColor: theme.colorScheme.primary,
+                      padding: const EdgeInsets.symmetric(horizontal: 20.0, vertical: 12.0),
+                    ),
+                    onPressed: () => _launchUrl(button['url'] as String),
+                    child: Text(
+                      (lang == AppLang.en ? button['label_en'] as String? : null) ?? button['label_it'] as String,
+                      style: const TextStyle(fontWeight: FontWeight.bold),
+                    ),
+                  ),
+              ],
+            ),
+          ],
+          const SizedBox(height: 20),
+          Container(
+            padding: const EdgeInsets.all(16),
+            decoration: BoxDecoration(
+              color: theme.colorScheme.secondaryContainer,
+              border: Border(left: BorderSide(color: theme.colorScheme.secondary, width: 4)),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  AppTranslations.get('home_limits_title', lang),
+                  style: theme.textTheme.titleSmall!.copyWith(
+                    color: theme.colorScheme.onSecondaryContainer,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  AppTranslations.get('home_limits_text', lang),
+                  style: theme.textTheme.bodyMedium!.copyWith(color: theme.colorScheme.onSecondaryContainer),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  @override
+  void dispose() {
+    _textController.dispose();
+    _scrollController.dispose();
+    _textFocusNode.dispose();
+    _longWaitTimer?.cancel(); // Prevenzione Memory Leak
+    _veryLongWaitTimer?.cancel(); // Prevenzione Memory Leak
+    super.dispose();
+  }
+
+  // ===========================================================================
+  // CORE API LOGIC
+  // ===========================================================================
+
+  /// Polls the status endpoint until the task is completed or failed
+  Future<Map<String, dynamic>> _pollForResponse(String taskId) async {
+    final String statusUrl = "${AppSettings.apiUrl}/status/$taskId";
+
+    final DateTime startTime = DateTime.now();
+    const int timeoutSeconds = 180;
+
+    int consecutiveErrors = 0;
+    const int maxErrors = 3;
+
+    while (true) {
+      if (DateTime.now().difference(startTime).inSeconds > timeoutSeconds) {
+        throw Exception(AppTranslations.get('timeout', langNotifier.value));
+      }
+
+      try {
+        final response = await http.get(
+          Uri.parse(statusUrl),
+          );
+
+        // FIX: Accettiamo 200 e 202. La UI non va in crash durante l'elaborazione.
+        if (response.statusCode == 200 || response.statusCode == 202) {
+          consecutiveErrors =
+              0; // Azzera gli errori solo su reale successo di rete
+
+          final data = jsonDecode(utf8.decode(response.bodyBytes));
+          final String status = data['status'];
+
+          if (status == 'completed' || status == 'success') {
+            return data['data'] ?? data;
+          } else if (status == 'failed') {
+            return {
+              'status': 'failed',
+              'error': data['error'] ?? "Worker error",
+            };
+          }
+        } else {
+          // Errori severi 500, 502, etc.
+          consecutiveErrors++;
+        }
+      } catch (e) {
+        consecutiveErrors++;
+      }
+
+      if (consecutiveErrors >= maxErrors) {
+        throw Exception(
+          AppTranslations.get('connection_lost', langNotifier.value),
+        );
+      }
+
+      await Future.delayed(const Duration(seconds: 2));
+    }
+  }
+
+  /// Sends the user's query and chat history to the Flask backend
+  Future<void> _handleSendPressed() async {
+    final text = _textController.text;
+    if (text.isEmpty) return;
+
+    final userMessage = ChatMessage(text: text, isUser: true);
+    _addMessage(userMessage);
+    _textController.clear();
+
+    setState(() {
+      _isLoading = true;
+      _dynamicLoadingMessage = null; // Reset per la nuova chiamata
+    });
+
+    // --- PROGRESSIVE DELAY MESSAGING ---
+    _longWaitTimer?.cancel();
+    _veryLongWaitTimer?.cancel();
+
+    _longWaitTimer = Timer(const Duration(seconds: 20), () {
+      if (mounted && _isLoading) {
+        setState(() {
+          // Assicurati che 'taking_longer' sia tradotto nel tuo file app_translations
+          _dynamicLoadingMessage = AppTranslations.get(
+            'taking_longer',
+            langNotifier.value,
+          );
+        });
+      }
+    });
+
+    // Terzo messaggio: scatta solo se, dopo il secondo, si è ancora in attesa.
+    // Assicurati di aggiungere la chiave 'taking_much_longer' in app_translations.dart
+    // (sia per 'it' che per 'en'), es:
+    // it: "Ci vuole più del previsto, sto ancora analizzando i documenti..."
+    // en: "This is taking a while, still analyzing the documents..."
+    _veryLongWaitTimer = Timer(const Duration(seconds: 35), () {
+      if (mounted && _isLoading) {
+        setState(() {
+          _dynamicLoadingMessage = AppTranslations.get(
+            'taking_much_longer',
+            langNotifier.value,
+          );
+        });
+      }
+    });
+
+    final chatHistory = _messages
+        .where((msg) => !msg.isError && !msg.isSystemMessage)
+        .toList()
+        .reversed
+        .map((msg) => {'role': msg.role, 'text': msg.text})
+        .toList();
+
+    final List<Map<String, dynamic>> chatHistoryForApi = chatHistory.length > 1
+        ? chatHistory.sublist(0, chatHistory.length - 1)
+        : [];
+
+    final lastQuery = text;
+
+    try {
+      final String chatUrl = "${AppSettings.apiUrl}/chat";
+
+      final response = await http
+          .post(
+            Uri.parse(chatUrl),
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: jsonEncode({
+              "history": chatHistoryForApi,
+              "query": lastQuery,
+              "sub_topics": _selectedSubTopics.toList(),
+              "topic_id": AppSettings.getTopicId,
+              if (_dateFrom != null) "date_from": _formatDate(_dateFrom!),
+              if (_dateTo != null) "date_to": _formatDate(_dateTo!),
+              if (_dateFrom != null || _dateTo != null)
+                "include_undated": _includeUndatedDocs,
+              "deep_search": _deepSearch,
+            }),
+          )
+          .timeout(const Duration(seconds: 10));
+
+      if (response.statusCode == 202) {
+        final data = jsonDecode(utf8.decode(response.bodyBytes));
+        final String taskId = data['task_id'];
+
+        final resultData = await _pollForResponse(taskId);
+
+        if (resultData['status'] == 'failed' ||
+            resultData['status'] == 'not_found') {
+          _addMessage(
+            ChatMessage(
+              text:
+                  "<p><strong>${AppTranslations.get('error', langNotifier.value)}:</strong> ${resultData['error'] ?? resultData['message']}</p>",
+              isError: true,
+              isSystemMessage: true,
+            ),
+          );
+        } else {
+          _addMessage(
+            ChatMessage(
+              text: resultData['answer'],
+              topic: resultData['topic'],
+              sources: (resultData['sources'] as List)
+                  .map((s) => s as Map<String, dynamic>)
+                  .toList(),
+            ),
+          );
+        }
+      } else {
+        final data = jsonDecode(utf8.decode(response.bodyBytes));
+        _addMessage(
+          ChatMessage(
+            text:
+                "<p>${AppTranslations.get('error', langNotifier.value)} (${response.statusCode}): ${data['message'] ?? AppTranslations.get('unknown_error', langNotifier.value)}</p>",
+            isError: true,
+            isSystemMessage: true,
+          ),
+        );
+      }
+    } catch (e) {
+      _addMessage(
+        ChatMessage(
+          text:
+              "<p>${AppTranslations.get('connection_lost', langNotifier.value)}</p>",
+          isError: true,
+          isSystemMessage: true,
+        ),
+      );
+    } finally {
+      // Spegne SEMPRE i timer, a prescindere dal successo o dal fallimento
+      _longWaitTimer?.cancel();
+      _veryLongWaitTimer?.cancel();
+
+      if (mounted) {
+        setState(() {
+          _isLoading = false;
+        });
+        _textFocusNode.requestFocus();
+      }
+    }
+  }
+
+  // --- Feedback Logic ---
+  Future<void> _sendFeedback(
+    ChatMessage message,
+    bool isLike,
+    String comment,
+  ) async {
+    if (message.isUser || message.isError || message.isSystemMessage) return;
+
+    int msgIndex = _messages.indexOf(message);
+    String userQuery = "";
+
+    if (msgIndex != -1 && msgIndex + 1 < _messages.length) {
+      userQuery = _messages[msgIndex + 1].text;
+    }
+
+    List<Map<String, dynamic>> contextHistory = [];
+    if (msgIndex + 2 < _messages.length) {
+      contextHistory = _messages
+          .sublist(msgIndex + 2)
+          .where((m) => !m.isError && !m.isSystemMessage)
+          .toList()
+          .reversed
+          .map((m) => {'role': m.role, 'text': m.text})
+          .toList();
+    }
+
+    setState(() {
+      message.feedback = isLike ? FeedbackStatus.like : FeedbackStatus.dislike;
+    });
+
+    try {
+      final String apiUrl = "${AppSettings.apiUrl}/feedback";
+      final feedbackResponse = await http.post(
+        Uri.parse(apiUrl),
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: jsonEncode({
+          "query": userQuery,
+          "answer": message.text,
+          "topic_id": message.topic,
+          "rating": isLike ? 1 : -1,
+          "history": contextHistory,
+          "comment": comment,
+        }),
+      );
+
+      if (feedbackResponse.statusCode < 200 ||
+          feedbackResponse.statusCode >= 300) {
+        throw Exception("Server returned ${feedbackResponse.statusCode}");
+      }
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              AppTranslations.get('feedback_received', langNotifier.value),
+            ),
+            duration: const Duration(seconds: 4),
+          ),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              AppTranslations.get('feedback_error', langNotifier.value),
+            ),
+            duration: const Duration(seconds: 4),
+          ),
+        );
+      }
+    }
+  }
+
+  /// Adds a new message to the list and scrolls to the bottom
+  void _addMessage(ChatMessage message) {
+    setState(() {
+      _messages.insert(0, message);
+    });
+    if (_scrollController.hasClients) {
+      _scrollController.animateTo(
+        0.0,
+        duration: const Duration(milliseconds: 300),
+        curve: Curves.easeOut,
+      );
+    }
+  }
+
+  /// Apre un documento citato tra le fonti. Prima controlla se è
+  /// consultabile: se l'archivio è riservato e non si è autenticati propone
+  /// l'accesso e poi il pulsante per aprirlo.
+  Future<void> _openDocument(String url, String fileName) async {
+    final lang = langNotifier.value;
+    String msg(String key) =>
+        AppTranslations.get(key, lang).replaceAll('{file}', fileName);
+
+    // La scheda si apre subito, durante il clic: i browser (Safari in
+    // particolare) bloccano le schede aperte dopo un'attesa, come quella
+    // del controllo sul documento. Se il documento non è consultabile la
+    // scheda si richiude.
+    html.WindowBase? tab;
+    try {
+      tab = html.window.open('', '_blank');
+    } catch (_) {}
+
+    final access = await ChatAuth.instance.checkDocument(url);
+    if (access == DocumentAccess.allowed || access == DocumentAccess.unknown) {
+      // unknown: controllo non riuscito, decide il server (che mostra la
+      // sua pagina se il documento è riservato).
+      if (tab != null) {
+        tab.location.href = url;
+      } else {
+        await _launchUrl(url);
+      }
+      return;
+    }
+    tab?.close();
+
+    if (access == DocumentAccess.loginRequired) {
+      if (!mounted) return;
+      final ok = await showLoginDialog(context, lang,
+          reason: msg('document_restricted'));
+      if (!ok || !mounted) return;
+      final after = await ChatAuth.instance.checkDocument(url);
+      if (!mounted) return;
+      if (after == DocumentAccess.allowed || after == DocumentAccess.unknown) {
+        _offerDocument(url, fileName);
+        return;
+      }
+      _addMessage(ChatMessage(
+          text: msg(after == DocumentAccess.notFound
+              ? 'document_not_found'
+              : 'document_forbidden'),
+          isError: true,
+          isSystemMessage: true));
+      return;
+    }
+    _addMessage(ChatMessage(
+        text: msg(access == DocumentAccess.notFound
+            ? 'document_not_found'
+            : 'document_forbidden'),
+        isError: true,
+        isSystemMessage: true));
+  }
+
+  /// Dopo l'accesso il documento si apre con un nuovo clic: un'apertura
+  /// automatica, arrivando dopo l'attesa del login, verrebbe bloccata.
+  void _offerDocument(String url, String fileName) {
+    final lang = langNotifier.value;
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(AppTranslations.get('login_done', lang)),
+        content: Text(AppTranslations.get('document_ready', lang)
+            .replaceAll('{file}', fileName)),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: Text(AppTranslations.get('cancel', lang)),
+          ),
+          FilledButton.icon(
+            onPressed: () {
+              html.window.open(url, '_blank');
+              Navigator.pop(ctx);
+            },
+            icon: const Icon(Icons.open_in_new),
+            label: Text(AppTranslations.get('open_document', lang)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Pulsante di accesso nella barra: "Accedi" oppure il menu dell'utente.
+  Widget _accountButton() {
+    return ValueListenableBuilder<ChatUser?>(
+      valueListenable: ChatAuth.instance.user,
+      builder: (context, user, _) {
+        final lang = langNotifier.value;
+        if (user == null) {
+          return IconButton(
+            icon: const Icon(Icons.login),
+            tooltip: AppTranslations.get('login_tooltip', lang),
+            onPressed: () => showLoginDialog(context, lang),
+          );
+        }
+        final theme = Theme.of(context);
+        return PopupMenuButton<String>(
+          tooltip:
+              '${AppTranslations.get('logged_in_as', lang)} ${user.displayName}',
+          position: PopupMenuPosition.under,
+          icon: CircleAvatar(
+            radius: 14,
+            backgroundColor: theme.colorScheme.primaryContainer,
+            child: Text(
+              user.displayName.isEmpty
+                  ? '?'
+                  : user.displayName[0].toUpperCase(),
+              style: TextStyle(
+                  fontSize: 13, color: theme.colorScheme.onPrimaryContainer),
+            ),
+          ),
+          itemBuilder: (_) => [
+            PopupMenuItem<String>(
+              enabled: false,
+              child: Text(
+                  '${AppTranslations.get('logged_in_as', lang)} ${user.displayName}'),
+            ),
+            const PopupMenuDivider(),
+            PopupMenuItem<String>(
+              value: 'logout',
+              child: ListTile(
+                contentPadding: EdgeInsets.zero,
+                leading: const Icon(Icons.logout),
+                title: Text(AppTranslations.get('logout', lang)),
+              ),
+            ),
+          ],
+          onSelected: (_) async {
+            await ChatAuth.instance.logout();
+            if (!mounted) return;
+            ScaffoldMessenger.of(this.context).showSnackBar(SnackBar(
+                content: Text(AppTranslations.get('logged_out', lang))));
+          },
+        );
+      },
+    );
+  }
+
+  /// --- Opens Nginx Document URLs ---
+  Future<void> _launchUrl(String urlString) async {
+    final Uri url = Uri.parse(urlString);
+    if (!await launchUrl(url, mode: LaunchMode.externalApplication)) {
+      _addMessage(
+        ChatMessage(
+          text:
+              "${AppTranslations.get('document_error', langNotifier.value)} ($urlString)",
+          isError: true,
+          isSystemMessage: true,
+        ),
+      );
+    }
+  }
+
+  // --- Clears the chat history ---
+  void _clearChat() {
+    setState(() {
+      _messages.clear();
+      _addWelcomeMessage();
+    });
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(AppTranslations.get('chat_cleared', langNotifier.value)),
+        duration: const Duration(seconds: 3),
+      ),
+    );
+  }
+
+  String _formatDate(DateTime d) {
+    // "YYYY-MM-DD" — deve combaciare col formato atteso dal backend
+    final mm = d.month.toString().padLeft(2, '0');
+    final dd = d.day.toString().padLeft(2, '0');
+    return "${d.year}-$mm-$dd";
+  }
+
+  void _showSubTopicSelector() {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      builder: (context) {
+        return StatefulBuilder(
+          builder: (context, setModalState) {
+            return Container(
+              padding: const EdgeInsets.all(16.0),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    AppTranslations.get('filter_subtopics', langNotifier.value),
+                    style: Theme.of(context).textTheme.titleLarge,
+                  ),
+                  CheckboxListTile(
+                    value: _deepSearch,
+                    contentPadding: EdgeInsets.zero,
+                    controlAffinity: ListTileControlAffinity.leading,
+                    title: Text(
+                      AppTranslations.get('deep_search', langNotifier.value),
+                    ),
+                    subtitle: Text(
+                      AppTranslations.get('deep_search_desc', langNotifier.value),
+                    ),
+                    onChanged: (value) {
+                      setState(() => _deepSearch = value ?? false);
+                      setModalState(() {});
+                    },
+                  ),
+                  if ((_allowSubtopicSelection && _availableSubTopicIds.isNotEmpty) ||
+                      AppSettings.allowDateFilter)
+                    const Divider(),
+                  if (_allowSubtopicSelection && _availableSubTopicIds.isNotEmpty) ...[
+                    Text(
+                      AppTranslations.get('subtopics_title', langNotifier.value),
+                      style: Theme.of(context).textTheme.titleLarge,
+                    ),
+                    const Divider(),
+                    ConstrainedBox(
+                      constraints: const BoxConstraints(maxHeight: 300),
+                      child: ListView(
+                        shrinkWrap: true,
+                        children: _availableSubTopicIds.map((id) {
+                          final longDesc = _subTopicLongDescriptions[id];
+                          return CheckboxListTile(
+                            title: Text(_subTopicDescriptions[id] ?? id),
+                            subtitle: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                if (longDesc != null && longDesc.trim().isNotEmpty) ...[
+                                  Text(
+                                    longDesc,
+                                    style: const TextStyle(fontSize: 11),
+                                  ),
+                                  const SizedBox(height: 2),
+                                ],
+                                Text(
+                                  id,
+                                  style: const TextStyle(fontSize: 10),
+                                ),
+                              ],
+                            ),
+                            value: _selectedSubTopics.contains(id),
+                            onChanged: (bool? value) {
+                              setState(() {
+                                if (value == true) {
+                                  _selectedSubTopics.add(id);
+                                } else {
+                                  _selectedSubTopics.remove(id);
+                                }
+                              });
+                              setModalState(() {});
+                            },
+                          );
+                        }).toList(),
+                      ),
+                    ),
+                    const Divider(),
+                  ],
+
+                  // --- Filtro range temporale (opzionale) ---
+                  if (AppSettings.allowDateFilter) ...[
+                    Text(
+                      AppTranslations.get('date_filter_title', langNotifier.value),
+                      style: Theme.of(context).textTheme.titleMedium,
+                    ),
+                    const SizedBox(height: 8.0),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: OutlinedButton(
+                            onPressed: () async {
+                              final picked = await showDatePicker(
+                                context: context,
+                                initialDate: _dateFrom ?? DateTime.now(),
+                                firstDate: DateTime(2000),
+                                lastDate: DateTime.now(),
+                              );
+                              if (picked != null) {
+                                setState(() => _dateFrom = picked);
+                                setModalState(() {});
+                              }
+                            },
+                            child: Text(
+                              _dateFrom == null
+                                  ? AppTranslations.get('date_from', langNotifier.value)
+                                  : _formatDate(_dateFrom!),
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 8.0),
+                        Expanded(
+                          child: OutlinedButton(
+                            onPressed: () async {
+                              final picked = await showDatePicker(
+                                context: context,
+                                initialDate: _dateTo ?? DateTime.now(),
+                                firstDate: DateTime(2000),
+                                lastDate: DateTime.now(),
+                              );
+                              if (picked != null) {
+                                setState(() => _dateTo = picked);
+                                setModalState(() {});
+                              }
+                            },
+                            child: Text(
+                              _dateTo == null
+                                  ? AppTranslations.get('date_to', langNotifier.value)
+                                  : _formatDate(_dateTo!),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                    if (_dateFrom != null || _dateTo != null) ...[
+                      CheckboxListTile(
+                        contentPadding: EdgeInsets.zero,
+                        controlAffinity: ListTileControlAffinity.leading,
+                        dense: true,
+                        title: Text(
+                          AppTranslations.get('include_undated_docs', langNotifier.value),
+                          style: Theme.of(context).textTheme.bodyMedium,
+                        ),
+                        value: _includeUndatedDocs,
+                        onChanged: (bool? value) {
+                          setState(() {
+                            _includeUndatedDocs = value ?? true;
+                          });
+                          setModalState(() {});
+                        },
+                      ),
+                      TextButton.icon(
+                        onPressed: () {
+                          setState(() {
+                            _dateFrom = null;
+                            _dateTo = null;
+                            _includeUndatedDocs = true;
+                          });
+                          setModalState(() {});
+                        },
+                        icon: const Icon(Icons.clear, size: 18),
+                        label: Text(
+                          AppTranslations.get('clear_date_filter', langNotifier.value),
+                        ),
+                      ),
+                    ],
+                  ],
+                ],
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
+  // ===========================================================================
+  // UI BUILDING
+  // ===========================================================================
+
+  @override
+  Widget build(BuildContext context) {
+    if (_isMaintenanceMode) {
+      return _buildMaintenancePage();
+    }
+
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(AppSettings.projectName),
+        actions: [
+          // Sempre visibile: la ricerca approfondita è disponibile ovunque,
+          // serie e date solo dove configurate. Il pallino segnala che c'è
+          // almeno un filtro impostato; il suggerimento dice quali.
+          IconButton(
+            key: _filterKey,
+            icon: Badge(
+              isLabelVisible: _activeFilters.isNotEmpty,
+              smallSize: 8,
+              child: const Icon(Icons.filter_list),
+            ),
+            onPressed: _showSubTopicSelector,
+            tooltip: _activeFilters.isEmpty
+                ? AppTranslations.get('filter_subtopics', langNotifier.value)
+                : AppTranslations.get('filters_active', langNotifier.value)
+                    .replaceAll('{list}', _activeFilters.join(', ')),
+          ),
+          ValueListenableBuilder<AppLang>(
+            valueListenable: langNotifier,
+            builder: (_, AppLang currentLang, __) {
+              return Tooltip(
+                message: AppTranslations.get('language_switch', currentLang),
+                child: TextButton(
+                  key: _langKey,
+                  onPressed: () {
+                    langNotifier.value = currentLang == AppLang.it
+                        ? AppLang.en
+                        : AppLang.it;
+                    _clearChat();
+                  },
+                  // Il lettore di schermo leggerebbe "bandiera Italia IT".
+                  child: Semantics(
+                    label: AppTranslations.get('language_label', currentLang),
+                    child: ExcludeSemantics(
+                      child: Text(
+                        currentLang == AppLang.it ? "🇮🇹 IT" : "🇬🇧 EN",
+                        style: TextStyle(
+                          fontSize: 16,
+                          color: Theme.of(context).colorScheme.onSurface,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              );
+            },
+          ),
+
+          ValueListenableBuilder<AppTheme>(
+            valueListenable: themeNotifier,
+            builder: (_, AppTheme currentTheme, __) {
+              IconData themeIcon;
+              if (currentTheme == AppTheme.light) {
+                themeIcon = Icons.dark_mode;
+              } else if (currentTheme == AppTheme.dark) {
+                themeIcon = Icons.contrast;
+              } else {
+                themeIcon = Icons.light_mode;
+              }
+
+              return IconButton(
+                key: _themeKey,
+                icon: Icon(themeIcon),
+                tooltip: AppTranslations.get(
+                  'toggle_theme',
+                  langNotifier.value,
+                ),
+                onPressed: _cycleTheme,
+              );
+            },
+          ),
+
+          IconButton(
+            key: _deleteKey,
+            icon: const Icon(Icons.delete_sweep_outlined),
+            tooltip: AppTranslations.get('clear_chat', langNotifier.value),
+            onPressed: _isLoading ? null : _clearChat,
+          ),
+          _accountButton(),
+          const SizedBox(width: 8),
+        ],
+      ),
+      body: Column(
+        children: [
+          Expanded(
+            child: ListView.builder(
+              controller: _scrollController,
+              reverse: true,
+              padding: const EdgeInsets.all(16.0),
+              itemCount: _messages.length + 1,
+              itemBuilder: (context, index) {
+                if (index == _messages.length) {
+                  return _buildProjectInfoHeader();
+                }
+                return _buildMessageBubble(_messages[index]);
+              },
+            ),
+          ),
+          // Sostituisce il vecchio LinearProgressIndicator con l'indicatore testuale
+          if (_isLoading) _buildTypingIndicator(),
+
+          _buildTextInputArea(),
+        ],
+      ),
+    );
+  }
+
+  /// Mostra un feedback visivo chiaro e testuale durante il polling.
+  /// Mantiene pulita la lista dei messaggi _messages.
+  Widget _buildTypingIndicator() {
+    final theme = Theme.of(context);
+
+    // Usa il messaggio dinamico dal Timer, oppure il fallback standard 'ai_processing'
+    final displayText =
+        _dynamicLoadingMessage ??
+        AppTranslations.get('ai_processing', langNotifier.value);
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 24.0, vertical: 16.0),
+      child: Row(
+        mainAxisSize: MainAxisSize.min, // Evita che occupi tutta la larghezza
+        children: [
+          SizedBox(
+            width: 16,
+            height: 16,
+            child: CircularProgressIndicator(
+              strokeWidth: 2.5,
+              color: theme.colorScheme.primary,
+            ),
+          ),
+          const SizedBox(width: 16),
+          // Semantics permette allo screen reader di annunciare l'attesa
+          Semantics(
+            liveRegion: true,
+            child: Text(
+              displayText,
+              style: theme.textTheme.bodyMedium!.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+                fontStyle: FontStyle.italic,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Builds the chat bubble for a given message
+  Widget _buildMessageBubble(ChatMessage message) {
+    final bool isUser = message.isUser;
+    final theme = Theme.of(context);
+
+    Widget messageContent;
+
+    // Il testo resta selezionabile col mouse, ma l'area di selezione esce
+    // dall'ordine del Tab: altrimenti ogni messaggio aggiunge una fermata
+    // invisibile in cui il fuoco sembra non spostarsi. (SelectableText, usato
+    // prima per i messaggi dell'utente, sul web diventa un campo di testo
+    // disabilitato e senza etichetta per i lettori di schermo.)
+    Widget selectable(Widget child) =>
+        ExcludeFocusTraversal(child: SelectionArea(child: child));
+
+    if (isUser) {
+      messageContent = selectable(
+        Text(
+          message.text,
+          style: theme.textTheme.bodyLarge!.copyWith(
+            color: theme.colorScheme.onPrimary,
+          ),
+        ),
+      );
+    } else {
+      messageContent = Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            selectable(Html(
+              data: message.text,
+              style: {
+                "body": Style(margin: Margins.zero, padding: HtmlPaddings.zero),
+                "p": Style(
+                  fontSize: FontSize(
+                    Theme.of(context).textTheme.bodyLarge!.fontSize!,
+                  ),
+                  color: message.isError
+                      ? theme.colorScheme.onErrorContainer
+                      : theme.colorScheme.onSurface,
+                ),
+                "ul": Style(
+                  padding: HtmlPaddings.only(left: 20),
+                  color: message.isError
+                      ? theme.colorScheme.onErrorContainer
+                      : theme.colorScheme.onSurface,
+                ),
+                "li": Style(
+                  color: message.isError
+                      ? theme.colorScheme.onErrorContainer
+                      : theme.colorScheme.onSurface,
+                ),
+              },
+            )),
+            _buildSources(message),
+
+            if (!message.isError && !message.isSystemMessage)
+              Padding(
+                padding: const EdgeInsets.only(top: 8.0),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    IconButton(
+                      icon: Icon(
+                        message.feedback == FeedbackStatus.like
+                            ? Icons.thumb_up
+                            : Icons.thumb_up_outlined,
+                        size: 20,
+                        color: message.feedback == FeedbackStatus.like
+                            ? Colors.green
+                            : theme.colorScheme.onSurfaceVariant,
+                      ),
+                      onPressed: () => _promptFeedbackComment(message, true),
+                      tooltip: AppTranslations.get(
+                        'good_response',
+                        langNotifier.value,
+                      ),
+                    ),
+                    IconButton(
+                      icon: Icon(
+                        message.feedback == FeedbackStatus.dislike
+                            ? Icons.thumb_down
+                            : Icons.thumb_down_outlined,
+                        size: 20,
+                        color: message.feedback == FeedbackStatus.dislike
+                            ? Colors.red
+                            : theme.colorScheme.onSurfaceVariant,
+                      ),
+                      onPressed: () => _promptFeedbackComment(message, false),
+                      tooltip: AppTranslations.get(
+                        'bad_response',
+                        langNotifier.value,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+          ],
+        );
+    }
+
+    // Chi parla, letto prima del messaggio (l'avatar dell'utente è a destra:
+    // l'ordine di lettura lo porta comunque davanti).
+    final String speaker = AppTranslations.get(
+      isUser
+          ? 'speaker_user'
+          : message.isError
+              ? 'speaker_error'
+              : message.isSystemMessage
+                  ? 'speaker_info'
+                  : 'speaker_assistant',
+      langNotifier.value,
+    );
+    Widget avatar(Widget circle) => Semantics(
+          container: true,
+          sortKey: const OrdinalSortKey(0),
+          label: speaker,
+          child: ExcludeSemantics(child: circle),
+        );
+
+    // Solo le risposte vengono annunciate quando arrivano: la domanda
+    // l'utente l'ha appena scritta.
+    return Semantics(
+      container: true,
+      liveRegion: !isUser,
+      child: Container(
+        margin: const EdgeInsets.symmetric(vertical: 8.0),
+        child: Row(
+          mainAxisAlignment: isUser
+              ? MainAxisAlignment.end
+              : MainAxisAlignment.start,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            if (!isUser)
+              avatar(CircleAvatar(
+                backgroundColor: theme.colorScheme.secondary,
+                child: Icon(
+                  message.isError
+                      ? Icons.error_outline
+                      : (message.isSystemMessage
+                            ? Icons.info_outline
+                            : Icons.computer),
+                  color: theme.colorScheme.onSecondary,
+                ),
+              )),
+            if (isUser) const SizedBox(width: 40),
+            Expanded(
+              child: Semantics(
+                container: true,
+                sortKey: const OrdinalSortKey(1),
+                child: Container(
+                margin: const EdgeInsets.symmetric(horizontal: 12.0),
+                padding: const EdgeInsets.all(16.0),
+                decoration: BoxDecoration(
+                  color: isUser
+                      ? theme.colorScheme.primary
+                      : (message.isError
+                            ? theme.colorScheme.errorContainer
+                            : theme.colorScheme.surfaceContainerHighest),
+                  borderRadius: BorderRadius.only(
+                    topLeft: const Radius.circular(20),
+                    topRight: const Radius.circular(20),
+                    bottomLeft: isUser
+                        ? const Radius.circular(20)
+                        : Radius.zero,
+                    bottomRight: isUser
+                        ? Radius.zero
+                        : const Radius.circular(20),
+                  ),
+                ),
+                child: messageContent,
+              ),
+              ),
+            ),
+            if (isUser)
+              avatar(CircleAvatar(
+                backgroundColor: theme.colorScheme.primary,
+                child: Icon(Icons.person, color: theme.colorScheme.onPrimary),
+              )),
+            if (!isUser) const SizedBox(width: 40),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Builds the source chips for an AI message (Expandable)
+  Widget _buildSources(ChatMessage message) {
+    if (message.isUser || message.sources.isEmpty) {
+      return const SizedBox.shrink();
+    }
+
+    final theme = Theme.of(context);
+    final String topic =
+        message.topic ??
+        AppTranslations.get('unknown_topic', langNotifier.value);
+
+    return Padding(
+      padding: const EdgeInsets.only(top: 12.0),
+      child: StatefulBuilder(
+        builder: (context, setLocalState) {
+          return Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              // Pulsante vero (non un semplice GestureDetector): raggiungibile
+              // con Tab, attivabile con Invio o Spazio, annunciato dai lettori
+              // di schermo come pulsante con lo stato aperto/chiuso.
+              // container: nodo a sé, senza inglobare il testo della risposta.
+              Semantics(
+                container: true,
+                button: true,
+                expanded: message.isSourcesExpanded,
+                label:
+                    "${AppTranslations.get('sources', langNotifier.value)} ${message.sources.length}",
+                hint: AppTranslations.get(
+                  message.isSourcesExpanded ? 'sources_hide' : 'sources_show',
+                  langNotifier.value,
+                ),
+                child: InkWell(
+                  borderRadius: BorderRadius.circular(6),
+                  onTap: () {
+                    setLocalState(() {
+                      message.isSourcesExpanded = !message.isSourcesExpanded;
+                    });
+                  },
+                  // Il testo visibile è già nell'etichetta: non va ripetuto.
+                  child: ExcludeSemantics(
+                    child: ConstrainedBox(
+                      // Area di tocco di almeno 24px (WCAG 2.5.8): era alta 20
+                      constraints: const BoxConstraints(minHeight: 32),
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 4),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(
+                              message.isSourcesExpanded
+                                  ? Icons.keyboard_arrow_down
+                                  : Icons.keyboard_arrow_right,
+                              size: 20,
+                              color: theme.colorScheme.onSurface.withAlpha(204),
+                            ),
+                            const SizedBox(width: 4.0),
+                            Text(
+                              "${AppTranslations.get('sources', langNotifier.value)} ${message.sources.length}",
+                              style: theme.textTheme.bodySmall!.copyWith(
+                                fontWeight: FontWeight.bold,
+                                color: theme.colorScheme.onSurface.withAlpha(204),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+
+              AnimatedSize(
+                duration: const Duration(milliseconds: 250),
+                curve: Curves.easeInOut,
+                alignment: Alignment.topCenter,
+                child: message.isSourcesExpanded
+                    ? Padding(
+                        padding: const EdgeInsets.only(top: 8.0, left: 8.0),
+                        child: Wrap(
+                          spacing: 8.0,
+                          runSpacing: 4.0,
+                          children: message.sources.map((source) {
+                            final String fileName =
+                                source['file_name'] ??
+                                AppTranslations.get(
+                                  'unknown_file',
+                                  langNotifier.value,
+                                );
+                            final String subTopic = source['sub_topic'] ?? '';
+
+                            final String url =
+                                "${AppSettings.downloadDocumentUrl}/${Uri.encodeComponent(topic)}/${Uri.encodeComponent(subTopic)}/${Uri.encodeComponent(fileName)}";
+
+                            return ActionChip(
+                              onPressed: () => _openDocument(url, fileName),
+                              avatar: Icon(
+                                Icons.link,
+                                size: 16,
+                                color: theme.colorScheme.onSecondaryContainer,
+                              ),
+                              label: Text(fileName),
+                              labelStyle: theme.textTheme.labelSmall?.copyWith(
+                                color: theme.colorScheme.onSecondaryContainer,
+                                fontWeight: FontWeight.bold,
+                              ),
+                              backgroundColor:
+                                  theme.colorScheme.secondaryContainer,
+                              labelPadding: const EdgeInsets.symmetric(
+                                horizontal: 8.0,
+                              ),
+                              visualDensity: VisualDensity.compact,
+                              side: BorderSide(
+                                color: theme.colorScheme.onSecondaryContainer
+                                    .withAlpha(50),
+                              ),
+                            );
+                          }).toList(),
+                        ),
+                      )
+                    : const SizedBox.shrink(),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+  }
+
+  /// Builds the bottom text input field and send button
+  Widget _buildTextInputArea() {
+    final theme = Theme.of(context);
+    return Container(
+      padding: const EdgeInsets.all(16.0),
+      decoration: BoxDecoration(
+        color: theme.colorScheme.surface,
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withValues(alpha: 0.1),
+            blurRadius: 10,
+            offset: const Offset(0, -5),
+          ),
+        ],
+      ),
+      child: SafeArea(
+        child: Row(
+          children: [
+            Expanded(
+              child: TextField(
+                controller: _textController,
+                focusNode: _textFocusNode,
+                enabled: !_isLoading,
+                autocorrect: true,
+                enableSuggestions: true,
+                decoration: InputDecoration(
+                  hintText: AppTranslations.get('ask_hint', langNotifier.value),
+                  filled: true,
+                  fillColor: theme.colorScheme.surfaceContainerHighest,
+                  border: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(30.0),
+                    borderSide: BorderSide.none,
+                  ),
+                  contentPadding: const EdgeInsets.symmetric(
+                    horizontal: 20.0,
+                    vertical: 16.0,
+                  ),
+                ),
+                onSubmitted: (_) => _handleSendPressed(),
+              ),
+            ),
+            const SizedBox(width: 12.0),
+            FloatingActionButton(
+              key: _sendKey,
+              onPressed: _isLoading ? null : _handleSendPressed,
+              backgroundColor: theme.colorScheme.primary,
+              tooltip: AppTranslations.get('send_question', langNotifier.value),
+              child: Icon(Icons.send, color: theme.colorScheme.onPrimary),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}

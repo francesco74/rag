@@ -29,12 +29,13 @@ from tenacity import (
     stop_after_attempt,
     wait_random_exponential,
     wait_exponential,
-    retry_if_exception_type
+    retry_if_exception
 )
 
 from common.db_logger import MySQLLogHandler, get_db_connection, init_db_pool
 from common.config import settings
-from common.utility import clean_ocr_text, split_protected_metadata
+from common.upload_status import FAILED, INDEXED, mark_upload
+from common.utility import clean_ocr_text, is_permanent_error, split_protected_metadata
 
 # ==============================================================================
 # 1. CONFIGURATION & LOGGING SETUP
@@ -97,7 +98,12 @@ markdown_splitter = MarkdownHeaderTextSplitter(headers_to_split_on=headers_to_sp
 # 2. CORE HELPER FUNCTIONS
 # ==============================================================================
 
+# Ritentare ha senso per rete e sovraccarico, non per le richieste rifiutate: il file
+# andrebbe in errore dopo ore, e nel frattempo risulterebbe "in lavorazione".
+_retry_if_transient = retry_if_exception(lambda e: not is_permanent_error(e))
+
 @retry(
+    retry=_retry_if_transient,
     wait=wait_exponential(multiplier=2, min=4, max=60), # Attese: 4s, 8s, 16s, 32s, 60s...
     stop=stop_after_attempt(5),                         # Massimo 5 tentativi
     reraise=True                                        # Rilancia l'errore se fallisce definitivamente
@@ -136,9 +142,10 @@ def safe_move_file(src_path, dest_folder):
         log.error(f"File Move Error ({src_path}): {e}")
 
 @retry(
-    retry=retry_if_exception_type(Exception),
+    retry=_retry_if_transient,
     wait=wait_random_exponential(multiplier=2, min=10, max=80),
-    stop=stop_after_attempt(20)
+    stop=stop_after_attempt(20),
+    reraise=True
 )
 async def async_embed_batch(batch_texts):
     """Genera embeddings in batch con backoff esponenziale in caso di rate limit.
@@ -154,6 +161,14 @@ async def async_embed_batch(batch_texts):
 async def finalize_file_move(file_path, root_folder, topic_id, sub_topic_id, error_msg: str = None):
     """Smista i file processati. Se error_msg è presente, lo inietta nel JSON."""
     success = error_msg is None
+    if file_path.suffix.lower() == '.json' and file_path.exists():
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                source = json.load(f).get("source")
+            if source:
+                await asyncio.to_thread(mark_upload, source, INDEXED if success else FAILED, error_msg)
+        except Exception as e:
+            log.warning(f"Stato del caricamento non aggiornato per {file_path.name}: {e}")
     try:
         try: 
             relative_path = file_path.relative_to(root_folder)
@@ -251,7 +266,7 @@ def sync_upsert_parents_mysql(source_name, topic_id, sub_topic_id, parents_data)
 # ==============================================================================
 
 @retry(
-    retry=retry_if_exception_type(Exception),
+    retry=_retry_if_transient,
     wait=wait_exponential(multiplier=2, min=4, max=30),
     stop=stop_after_attempt(5),
     reraise=True

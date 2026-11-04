@@ -43,6 +43,7 @@ so worker.py never needs to know which SDK is in use.
 
 import os
 import logging
+import re
 import time
 from abc import ABC, abstractmethod
 from common.config import settings
@@ -56,6 +57,8 @@ log = logging.getLogger("rag_queue")
 # costante qui e non una variabile d'ambiente — non c'è nessuna decisione
 # operativa da prendere, solo un buco dell'API da tappare.
 _ANTHROPIC_MAX_TOKENS_FALLBACK = 8192
+
+_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 
 # ==============================================================================
 # PROVIDER REGISTRY
@@ -295,6 +298,23 @@ class GeminiProvider(LLMProvider):
 # ==============================================================================
 # OPENAI PROVIDER
 # ==============================================================================
+def _strict_json_schema(schema) -> dict:
+    """
+    JSON Schema nella forma che OpenAI e vLLM accettano con strict=True, da una
+    classe Pydantic o da un dict: niente proprietà extra e tutte obbligatorie.
+    """
+    result = schema.model_json_schema() if hasattr(schema, "model_json_schema") else dict(schema)
+    result["additionalProperties"] = False
+    if "properties" in result:
+        result["required"] = list(result["properties"])
+    return result
+
+
+def _is_temperature_rejected(error) -> bool:
+    """Alcuni modelli accettano solo la temperatura di default e rispondono 400 se la si indica."""
+    return getattr(error, "status_code", None) == 400 and "temperature" in str(error).lower()
+
+
 class OpenAIProvider(LLMProvider):
     """
     base_url=None (default) -> API OpenAI ufficiali. Parametrico apposta:
@@ -304,6 +324,10 @@ class OpenAIProvider(LLMProvider):
     serve duplicare _call/retry/normalizzazione finish_reason per un backend
     che parla già la lingua che questa classe sa già parlare.
     """
+
+    # I modelli OpenAI recenti rifiutano max_tokens; vLLM li accetta entrambi ma
+    # altri server compatibili conoscono solo il nome storico.
+    _max_tokens_param = "max_completion_tokens"
 
     def __init__(self, base_url: str | None = None, api_key: str | None = None, label: str = "OpenAIProvider"):
         try:
@@ -317,17 +341,15 @@ class OpenAIProvider(LLMProvider):
 
     def _call(self, model_name, prompt, temperature, max_tokens, json_mode=False, thinking_level: str | None = None,
               with_meta: bool = False, response_schema=None):
-        if thinking_level:
-            log.warning ("OpenAIProvider thinking level not used")
-
         kwargs = dict(
             model=model_name,
             messages=[{"role": "user", "content": prompt}],
             temperature=temperature,
         )
+        kwargs.update(self._thinking_kwargs(thinking_level))
         # Omesso quando None: l'API usa il massimo del modello.
         if max_tokens is not None:
-            kwargs["max_tokens"] = max_tokens
+            kwargs[self._max_tokens_param] = max_tokens
         if response_schema is not None:
             # OpenAI vuole un JSON Schema (dict), non una classe Pydantic:
             # "strict": True attiva il constrained decoding vero e proprio
@@ -336,7 +358,7 @@ class OpenAIProvider(LLMProvider):
                 "type": "json_schema",
                 "json_schema": {
                     "name": "response",
-                    "schema": response_schema,
+                    "schema": _strict_json_schema(response_schema),
                     "strict": True,
                 },
             }
@@ -346,7 +368,7 @@ class OpenAIProvider(LLMProvider):
         def _attempt():
             try:
                 response = self._client.chat.completions.create(**kwargs)
-                content = response.choices[0].message.content
+                content = self._clean_content(response.choices[0].message.content)
                 if not with_meta:
                     return content
                 fr_str = str(getattr(response.choices[0], "finish_reason", None) or "UNKNOWN")
@@ -364,9 +386,21 @@ class OpenAIProvider(LLMProvider):
             except self._APIStatusError as e:
                 if e.status_code in (429, 503):
                     raise LLMRateLimitError(str(e)) from e
+                if _is_temperature_rejected(e) and "temperature" in kwargs:
+                    log.info(f"Il modello {model_name} non accetta temperature: la ometto.")
+                    del kwargs["temperature"]
+                    return _attempt()
                 raise
 
         return _retry_with_backoff(_attempt)
+
+    def _thinking_kwargs(self, thinking_level) -> dict:
+        if thinking_level:
+            log.debug("OpenAIProvider thinking level not used")
+        return {}
+
+    def _clean_content(self, content):
+        return content
 
     def generate_json(self, model_name, prompt, temperature=0.1, max_tokens: int | None = 2048,
                       thinking_level: str | None = None, with_meta: bool = False, response_schema=None):
@@ -402,7 +436,7 @@ class AnthropicProvider(LLMProvider):
     def _call(self, model_name, prompt, temperature, max_tokens, json_mode=False, thinking_level: str | None = None,
               with_meta: bool = False):
         if thinking_level:
-            log.warning ("AnthropicProvider thinking level not used")
+            log.debug("AnthropicProvider thinking level not used")
 
         # Unico provider dei tre in cui max_tokens è obbligatorio: qui None non
         # può essere propagato all'SDK, va risolto. Il log è a livello INFO e
@@ -426,13 +460,13 @@ class AnthropicProvider(LLMProvider):
                 kwargs = dict(
                     model=model_name,
                     max_tokens=max_tokens,
-                    temperature=temperature,
+                    # Niente temperature: l'SDK attuale non ha più il parametro.
                     messages=[{"role": "user", "content": prompt}],
                 )
                 if system:
                     kwargs["system"] = system
                 response = self._client.messages.create(**kwargs)
-                content = response.content[0].text
+                content = "".join(block.text for block in response.content if block.type == "text")
                 if not with_meta:
                     return content
                 fr_str = str(getattr(response, "stop_reason", None) or "UNKNOWN")
@@ -483,8 +517,8 @@ class MistralProvider(LLMProvider):
 
     def __init__(self):
         try:
-            from mistralai import Mistral
-            from mistralai.models import SDKError
+            from mistralai.client import Mistral
+            from mistralai.client.errors import SDKError
             self._client = Mistral(api_key=settings.api_llm_key)
             self._SDKError = SDKError
             log.info("✓ MistralProvider initialized.")
@@ -494,7 +528,7 @@ class MistralProvider(LLMProvider):
     def _call(self, model_name, prompt, temperature, max_tokens, json_mode=False, thinking_level: str | None = None,
               with_meta: bool = False):
         if thinking_level:
-            log.warning("MistralProvider thinking level not used")
+            log.debug("MistralProvider thinking level not used")
 
         kwargs = dict(
             model=model_name,
@@ -572,7 +606,14 @@ class VLLMProvider(OpenAIProvider):
     api_key: vLLM in locale tipicamente non richiede autenticazione reale,
     ma il client OpenAI pretende comunque una stringa non vuota — da cui il
     placeholder quando LOCAL_VLLM_API_KEY non è impostata.
+
+    Thinking: come con Ollama, qualunque thinking_level lo attiva e l'assenza lo
+    disattiva (enable_thinking del template del modello; i modelli che non lo
+    prevedono lo ignorano). Se vLLM gira senza --reasoning-parser il ragionamento
+    arriva dentro il testo tra <think>: va tolto, altrimenti rompe il JSON.
     """
+
+    _max_tokens_param = "max_tokens"
 
     def __init__(self):
         super().__init__(
@@ -580,6 +621,12 @@ class VLLMProvider(OpenAIProvider):
             api_key=settings.local_vllm_api_key or "not-needed",
             label="VLLMProvider",
         )
+
+    def _thinking_kwargs(self, thinking_level) -> dict:
+        return {"extra_body": {"chat_template_kwargs": {"enable_thinking": bool(thinking_level)}}}
+
+    def _clean_content(self, content):
+        return _THINK_RE.sub("", content or "").strip()
 
 
 # ==============================================================================
@@ -695,6 +742,17 @@ def init_llm_provider() -> LLMProvider:
     Returns the provider instance and also stores it in the module-level singleton.
     """
     global _PROVIDER_INSTANCE
+    # I default in config.py sono modelli Gemini: con un altro provider
+    # fallirebbero alla prima domanda, con un errore poco chiaro.
+    if settings.llm_provider != "gemini":
+        unset = [name for name, model in (
+            ("QUERY_REWRITER_MODEL_NAME", settings.query_rewriter_model_name),
+            ("ANSWER_GENERATOR_MODEL_NAME", settings.answer_generator_model_name),
+            ("GRADER_MODEL_NAME", settings.grader_model_name),
+        ) if model.startswith("gemini")]
+        if unset:
+            raise ValueError(f"LLM_PROVIDER='{settings.llm_provider}' ma {', '.join(unset)} indicano un modello Gemini.")
+
     providers = {
         "gemini":    GeminiProvider,
         "openai":    OpenAIProvider,

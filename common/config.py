@@ -61,6 +61,18 @@ class Settings:
     db_name: str
 
     ocr_model_name: str
+    # Fornitore del modello OCR (vedi converter/src/ocr_provider.py): gemini,
+    # openai, anthropic, mistral o local. Indipendente da LLM_PROVIDER.
+    ocr_provider: str
+    ocr_rate_per_minute: int
+    ocr_max_attempts: int
+    # Il comando del revisore passa a Google Cloud Vision se il modello esterno fallisce.
+    ocr_vision_fallback: bool
+    # Modello esterno per il comando del revisore, prima di Vision (vedi get_external_fallback). Mai in automatico.
+    ocr_external_fallback: bool
+    ocr_external_provider: str
+    ocr_external_model_name: str
+    ocr_external_api_key: str
 
     api_llm_key: str
     api_secret_key: str
@@ -85,15 +97,38 @@ class Settings:
     # Il frontend rinnova il blocco finché il documento resta aperto; senza
     # rinnovi (scheda chiusa, PC spento) scade dopo questi secondi.
     review_lock_ttl_seconds: int
+    # Protezione del login contro i tentativi ripetuti (review_routes.login).
+    # Dopo login_max_failures tentativi falliti di fila sullo stesso nome
+    # utente (esistente o no: il blocco non deve rivelare quali esistono),
+    # quel nome è bloccato per login_lockout_seconds, anche con la password
+    # giusta. Lo stesso per indirizzo IP con login_ip_max_failures, ma solo se
+    # trusted_proxy_hops > 0: altrimenti l'API vede l'IP del proxy davanti a
+    # sé, uguale per tutti, e un limite per IP bloccherebbe tutti insieme.
+    # API per i sistemi esterni (external_routes.py): dimensione massima dei
+    # documenti da convertire e ore di conservazione dei lavori di conversione.
+    convert_max_upload_mb: int
+    # Limite di ogni file caricato dal sito di amministrazione. Va allineato a
+    # client_max_body_size di nginx sulla location /api/.
+    upload_max_mb: int
+    convert_retention_hours: int
+    login_max_failures: int
+    login_lockout_seconds: int
+    login_ip_max_failures: int
+    # Proxy fidati davanti all'API che aggiungono X-Forwarded-For (in k8s:
+    # ingress + nginx = 2). Con 0 (default) l'indirizzo del client è quello
+    # della connessione. Un valore troppo alto permette al client di
+    # scegliersi l'IP scrivendo X-Forwarded-For.
+    trusted_proxy_hops: int
 
     hostname: str
 
     qdrant_host: str
     qdrant_port: int
 
-    allow_subtopic_selection: bool
-
     allowed_origins: list[str]
+    # Per quanti secondi un processo dell'API tiene in memoria un sito della chat
+    # (dominio -> archivio): le modifiche arrivano a tutti entro questo tempo.
+    site_cache_seconds: int
 
     # Metadati del documento nel contesto del generatore (worker.build_context):
     # oggetto, numero, ufficio... sul primo passaggio di ogni documento, un
@@ -121,6 +156,11 @@ class Settings:
     rerank_truncate: int
     rerank_batch_size: int
     rerank_max_length: int
+    # onnx (modello locale su CPU) oppure vllm (cross-encoder su server, es. DGX).
+    rerank_provider: str
+    rerank_model_name: Optional[str]
+    local_vllm_rerank_base_url: Optional[str]
+    rerank_timeout_seconds: float
     # None = nessun tetto esplicito: si usa il massimo del modello. È il default.
     # Un numero qui sarebbe una copia locale di un dato che appartiene al
     # vendor e che diverge in silenzio al primo cambio di
@@ -249,6 +289,12 @@ class Settings:
     # nient'altro a valle (query_rewriter_model_name ecc. restano quelli).
     local_llm_backend: str
 
+    # Usati solo con EMBEDDING_PROVIDER="vllm". L'indirizzo serve se il modello
+    # di embedding gira su un'istanza vLLM diversa (di norma è così: una istanza,
+    # un modello); vuoto = local_vllm_base_url.
+    local_vllm_embedding_model: str | None
+    local_vllm_embedding_base_url: str | None
+
     # Usati solo quando local_llm_backend="vllm". base_url punta al server
     # OpenAI-compatible esposto da vLLM (es. "http://localhost:8000/v1" —
     # nota il suffisso /v1, diverso dal formato di local_llm_host per Ollama).
@@ -315,6 +361,10 @@ def load_settings() -> Settings:
     # già stato allocato: build_context si troverebbe a scartare parent a cui
     # era stato appena assegnato del budget — di nuovo il bug che questa
     # modifica elimina, solo per un'altra strada.
+    rerank_provider = (os.environ.get("RERANK_PROVIDER") or "onnx").strip().lower()
+    if rerank_provider not in ("onnx", "vllm"):
+        raise ValueError(f"RERANK_PROVIDER='{rerank_provider}' non valido (ammessi: onnx, vllm).")
+
     context_score_source = (os.environ.get("CONTEXT_SCORE_SOURCE") or "rerank").strip().lower()
     if context_score_source not in ("rerank", "vector"):
         _log.warning(
@@ -369,7 +419,7 @@ def load_settings() -> Settings:
     max_reranker_thread = int(os.environ.get("MAX_RERANKER_THREAD") or 2)
     reranker_pool_size = int(os.environ.get("RERANKER_POOL_SIZE") or 1)
 
-    if reranker_pool_size < max_reranker_thread:
+    if rerank_provider == "onnx" and reranker_pool_size < max_reranker_thread:
         _log.warning(
             "RERANKER_POOL_SIZE (%d) è inferiore a MAX_RERANKER_THREAD (%d): i thread in "
             "eccesso condividerebbero una sessione ONNX sequenziale, serializzandosi. "
@@ -407,7 +457,17 @@ def load_settings() -> Settings:
         db_pass = os.environ.get("MYSQL_PASSWORD", ""),
         db_name = os.environ.get("MYSQL_DATABASE", "rag_db"),
 
-        ocr_model_name = os.environ.get("OCR_MODEL_NAME", "gemini-3-flash-preview"),
+        # Il predefinito vale solo per Gemini: gli altri fornitori non hanno quel modello.
+        ocr_model_name = os.environ.get("OCR_MODEL_NAME", "").strip() or (
+            "gemini-3-flash-preview" if os.environ.get("OCR_PROVIDER", "gemini").strip().lower() in ("", "gemini") else ""),
+        ocr_provider = os.environ.get("OCR_PROVIDER", "gemini").strip().lower() or "gemini",
+        ocr_rate_per_minute = int(os.environ.get("OCR_RATE_PER_MINUTE") or 10),
+        ocr_max_attempts = int(os.environ.get("OCR_MAX_ATTEMPTS") or 6),
+        ocr_vision_fallback = os.environ.get("OCR_VISION_FALLBACK", "true").strip().lower() != "false",
+        ocr_external_fallback = os.environ.get("OCR_EXTERNAL_FALLBACK", "false").strip().lower() == "true",
+        ocr_external_provider = os.environ.get("OCR_EXTERNAL_ALTERNATIVE_PROVIDER", "").strip().lower(),
+        ocr_external_model_name = os.environ.get("OCR_EXTERNAL_ALTERNATIVE_MODEL_NAME", "").strip(),
+        ocr_external_api_key = os.environ.get("OCR_EXTERNAL_API_KEY", "").strip(),
 
         api_llm_key = os.environ.get("API_LLM_KEY", "default_key"),
         api_secret_key  = os.environ.get("API_SECRET_KEY", "default_key"),
@@ -415,16 +475,23 @@ def load_settings() -> Settings:
         session_cookie_secure = os.environ.get("SESSION_COOKIE_SECURE", "true").strip().lower()
                                 not in ("0", "false", "no", "off"),
         files_x_accel_prefix = os.environ.get("FILES_X_ACCEL_PREFIX", "").strip(),
-        files_login_url = os.environ.get("FILES_LOGIN_URL", "/revisione/").strip() or "/revisione/",
+        files_login_url = os.environ.get("FILES_LOGIN_URL", "/amministrazione/").strip() or "/amministrazione/",
         review_lock_ttl_seconds = max(60, int(os.environ.get("REVIEW_LOCK_TTL_SECONDS") or 300)),
+        convert_max_upload_mb = max(1, int(os.environ.get("CONVERT_MAX_UPLOAD_MB") or 50)),
+        upload_max_mb = max(1, int(os.environ.get("UPLOAD_MAX_MB") or 100)),
+        convert_retention_hours = max(1, int(os.environ.get("CONVERT_RETENTION_HOURS") or 48)),
+        login_max_failures = max(1, int(os.environ.get("LOGIN_MAX_FAILURES") or 5)),
+        login_lockout_seconds = max(60, int(os.environ.get("LOGIN_LOCKOUT_SECONDS") or 900)),
+        login_ip_max_failures = max(1, int(os.environ.get("LOGIN_IP_MAX_FAILURES") or 20)),
+        trusted_proxy_hops = max(0, int(os.environ.get("TRUSTED_PROXY_HOPS") or 0)),
 
         hostname = os.environ.get("HOSTNAME", socket.gethostname()),
 
         qdrant_host = os.environ.get("QDRANT_HOST", "localhost"),
         qdrant_port = int(os.environ.get("QDRANT_PORT") or 6333),
 
-        allow_subtopic_selection=_parse_bool(os.environ.get("ALLOW_SUBTOPIC_SELECTION"), default=True),
         allowed_origins=allowed_origins,
+        site_cache_seconds = int(os.environ.get("SITE_CACHE_SECONDS") or 10),
         context_metadata=os.environ.get("CONTEXT_METADATA", "true").strip().lower()
                          not in ("0", "false", "no", "off"),
         context_metadata_exclude=frozenset(
@@ -442,6 +509,10 @@ def load_settings() -> Settings:
         rerank_truncate = int(os.environ.get("RERANK_TRUNCATE") or 1200),
         rerank_batch_size = int(os.environ.get("RERANK_BATCH_SIZE") or  4),
         rerank_max_length = int(os.environ.get("RERANK_MAX_LENGTH") or 512),
+        rerank_provider = rerank_provider,
+        rerank_model_name = os.environ.get("RERANK_MODEL_NAME", "").strip() or None,
+        local_vllm_rerank_base_url = os.environ.get("LOCAL_VLLM_RERANK_BASE_URL", "").strip() or None,
+        rerank_timeout_seconds = float(os.environ.get("RERANK_TIMEOUT_SECONDS") or 30),
         qdrant_concept_threshold = float(os.environ.get("QDRANT_CONCEPT_THRESHOLD") or 0.80),
         answer_max_tokens = answer_max_tokens,
         # Il grader ora restituisce un JSON strutturato (verdict/reason/
@@ -505,6 +576,8 @@ def load_settings() -> Settings:
 
         local_llm_backend = os.environ.get("LOCAL_LLM_BACKEND", "ollama").strip().lower() or "ollama",
 
+        local_vllm_embedding_model = os.environ.get("LOCAL_VLLM_EMBEDDING_MODEL", "").strip() or None,
+        local_vllm_embedding_base_url = os.environ.get("LOCAL_VLLM_EMBEDDING_BASE_URL", "").strip() or None,
         local_vllm_base_url = os.environ.get("LOCAL_VLLM_BASE_URL", "").strip() or "http://localhost:8000/v1",
         local_vllm_api_key = os.environ.get("LOCAL_VLLM_API_KEY", "").strip() or None,
 

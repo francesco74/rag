@@ -4,7 +4,7 @@ Gestione degli utenti revisori da riga di comando.
 Esempi (dentro il container del servizio review):
     python -m utils.manage_review_users add mrossi --name "Mario Rossi"            # chiede la password, ruolo revisore
     python -m utils.manage_review_users add admin --role admin
-    python -m utils.manage_review_users add lbianchi --role correttore --role validatore
+    python -m utils.manage_review_users add lbianchi --role archivista
     python -m utils.manage_review_users grant mrossi admin                         # aggiunge uno o più ruoli
     python -m utils.manage_review_users revoke mrossi admin                        # toglie uno o più ruoli
     python -m utils.manage_review_users roles                                      # ruoli disponibili e permessi
@@ -18,6 +18,7 @@ Esempi (dentro il container del servizio review):
     python -m utils.manage_review_users disable mrossi                            # disattiva e chiude le sessioni
     python -m utils.manage_review_users enable mrossi
     python -m utils.manage_review_users list
+    python -m utils.manage_review_users unlock mrossi [--ip 10.1.2.3]          # toglie il blocco per tentativi ripetuti
 """
 
 import argparse
@@ -110,6 +111,20 @@ def cmd_disable(args):
 def cmd_enable(args):
     _update(args.username, "UPDATE review_users SET active = 1 WHERE username = %s",
             (), f"Utente '{args.username}' riattivato.")
+
+
+def cmd_unlock(args):
+    """Toglie il blocco per tentativi di login ripetuti (nome utente o IP)."""
+    conn = _conn()
+    try:
+        cur = conn.cursor()
+        keys = [f"user:{args.username.lower()}"] + [f"ip:{ip}" for ip in args.ip or []]
+        cur.execute(f"DELETE FROM review_login_failures WHERE lkey IN ({', '.join(['%s'] * len(keys))})",
+                    tuple(keys))
+        conn.commit()
+        print(f"Sbloccati: {', '.join(keys)}" if cur.rowcount else "Nessun blocco da togliere.")
+    finally:
+        conn.close()
 
 
 def _user_id(cur, username):
@@ -318,6 +333,11 @@ def main():
         p.set_defaults(func=func)
 
     sub.add_parser("list", help="elenca gli utenti").set_defaults(func=cmd_list)
+
+    p = sub.add_parser("unlock", help="toglie il blocco per tentativi di login ripetuti")
+    p.add_argument("username")
+    p.add_argument("--ip", action="append", help="sblocca anche questo indirizzo IP, ripetibile")
+    p.set_defaults(func=cmd_unlock)
 
     args = parser.parse_args()
     args.func(args)

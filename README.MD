@@ -41,7 +41,7 @@ Prima di poter rispondere alle domande, il sistema deve "studiare" ed elaborare 
 
 * In presenza di scansioni o foto sbiadite, si attiva una "vista digitale" (OCR) per riconoscere in modo accurato i caratteri scritti nelle immagini.
 
-* Qualora i filtri o le regole di sicurezza di un modulo IA dovessero bloccare la lettura di una pagina per un falso allarme, il sistema non interrompe il flusso, ma passa istantaneamente il compito a un "occhio di riserva" (Google Vision) per garantire il recupero di ogni singola riga del testo.
+* Qualora i filtri o le regole di sicurezza di un modulo IA dovessero bloccare la lettura di una pagina per un falso allarme, il sistema non interrompe il flusso, ma segnala il documento in errore senza inviarlo ad altri servizi: si può riprovare, e in revisione il personale può decidere di inviarlo a un servizio esterno.
 
 * Per riprodurre l'impaginazione dell'originale (rientri, firme allineate a destra, colonne), l'OCR inserisce molti spazi: prima dell'archiviazione il testo viene ripulito di quegli spazi superflui, che all'IA non servono e le sottrarrebbero spazio utile, conservando però titoli, elenchi, tabelle e colonne di dati. Il testo originale dell'OCR resta comunque disponibile ai revisori.
 
@@ -208,11 +208,8 @@ Chat e revisione condividono la stessa gestione degli utenti: ogni persona ha le
 
 | Ruolo | Funzioni |
 | --- | --- |
-| **Lettore** | Consulta i documenti, il loro storico e i file originali degli archivi assegnati. |
-| **Correttore** | Corregge i testi. |
-| **Catalogatore** | Modifica i dati di catalogo. |
-| **Validatore** | Cambia lo stato di revisione. |
-| **Revisore** | Tutte le funzioni di revisione: testo, dati di catalogo e stato. |
+| **Revisore** | Corregge i testi e aggiorna lo stato di revisione degli archivi assegnati. |
+| **Archivista** | Come il revisore, e in più modifica i dati di catalogo. |
 | **Amministratore** | Tutte le funzioni, su tutti gli archivi, più la gestione degli utenti. |
 
 L'interfaccia mostra a ciascuno solo le funzioni concesse dai suoi ruoli, e il sistema le verifica comunque a ogni operazione.
@@ -223,6 +220,10 @@ L'interfaccia mostra a ciascuno solo le funzioni concesse dai suoi ruoli, e il s
 
 **Sessioni sicure:** L'uscita chiude la sessione su tutti i dispositivi e le schede in cui era aperta; la disattivazione di un utente o la modifica dei suoi ruoli hanno effetto immediato.
 
+
+### Amministrazione
+
+Dal sito di amministrazione (`/amministrazione/`), l'amministratore gestisce utenti e ruoli, configura archivi e siti della chat e rilascia le credenziali per i sistemi esterni. Ogni sito della chat ha un proprio indirizzo, nome e home page: per aggiungerne uno lo si crea da riga di comando con `utils/manage_sites.py`, senza installare nulla, e si fa puntare il suo indirizzo al sistema. Dominio e archivio restano fissi, tutto il resto si modifica da qui. Archivi e siti si creano e si eliminano solo da riga di comando (`utils/manage_topics.py`, `utils/manage_sites.py`).
 
 ## 8. Efficienza Operativa, Sostenibilità Economica e Gestione degli Imprevisti
 
@@ -273,3 +274,135 @@ La tabella sottostante riassume le differenze strutturali e funzionali che dista
 La scelta di implementare una soluzione integrata che fonde la flessibilità logica del backend (RAG Agentico, *Parent Document Retriever*, ricerca ibrida a combinazioni e moduli di analisi concettuale) con la trasparenza e l'accessibilità del frontend (interfaccia multi-tema, filtri, fonti consultabili, gestione trasparente dei tempi e degli imprevisti) dota l'Ente di uno strumento di lavoro sicuro, affidabile e all'avanguardia.
 
 La revisione dei testi e la gestione degli utenti completano il quadro: l'archivio non è un deposito immutabile ma un patrimonio che il personale dell'Ente controlla, corregge e protegge, con ruoli chiari e la traccia di ogni intervento.
+
+
+## 12. Manuale Operativo: Avvio e Gestione
+
+I comandi di questa sezione si lanciano dalla cartella del progetto e usano Docker Compose. In Kubernetes gli stessi script `python -m utils...` si eseguono nel pod dell'API con `kubectl exec -it -n rag <pod-api> -- python -m ...`.
+
+**Chi configura cosa:**
+
+| Dove | Cosa si gestisce |
+| --- | --- |
+| File `.env.local` (in Kubernetes: ConfigMap e Secret) | LLM per le varie fasi, OCR, embedding, reranker e infrastruttura. Elenco completo in `.env.example`. |
+| Riga di comando | Creazione ed eliminazione di archivi e siti, primo amministratore. |
+| Sito di amministrazione | Utenti, ruoli, sottocategorie, configurazione di archivi e siti, credenziali per i sistemi esterni. |
+
+### Passo 1: Avviare il Sistema
+
+```bash
+cp misc/local/env.example .env.local     # poi inserire API_LLM_KEY e cambiare le password
+docker compose --env-file .env.local up -d --build
+```
+
+Conviene scegliere fornitore e modello degli embedding prima di caricare documenti: cambiarli in seguito richiede una nuova collection e la re-ingestione completa. Le password di MySQL e RabbitMQ valgono dalla prima creazione dei dati: per cambiarle dopo, in locale, serve `docker compose --env-file .env.local down -v`, che **cancella tutti i dati**.
+
+Per fermare il sistema conservando i dati: `docker compose --env-file .env.local down`.
+
+### Passo 2: Creare il Primo Amministratore
+
+```bash
+docker compose --env-file .env.local exec api python -m utils.manage_review_users add admin --role admin
+```
+
+Il comando chiede la password. Da quel momento l'amministratore entra da `http://localhost:8081/amministrazione/` e crea gli altri utenti dall'interfaccia.
+
+### Passo 3: Creare l'Archivio
+
+Ogni sito della chat corrisponde a un archivio (`topic_id`), che va creato per primo:
+
+```bash
+docker compose --env-file .env.local exec api python -m utils.manage_topics add mio_archivio \
+  --description "Descrizione dell'archivio" --prompt general
+```
+
+- `--prompt` sceglie le istruzioni date al modello; un nome non valido fa comparire l'elenco di quelli disponibili.
+- `--public` rende i documenti originali scaricabili da chiunque; senza, sono riservati agli utenti abilitati.
+
+### Passo 4: Creare il Sito
+
+Si può preparare una cartella con i file del sito, tutti facoltativi: `welcome_it.html`, `welcome_en.html`, `favicon.png` e `buttons.json`. Testo e pulsanti si possono anche scrivere dopo, dal sito di amministrazione.
+
+```bash
+docker compose --env-file .env.local run --rm --no-deps \
+  -v /percorso/cartella-del-sito:/sites:ro \
+  api python -m utils.manage_sites add archivio.ente.it \
+  --topic mio_archivio --name "Nome del sito" --dir /sites
+```
+
+- `--date-filter` attiva il filtro per periodo nella chat.
+- Ogni archivio ha un solo sito. Il comando non modifica mai un sito esistente: se dominio o archivio sono già in uso si ferma con un errore.
+- Il dominio deve poi arrivare al sistema: record DNS e, in Kubernetes, ingress con certificato (o un wildcard). In locale bastano i nomi `nome.localhost:8081`, che il browser risolve da solo.
+
+### Passo 5: Configurare dal Sito di Amministrazione
+
+Nell'elenco di Revisione i documenti passati dall'OCR hanno l'etichetta **OCR 3/4** (pagine trascritte su pagine totali), e il filtro **Trascrizione** isola quelli da controllare con più attenzione. I documenti indicizzati prima di questa funzione non hanno il dato: compaiono solo con il filtro *Tutte*.
+
+In automatico si usa solo il modello OCR scelto (`OCR_PROVIDER`), locale o no: se fallisce o rifiuta una pagina, il documento va in errore e non viene inviato ad altri servizi. In revisione il pulsante **Trascrivi con OCR esterno**, su clic esplicito, invia il documento aperto al modello esterno (`OCR_EXTERNAL_FALLBACK=true`) e, se fallisce ed è abilitato (`OCR_VISION_FALLBACK=true` con le credenziali), a Google Cloud Vision. Si può anche uscire: riaprendo il documento si ritrova la trascrizione, per inserirla nell'editor o scartarla, entro `CONVERT_RETENTION_HOURS` (48 ore). Diventa definitiva solo salvando. Se nessuno dei due è configurato il pulsante non compare.
+
+Dalla voce **Amministrazione** della barra laterale, cliccando su una riga si aprono le azioni disponibili:
+
+1. **Archivi:** aggiungere le sottocategorie, che vanno create prima di caricare i documenti.
+2. **Siti:** modificare nome, home page e icona, attivare o disattivare il sito, il filtro per periodo e la scelta delle serie nei Filtri. Dominio e archivio del sito non si cambiano. L'icona a destra della riga apre il sito in una nuova scheda.
+
+   La home mostra, dall'alto, il testo descrittivo, le statistiche sui documenti (calcolate dal sistema), i pulsanti e i limiti del sistema. Il testo si scrive con l'editor visuale; **Traduci in inglese con IA** riempie testo ed etichette inglesi con l'LLM di sistema, e il risultato si può correggere prima di salvare. I pulsanti si aggiungono, ordinano e tolgono a piacimento.
+3. **Utenti:** creare gli utenti, assegnare ruoli e archivi.
+4. **Credenziali:** rilasciare le chiavi per i sistemi esterni. La chiave si vede solo alla creazione e alla rigenerazione.
+
+**Ruoli disponibili:**
+
+| Ruolo | Cosa può fare |
+| --- | --- |
+| **Revisore** | Consulta i documenti degli archivi assegnati, corregge i testi e cambia lo stato di revisione. |
+| **Archivista** | Come il revisore, e in più modifica i metadati. |
+| **Amministratore** | Tutto, su tutti gli archivi, compresa la gestione di utenti e configurazioni. |
+
+I ruoli sono fissi: l'amministratore li assegna, ma non può crearne di nuovi né cambiarne i permessi.
+
+### Passo 6: Caricare i Documenti
+
+Dal sito di amministrazione, la voce **Caricamento** della barra laterale è disponibile per archivisti e amministratori:
+
+1. si scelgono archivio e sottocategoria, tra quelli assegnati;
+2. si trascinano o si scelgono i file (PDF, immagini, testo, buste firmate `.p7m`), e si controlla il riepilogo di numero e dimensione;
+3. Per conservare le sottocartelle di origine, ad esempio l'ordine dell'inventario, usa **Scegli una cartella** o trascina la cartella: il percorso resta nel nome del documento e compare nelle fonti della chat. I file di tipo non ammesso che contiene vengono ignorati.
+4. **Carica e avvia l'ingestione** invia i file: l'indicizzazione parte da sola e si può chiudere la pagina.
+
+L'elenco **I miei caricamenti** mostra solo i file caricati da chi è collegato, anche per l'amministratore. Si apre sul filtro **Errori**, che comprende anche i file *da inviare* (coda non raggiungibile); gli altri filtri sono **In lavorazione** (*in coda* e *in lavorazione*), **Indicizzati**, limitati agli ultimi 3 giorni, e **Tutti**. Dopo un invio l'elenco passa da solo a *In lavorazione*. Un file in errore resta in elenco finché non viene ripreso o ricaricato. Su un file in errore compare **Riprova**: riparte dal punto in cui si è fermato, senza rifare l'OCR se il testo è già stato ricavato. Se il problema è nel file, invece, va corretto e caricato di nuovo. Un contenuto già presente viene rifiutato, e un documento con lo stesso nome si sostituisce solo attivando l'opzione apposita.
+
+Per caricamenti massivi di file già sul server resta `direct`, che si lancia dopo averli messi in `/data/direct/<archivio>/<sottocategoria>/`:
+
+```bash
+docker compose --env-file .env.local run --rm direct
+```
+
+Il dizionario dei concetti si carica con:
+
+```bash
+docker compose --env-file .env.local exec -w /app api python populate_concepts.py
+```
+
+A ingestione completata i documenti sono interrogabili dalla chat e revisionabili dal sito di amministrazione.
+
+### Eliminare un Sito o un Archivio
+
+Si elimina prima il sito e poi l'archivio. Entrambi i comandi chiedono di riscrivere il nome per conferma; l'archivio non si elimina se contiene ancora documenti.
+
+```bash
+docker compose --env-file .env.local exec api python -m utils.manage_sites delete archivio.ente.it
+docker compose --env-file .env.local exec api python -m utils.manage_topics delete mio_archivio
+```
+
+Per sospendere un sito senza eliminarlo basta l'interruttore **Attivo** nella scheda Siti.
+
+### Comandi di Controllo
+
+```bash
+docker compose --env-file .env.local ps                                      # stato dei servizi
+docker compose --env-file .env.local exec api python -m utils.manage_topics list
+docker compose --env-file .env.local exec api python -m utils.manage_sites list
+docker compose --env-file .env.local exec api python -m utils.manage_review_users list
+docker compose --env-file .env.local logs -f worker | grep SUMMARY           # riepilogo di ogni domanda
+```
+
+Il servizio `setup` risulta terminato (`Exited (0)`) dopo l'avvio: è normale, perché prepara code e collection e poi si ferma.

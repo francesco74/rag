@@ -5,9 +5,10 @@ import 'package:web/web.dart' as web;
 
 import '../api.dart';
 
-/// Mostra il file originale in un iframe: il browser visualizza da solo PDF e
-/// immagini (zoom, pagine, ricerca) senza librerie aggiuntive. Per gli altri
-/// formati offre solo il download.
+/// Mostra il file originale: i PDF in un iframe, con gli strumenti del browser
+/// (zoom, pagine, ricerca); le immagini in un visore proprio, perché in un iframe
+/// il browser non offre né zoom né adattamento. Per gli altri formati offre solo
+/// il download.
 class OriginalViewer extends StatelessWidget {
   const OriginalViewer({super.key, required this.file});
 
@@ -73,7 +74,9 @@ class OriginalViewer extends StatelessWidget {
       header,
       Expanded(
         child: f.previewable
-            ? HtmlElementView(viewType: _register(f.url()))
+            ? f.mimeType.startsWith('image/')
+                ? _ImageViewer(key: ValueKey(f.url()), url: f.url())
+                : HtmlElementView(viewType: _register(f.url()))
             : _placeholder(
                 theme,
                 Icons.insert_drive_file_outlined,
@@ -106,5 +109,103 @@ class OriginalViewer extends StatelessWidget {
     if (bytes < 1024) return '$bytes B';
     if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(0)} KB';
     return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+  }
+}
+
+/// Immagine adattata allo spazio: rotella e pulsanti per lo zoom, trascinamento
+/// per spostarsi, rotazione per le scansioni storte.
+class _ImageViewer extends StatefulWidget {
+  const _ImageViewer({super.key, required this.url});
+
+  final String url;
+
+  @override
+  State<_ImageViewer> createState() => _ImageViewerState();
+}
+
+class _ImageViewerState extends State<_ImageViewer> {
+  static const _minScale = 0.5;
+  static const _maxScale = 12.0;
+
+  final _transform = TransformationController();
+  int _turns = 0;
+  Size _viewport = Size.zero;
+
+  @override
+  void dispose() {
+    _transform.dispose();
+    super.dispose();
+  }
+
+  /// Zoom attorno al centro della vista.
+  void _zoom(double factor) {
+    final current = _transform.value.getMaxScaleOnAxis();
+    final k = (current * factor).clamp(_minScale, _maxScale) / current;
+    final c = _viewport.center(Offset.zero);
+    _transform.value = Matrix4.identity()
+      ..translate(c.dx, c.dy)
+      ..scale(k)
+      ..translate(-c.dx, -c.dy)
+      ..multiply(_transform.value);
+  }
+
+  void _fit() => _transform.value = Matrix4.identity();
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Stack(children: [
+      Positioned.fill(
+        child: ColoredBox(
+          color: theme.colorScheme.surfaceContainerLowest,
+          child: LayoutBuilder(builder: (context, constraints) {
+            _viewport = constraints.biggest;
+            return InteractiveViewer(
+              transformationController: _transform,
+              minScale: _minScale,
+              maxScale: _maxScale,
+              boundaryMargin: const EdgeInsets.all(200),
+              child: SizedBox.fromSize(
+                size: _viewport,
+                child: RotatedBox(
+                  quarterTurns: _turns,
+                  child: Image.network(
+                    widget.url,
+                    fit: BoxFit.contain,
+                    filterQuality: FilterQuality.medium,
+                    loadingBuilder: (_, child, progress) =>
+                        progress == null ? child : const Center(child: CircularProgressIndicator()),
+                    errorBuilder: (_, _, _) => const Center(
+                        child: Text('Immagine non visualizzabile: usa "Scarica" per aprirla.')),
+                  ),
+                ),
+              ),
+            );
+          }),
+        ),
+      ),
+      Positioned(
+        right: 12,
+        bottom: 12,
+        child: Material(
+          elevation: 2,
+          borderRadius: BorderRadius.circular(8),
+          color: theme.colorScheme.surfaceContainerHigh,
+          child: Row(mainAxisSize: MainAxisSize.min, children: [
+            IconButton(tooltip: 'Riduci', icon: const Icon(Icons.remove), onPressed: () => _zoom(1 / 1.4)),
+            IconButton(tooltip: 'Ingrandisci', icon: const Icon(Icons.add), onPressed: () => _zoom(1.4)),
+            IconButton(tooltip: 'Adatta alla pagina', icon: const Icon(Icons.fit_screen_outlined), onPressed: _fit),
+            IconButton(
+              tooltip: 'Ruota',
+              icon: const Icon(Icons.rotate_right),
+              onPressed: () => setState(() {
+                _turns = (_turns + 1) % 4;
+                _fit();
+              }),
+            ),
+          ]),
+        ),
+      ),
+    ]);
   }
 }

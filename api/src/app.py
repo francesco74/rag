@@ -11,8 +11,14 @@ import json
 from common.db_logger import MySQLLogHandler, get_db_connection, init_db_pool
 
 from common.config import settings
+from common.utility import quiet_http_loggers
 from review_routes import auth_bp, bp as review_bp
 from files_routes import bp as files_bp
+from external_routes import bp as external_bp
+from admin_routes import bp as admin_bp
+from upload_routes import bp as upload_bp
+from external_ocr_routes import bp as external_ocr_bp
+from site_routes import bp as site_bp, request_hostname, site_for_host
 
 # ==============================================================================
 # CONFIGURATION & LOGGING
@@ -23,19 +29,36 @@ logging.basicConfig(
     handlers=[logging.StreamHandler()]
 )
 log = logging.getLogger("api_gateway")
+quiet_http_loggers()
 
 app = Flask(__name__)
+
+# Indirizzo reale del client dietro ingress e nginx (X-Forwarded-For), per i
+# log e per il limite dei tentativi di login per IP. Solo con proxy fidati
+# dichiarati: senza, X-Forwarded-For lo potrebbe scrivere il client stesso.
+if settings.trusted_proxy_hops > 0:
+    from werkzeug.middleware.proxy_fix import ProxyFix
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=settings.trusted_proxy_hops)
 
 CORS(app, origins=settings.allowed_origins)  # Enable CORS for frontend access
 
 # Revisione documentale (frontend web/revisione): rotte sotto /review con
 # autenticazione propria a utenti e password, vedi review_routes.py.
+# L'amministrazione (admin_routes.py) è sotto /review/admin: ne eredita controlli
+# ed errori; va agganciata prima di registrare il blueprint principale.
+review_bp.register_blueprint(admin_bp)
+review_bp.register_blueprint(upload_bp)
+review_bp.register_blueprint(external_ocr_bp)
 app.register_blueprint(review_bp)
 # Login/logout generici (/auth/...), usati dalla chat per i documenti riservati.
 app.register_blueprint(auth_bp)
 # Download dei documenti originali per chat e revisione: archivi pubblici
 # liberi, riservati solo per utenti autenticati, vedi files_routes.py.
 app.register_blueprint(files_bp)
+# API per i sistemi esterni: chiavi proprie, vedi external_routes.py.
+app.register_blueprint(external_bp)
+# Riconoscimento del sito della chat dal dominio, vedi site_routes.py.
+app.register_blueprint(site_bp)
 
 
 
@@ -54,13 +77,18 @@ except Exception as e:
     # Consider whether the app should crash here if the DB is critical
 
 
-UNPROTECTED_ROUTES = {"/health"}
+UNPROTECTED_ROUTES = {"/health", "/site", "/site/icon"}
+
+# Rotte che la chat chiama senza credenziali: le autorizza il sito (dominio) da
+# cui arriva la richiesta, limitato al suo archivio. La vecchia chiave resta
+# valida per chi chiama l'API da un programma; ai frontend non serve più.
+SITE_ROUTES = ("/config", "/chat", "/status/", "/feedback")
 
 # Le rotte di revisione non usano API_SECRET_KEY: ogni revisore si autentica
 # con le proprie credenziali e il blueprint verifica il suo token di sessione.
 # Lo stesso per i documenti: i link sono aperti dal browser, che non può
 # inviare la API key; l'accesso lo decide files_routes.py per archivio.
-SELF_AUTHENTICATED_PREFIXES = ("/review/", "/files/", "/auth/")
+SELF_AUTHENTICATED_PREFIXES = ("/review/", "/files/", "/auth/", "/external/")
 
 # ==============================================================================
 # MIDDLEWARE
@@ -80,8 +108,15 @@ def start_timer_and_add_id():
             and not request.path.startswith(SELF_AUTHENTICATED_PREFIXES)):
         auth_header = request.headers.get("Authorization", "")
         if not auth_header.startswith("Bearer ") or auth_header[7:] != settings.api_secret_key:
-            log.warning(f"[{request.request_id}] Unauthorized request to {request.path}")
-            return jsonify({"error": "Unauthorized"}), 401
+            site = site_for_host(request_hostname()) if request.path.startswith(SITE_ROUTES) else None
+            if not site:
+                log.warning(f"[{request.request_id}] Unauthorized request to {request.path}")
+                return jsonify({"error": "Unauthorized"}), 401
+            body = request.get_json(silent=True)
+            topic_id = body.get("topic_id") if isinstance(body, dict) else None
+            if topic_id and topic_id != site["topic_id"]:
+                log.warning(f"[{request.request_id}] Il sito '{site['hostname']}' ha chiesto l'archivio '{topic_id}'")
+                return jsonify({"error": "Forbidden"}), 403
 
 @app.after_request
 def log_response(response):
@@ -174,8 +209,12 @@ def get_config():
             for row in rows
         ]
 
+        # Si configura sul sito dell'archivio; senza sito (accesso con chiave) le serie si vedono.
+        cursor.execute("SELECT allow_subtopic_selection FROM chat_sites WHERE topic_id = %s", (topic_id,))
+        site = cursor.fetchone()
+
         return jsonify({
-            "allow_subtopic_selection": settings.allow_subtopic_selection,
+            "allow_subtopic_selection": bool(site["allow_subtopic_selection"]) if site else True,
             "sub_topics": sub_topics_data 
         }), 200
     finally:

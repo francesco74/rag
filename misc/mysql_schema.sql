@@ -272,6 +272,43 @@ CREATE TABLE IF NOT EXISTS review_status (
     KEY idx_status (topic_id, sub_topic_id, status)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
+CREATE TABLE IF NOT EXISTS external_api_keys (
+    -- Credenziali dei sistemi esterni (api/src/external_routes.py). Della chiave
+    -- si conserva solo l'hash SHA-256: è casuale e lunga, e non si può rileggere.
+    id            INT AUTO_INCREMENT PRIMARY KEY,
+    name          VARCHAR(100) NOT NULL,
+    key_hash      CHAR(64)     NOT NULL,
+    key_prefix    VARCHAR(16)  NOT NULL,
+    active        BOOLEAN      NOT NULL DEFAULT TRUE,
+    created_at    TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+    expires_at    TIMESTAMP    NULL DEFAULT NULL,
+    last_used_at  TIMESTAMP    NULL DEFAULT NULL,
+    UNIQUE KEY uq_external_name (name),
+    UNIQUE KEY uq_external_hash (key_hash)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+CREATE TABLE IF NOT EXISTS external_api_key_topics (
+    key_id    INT          NOT NULL,
+    topic_id  VARCHAR(100) NOT NULL,
+    PRIMARY KEY (key_id, topic_id),
+    CONSTRAINT fk_external_key FOREIGN KEY (key_id)
+        REFERENCES external_api_keys (id) ON DELETE CASCADE,
+    CONSTRAINT fk_external_topic FOREIGN KEY (topic_id)
+        REFERENCES topics (topic_id) ON DELETE CASCADE ON UPDATE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+CREATE TABLE IF NOT EXISTS review_login_failures (
+    -- Tentativi di login falliti di fila, per chiave: "user:<nome utente>"
+    -- (anche per nomi inesistenti) e, con TRUSTED_PROXY_HOPS > 0,
+    -- "ip:<indirizzo>". Arrivati al massimo la chiave è bloccata fino a
+    -- locked_until (LOGIN_LOCKOUT_SECONDS). Un login riuscito cancella le
+    -- righe; utils/manage_review_users.py unlock toglie un blocco a mano.
+    lkey            VARCHAR(160) NOT NULL PRIMARY KEY,
+    failed_count    INT          NOT NULL DEFAULT 0,
+    last_failed_at  TIMESTAMP    NULL DEFAULT NULL,
+    locked_until    TIMESTAMP    NULL DEFAULT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
 CREATE TABLE IF NOT EXISTS review_locks (
     -- Un documento aperto da un revisore è bloccato per gli altri finché il
     -- frontend rinnova il blocco; scade da solo dopo REVIEW_LOCK_TTL_SECONDS.
@@ -313,3 +350,55 @@ CREATE TABLE IF NOT EXISTS review_audit (
 -- Consigliato: l'elenco documenti del servizio di revisione filtra su
 -- parent_index = 0 per topic/sub_topic.
 -- CREATE INDEX idx_review_list ON parent_documents (topic_id, sub_topic_id, parent_index, created_at);
+
+-- Siti della chat: il frontend è unico e riconosce il sito dal nome di dominio.
+CREATE TABLE IF NOT EXISTS chat_sites (
+    hostname           VARCHAR(255) NOT NULL PRIMARY KEY,
+    topic_id           VARCHAR(100) NOT NULL,
+    name               VARCHAR(255) NOT NULL,
+    allow_date_filter  BOOLEAN      NOT NULL DEFAULT FALSE,
+    allow_subtopic_selection BOOLEAN NOT NULL DEFAULT TRUE,
+    active             BOOLEAN      NOT NULL DEFAULT TRUE,
+    welcome_it         MEDIUMTEXT,
+    welcome_en         MEDIUMTEXT,
+    -- Pulsanti della home: JSON [{label_it, label_en, url}]
+    home_buttons       TEXT,
+    icon               MEDIUMBLOB,
+    created_at         TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+    updated_at         TIMESTAMP    DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    -- Ogni archivio ha il suo sito.
+    CONSTRAINT uq_chat_sites_topic UNIQUE (topic_id),
+    CONSTRAINT fk_chat_sites_topic FOREIGN KEY (topic_id) REFERENCES topics (topic_id) ON UPDATE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+-- File caricati dal sito di amministrazione e loro stato nella pipeline.
+CREATE TABLE IF NOT EXISTS document_uploads (
+    id            INT          NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    topic_id      VARCHAR(100) NOT NULL,
+    sub_topic_id  VARCHAR(100) NOT NULL,
+    source        VARCHAR(700) NOT NULL,
+    file_name     VARCHAR(255) NOT NULL,
+    size_bytes    BIGINT       NOT NULL,
+    sha256        CHAR(64)     NOT NULL,
+    -- in_coda, da_inviare, in_lavorazione, indicizzato, errore
+    status        VARCHAR(20)  NOT NULL,
+    error         VARCHAR(1000),
+    uploaded_by   VARCHAR(100) NOT NULL,
+    created_at    TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+    updated_at    TIMESTAMP    DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    CONSTRAINT uq_document_uploads_source UNIQUE (source),
+    KEY idx_document_uploads_hash (topic_id, sub_topic_id, sha256),
+    KEY idx_document_uploads_updated (updated_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+-- Pagine trascritte con l'OCR per ogni documento: le aggiorna il converter.
+-- I documenti indicizzati prima di questa tabella non hanno riga: dato non noto.
+CREATE TABLE IF NOT EXISTS document_ocr (
+    source        VARCHAR(700) NOT NULL,
+    topic_id      VARCHAR(100) NOT NULL,
+    sub_topic_id  VARCHAR(100) NOT NULL,
+    ocr_pages     INT          NOT NULL,
+    total_pages   INT          NOT NULL,
+    updated_at    TIMESTAMP    DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    CONSTRAINT uq_document_ocr UNIQUE (source(500), topic_id, sub_topic_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;

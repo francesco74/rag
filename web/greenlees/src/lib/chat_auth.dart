@@ -19,8 +19,14 @@ class ChatUser {
 enum DocumentAccess { allowed, loginRequired, forbidden, notFound, unknown }
 
 class AuthException implements Exception {
-  AuthException(this.message);
+  AuthException(this.message, {this.statusCode = 0});
   final String message;
+
+  /// 0 = servizio non raggiungibile.
+  final int statusCode;
+
+  /// Troppi tentativi falliti: accesso bloccato per qualche minuto.
+  bool get isLocked => statusCode == 429;
 }
 
 /// Accesso facoltativo alla chat, per consultare i documenti degli archivi
@@ -65,7 +71,8 @@ class ChatAuth {
       data = jsonDecode(utf8.decode(res.bodyBytes)) as Map<String, dynamic>;
     } catch (_) {}
     if (res.statusCode != 200) {
-      throw AuthException((data['error'] ?? '').toString());
+      throw AuthException((data['error'] ?? '').toString(),
+          statusCode: res.statusCode);
     }
     user.value = ChatUser.fromJson(data['user'] as Map<String, dynamic>);
   }

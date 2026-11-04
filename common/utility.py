@@ -1,12 +1,17 @@
 import codecs
+import hashlib
 import logging
 import re
+import secrets
 from typing import Optional
 
 
 _SENTINEL_DATES_ISO = {"0001-01-01"}
 log = logging.getLogger("UTILITY")
 _WS_RE = re.compile(r'(?:&nbsp;|&#160;|\xa0|\s)+')
+
+# Lo scrive il converter, che ha chiavi e credenziali: l'API sa così se l'OCR esterno è utilizzabile.
+EXTERNAL_OCR_MARKER = "converter/ocr_esterno_disponibile"
 
 _SOAP_DECODE_HANDLER_NAME = "cp1252_fallback"
 
@@ -109,6 +114,17 @@ def decode_soap_response(raw_bytes: bytes) -> str:
     return decoded
 
 
+# Librerie che a INFO/DEBUG scrivono una riga per ogni richiesta HTTP (Qdrant,
+# Gemini, OpenAI...): con LOG_LEVEL=DEBUG erano la gran parte del log.
+NOISY_HTTP_LOGGERS = ("httpx", "httpcore")
+
+
+def quiet_http_loggers():
+    """Porta i logger HTTP a WARNING qualunque sia LOG_LEVEL: restano solo gli errori."""
+    for name in NOISY_HTTP_LOGGERS:
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
 def normalize_ws(text: str) -> str:
     """Collassa entità HTML di spaziatura e whitespace ripetuto in un solo
     spazio. Applicata al momento della query (rerank e rendering), NON in
@@ -121,7 +137,8 @@ def normalize_ws(text: str) -> str:
 _NBSP = r'(?:&nbsp;|&#160;|&#xa0;|\xa0)'
 _NBSP_RE = re.compile(_NBSP, re.IGNORECASE)
 _LEADING_RE = re.compile(rf'^(?:[ \t]|{_NBSP})*', re.IGNORECASE)
-_MARK_RE = re.compile(r'</?mark\s*>', re.IGNORECASE)
+# Evidenziato e sottolineato: li aggiunge l'estrazione del PDF, il Markdown non li ha.
+_MARK_RE = re.compile(r'</?(?:mark|u)\s*>', re.IGNORECASE)
 _GAP_RE = re.compile(r' {3,}')            # colonne allineate a spazi
 _SPACES_RE = re.compile(r' {2,}')
 _BLANK_LINES_RE = re.compile(r'\n{3,}')
@@ -143,7 +160,7 @@ def clean_ocr_text(text: str) -> str:
       - nelle righe di tabella Markdown (| ... |) gli spazi multipli sono solo
         imbottitura delle celle: uno;
       - spazi a fine riga: tolti; più di una riga vuota di fila: una;
-      - tag <mark> dell'OCR: tolti, il testo che racchiudono resta.
+      - tag <mark> e <u> dell'estrazione: tolti, il testo che racchiudono resta.
     I blocchi di codice (```) restano come sono.
     """
     if not text:
@@ -170,6 +187,54 @@ def clean_ocr_text(text: str) -> str:
             body = _SPACES_RE.sub(' ', _GAP_RE.sub('\t', body))
         out.append(indent + body)
     return _BLANK_LINES_RE.sub('\n\n', '\n'.join(out)).strip('\n')
+
+
+_MD_RULES = (
+    (re.compile(r'<!--.*?-->', re.DOTALL), ''),
+    (re.compile(r'^\s*```[^\n]*$', re.MULTILINE), ''),
+    (re.compile(r'!\[([^\]]*)\]\([^)]*\)'), r'\1'),            # immagini
+    (re.compile(r'\[([^\]]+)\]\([^)]*\)'), r'\1'),             # collegamenti
+    (re.compile(r'</?[a-zA-Z][^>\n]*>'), ''),                     # tag HTML
+    (re.compile(r'^[ \t]*\|?[ \t:|-]*-[ \t:|-]*\|?[ \t]*$', re.MULTILINE), ''),  # separatori di tabella
+    (re.compile(r'^[ \t]{0,3}#{1,6}[ \t]+', re.MULTILINE), ''),    # titoli
+    (re.compile(r'^[ \t]*(?:-{3,}|\*{3,}|_{3,})[ \t]*$', re.MULTILINE), ''),  # righe orizzontali
+    (re.compile(r'^[ \t]*>[ \t]?', re.MULTILINE), ''),             # citazioni
+    (re.compile(r'(\*\*|__)(?=\S)(.+?)(?<=\S)\1'), r'\2'),       # grassetto
+    (re.compile(r'(?<![\w*])\*(?=\S)(.+?)(?<=\S)\*(?![\w*])'), r'\1'),  # corsivo
+    (re.compile(r'(?<![\w_])_(?=\S)(.+?)(?<=\S)_(?![\w_])'), r'\1'),
+    (re.compile(r'~~(.+?)~~'), r'\1'),
+    (re.compile(r'`([^`\n]+)`'), r'\1'),
+)
+
+
+def is_permanent_error(error: Exception) -> bool:
+    """Richiesta rifiutata dal servizio (modello inesistente, chiave o dimensione errata): ritentare non serve."""
+    # Il provider Gemini incapsula ogni errore: lo stato è in quello originale.
+    error = error.__cause__ or error
+    status = getattr(error, "status_code", None)
+    if not isinstance(status, int):
+        status = getattr(error, "code", None)
+    return isinstance(status, int) and 400 <= status < 500 and status not in (408, 409, 425, 429)
+
+
+def markdown_to_text(markdown: str) -> str:
+    """Testo semplice dal Markdown: via la formattazione, le righe di tabella diventano colonne con tabulazioni."""
+    text = clean_ocr_text(markdown or "")
+    for pattern, replacement in _MD_RULES:
+        text = pattern.sub(replacement, text)
+    lines = []
+    for line in text.split("\n"):
+        stripped = line.strip()
+        if stripped.startswith("|") and stripped.endswith("|") and len(stripped) > 1:
+            line = "\t".join(cell.strip() for cell in stripped[1:-1].split("|"))
+        lines.append(line.rstrip())
+    return _BLANK_LINES_RE.sub("\n\n", "\n".join(lines)).strip()
+
+
+# Coda dei lavori di conversione: la usano API, converter e setup_rabbitmq, che
+# devono dichiararla con argomenti identici (RabbitMQ rifiuta le differenze).
+CONVERSION_QUEUE = "da-convertire-api"
+CONVERSION_QUEUE_ARGS = {"x-queue-type": "quorum"}
 
 
 def clean_iso_date(date_raw: Optional[str]) -> Optional[str]:
@@ -226,3 +291,9 @@ def split_protected_metadata(metadata: dict, protected_keys) -> tuple[dict, list
     clean = {k: v for k, v in metadata.items() if k not in protected_keys}
     dropped = sorted(k for k in metadata if k in protected_keys)
     return clean, dropped
+
+
+def new_external_key() -> tuple[str, str, str]:
+    """Nuova chiave delle API esterne: (chiave, hash da conservare, prefisso riconoscibile)."""
+    key = "rag_" + secrets.token_urlsafe(32)
+    return key, hashlib.sha256(key.encode()).hexdigest(), key[:12]

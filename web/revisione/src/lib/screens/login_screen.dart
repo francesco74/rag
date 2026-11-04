@@ -67,7 +67,7 @@ class _LoginScreenState extends State<LoginScreen> {
                             textAlign: TextAlign.center,
                             style: theme.textTheme.titleLarge),
                         const SizedBox(height: 4),
-                        Text('Accesso riservato ai revisori',
+                        Text('Accesso riservato',
                             textAlign: TextAlign.center,
                             style: theme.textTheme.bodyMedium?.copyWith(
                                 color: theme.colorScheme.onSurfaceVariant)),

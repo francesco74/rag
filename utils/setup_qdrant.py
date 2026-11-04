@@ -13,13 +13,13 @@ QDRANT_COLLECTION = "document_chunks"
 CACHE_COLLECTION = "semantic_cache"
 CONCEPT_COLLECTION = "conceptual_dictionary"  
 
-async def create_collection_if_missing(client, name, size=768):
+async def create_collection_if_missing(client, name):
     """Crea la collection solo se non esiste."""
     if not await client.collection_exists(name):
-        log.info(f"Creazione collection: {name}")
+        log.info(f"Creazione collection: {name} (dimensione {settings.embedding_dimension})")
         await client.create_collection(
             collection_name=name,
-            vectors_config=models.VectorParams(size=size, distance=models.Distance.COSINE)
+            vectors_config=models.VectorParams(size=settings.embedding_dimension, distance=models.Distance.COSINE)
         )
     else:
         log.info(f"Collection {name} già esistente.")

@@ -5,6 +5,7 @@ Safe for use with Celery/Multiprocessing
 
 import os
 import time
+import httpx
 import numpy as np
 from pathlib import Path
 from typing import List, Tuple, Optional
@@ -32,6 +33,8 @@ class RerankResult:
     index: int
     score: float
     text: str = ""
+    # Già normalizzata 0..1 dal server; None = score è un logit (ONNX).
+    probability: Optional[float] = None
 
 
 class ONNXReranker:
@@ -236,4 +239,52 @@ class ONNXReranker:
                 snippet = documents[res.index][:80].replace('\n', ' ')
                 log.debug(f"  Rank {i+1:2d} | Score: {res.score: .4f} | Index: {res.index:3d} | Text: {snippet}...")
             
+        return results
+
+
+class VLLMReranker:
+    """
+    Cross-encoder servito da vLLM (POST /rerank), per esempio sul DGX.
+
+    vLLM normalizza di norma i punteggi in 0..1, ma dipende da modello e versione.
+    Le soglie (MIN_PROB_THRESHOLD, EXTRA_PARENTS_MIN_PROB) lavorano su probabilità,
+    quindi una seconda sigmoide le falserebbe: un punteggio fuori da 0..1 indica
+    logit grezzi e la conversione la fa il chiamante, come per ONNX.
+
+    Thread-safe: i thread delle sotto-query condividono lo stesso client. Un errore
+    si propaga e retrieve_chunks ripiega sulla similarità vettoriale.
+    """
+
+    def __init__(self, base_url: str, model: str, api_key: Optional[str] = None,
+                 max_length: int = 512, timeout: float = 30.0):
+        self.url = base_url.rstrip("/") + "/rerank"
+        self.model = model
+        self.max_length = max_length
+        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+        self._client = httpx.Client(headers=headers, timeout=timeout)
+        log.info(f"Reranker vLLM: modello {model} su {self.url}")
+
+    def rerank(self, query: str, documents: List[str]) -> List[RerankResult]:
+        if not documents:
+            return []
+        started = time.time()
+        response = self._client.post(self.url, json={
+            "model": self.model,
+            "query": query,
+            "documents": documents,
+            "truncate_prompt_tokens": self.max_length,
+        })
+        response.raise_for_status()
+        items = response.json()["results"]
+        if sorted(item["index"] for item in items) != list(range(len(documents))):
+            raise ValueError(f"Risposta di {self.url}: {len(items)} risultati per {len(documents)} documenti")
+
+        scores = [float(item["relevance_score"]) for item in items]
+        normalized = all(0.0 <= score <= 1.0 for score in scores)
+        results = [
+            RerankResult(index=item["index"], score=score, probability=score if normalized else None)
+            for item, score in zip(items, scores)
+        ]
+        results.sort(key=lambda x: x.score, reverse=True)
+        log.info(f"Reranking vLLM di {len(documents)} documenti: {time.time() - started:.3f}s")
         return results

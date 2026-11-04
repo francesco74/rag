@@ -1,5 +1,6 @@
 *
 !.gitignore
+!.env.example
 !ingestion/
 !saga_extract/
 !detect_boilerplate/
@@ -22,6 +23,7 @@
 !direct/
 !web/revisione/
 !web/revisione/src/
+!web/chat/
 
 
 !ingestion/**
@@ -42,6 +44,7 @@
 !direct/**
 !utils/**
 !web/revisione/**
+!web/chat/**
 
 !web/greenlees/docker-entrypoint.sh
 !web/greenlees/Dockerfile
@@ -53,6 +56,7 @@
 !LICENSE
 !README.MD
 !README-TECH.MD
+!docker-compose.yml
 
 api/model_cache/
 ingestion/src/error/

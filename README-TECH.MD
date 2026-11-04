@@ -90,12 +90,30 @@ Frontend e accesso ai documenti (stessa API, stesso database):
 ### I Componenti Centrali:
 
 1. **API Gateway (`app.py` - Flask)**: Espone le interfacce REST della chat protette da Bearer Token (`API_SECRET_KEY`) e registra i blueprint `review` (`/review`), `auth` (`/auth`) e `files` (`/files`), che si autenticano da sé con le credenziali personali degli utenti (`SELF_AUTHENTICATED_PREFIXES`) e non accettano il token della chat. Gestisce il bootstrap caricando le rotte e i topic dinamici, convalida le richieste di chat, raccoglie i feedback e delega in modalità non bloccante la computazione pesante a Celery, rispondendo istantaneamente con un codice `202 Accepted` per l'avvio del polling.
-2. **Celery Worker (`worker.py`)**: Il vero motore di ricerca e generazione. Gestisce la trasformazione semantica della query, la ricerca ibrida parallela, il riordinamento Cross-Encoder locale, la generazione strutturata e l'auditing qualitativo della risposta (Grader).
+2. **Celery Worker (`worker.py` + pacchetto `rag/`)**: Il vero motore di ricerca e generazione. Gestisce la trasformazione semantica della query, la ricerca ibrida parallela, il riordinamento Cross-Encoder locale, la generazione strutturata e l'auditing qualitativo della risposta (Grader). `worker.py` contiene solo Celery (configurazione, inizializzazione dei client dopo il fork, task `rag_queue` e pulizia della cache); il motore è diviso in moduli in `api/src/rag/`:
+
+   | Modulo | Contenuto |
+   | --- | --- |
+   | `concepts` | Dizionario dei concetti: ricerca per nome e per similarità (`find_concepts`). |
+   | `rewriter` | Riscrittura della domanda e scomposizione in sotto-query (`transform_query`). |
+   | `retrieval` | `retrieve_chunks`: ricerca vettoriale e testuale in parallelo, rerank, selezione dei parent, posti extra; pool ONNX; profili di retry. |
+   | `keywords` | Ricerca testuale a combinazioni (`keyword_search`, `build_keyword_groups`, `plan_keyword_combinations`). |
+   | `boilerplate` | Frasi ripetute da togliere prima del rerank. |
+   | `mmr` | Diversificazione MMR negli slot liberi. |
+   | `context` | Core, budget, finestre e metadati del contesto (`build_context`). |
+   | `generation` | Generazione della risposta, citazioni, Grader (`generate_answer`, `evaluate_generation`). |
+   | `cache` | Cache semantica. |
+   | `metrics` | `rag_metrics` e auto-log dei fallimenti in `chat_feedback`. |
+   | `prompts` | Template dei prompt (`api/src/prompts/`) e prompt per topic da MySQL. |
+   | `jsonparse` | Parsing robusto del JSON degli LLM (`safe_json_parse`). |
+   | `state` | Client Qdrant condiviso: creato da `worker.py` dopo il fork, i moduli lo leggono sempre come `state.qdrant_client`. |
+
+   I test (`api/tests/test_retrieval.py`, `api/tests/test_task.py`) usano Qdrant in memoria, SQLite e LLM finti, e non richiedono servizi esterni.
 3. **Estrattore Massivo (`estrattore.py` - CLI / CronJob)**: Il ponte di collegamento con la suite Sicr@Web dell'Ente Locale. Invia richieste SOAP ai WS di ricerca ed estrazione, gestisce l'autenticazione applicativa ed estrae i flussi binari in sicurezza.
 4. **Wrapper Diretti (`direct.py` - CLI / Daemon)**: Scansiona la cartella di ingresso locale per i documenti caricati manualmente, mantiene la gerarchia delle cartelle convertendola in copie `topic_id/sub_topic_id` e pubblica gli eventi su RabbitMQ.
-5. **Convertitore Documentale (`converter.py` - Worker Async)**: Elabora asincronamente i PDF e le immagini. Esegue l'estrazione testuale nativa o l'OCR avanzato tramite Gemini Vision, con fallback asincrono su Google Cloud Vision API in caso di blocco delle policy di sicurezza.
+5. **Convertitore Documentale (`converter.py` - Worker Async)**: Elabora asincronamente i PDF e le immagini. Esegue l'estrazione testuale nativa o l'OCR con il modello scelto (`OCR_PROVIDER`). L'OCR esterno parte solo su richiesta del revisore.
 6. **Worker Ingest (`ingest.py` - Worker Async)**: Frammenta i documenti normalizzati in strutture gerarchiche Parent-Child, genera gli embedding vettoriali e popola in modo transazionale MySQL e Qdrant.
-7. **Revisione (`web/revisione` - Flutter Web, `review_routes.py`)**: Applicazione di correzione di testi, metadati e stato di revisione, con autenticazione, ruoli, archivi assegnati, storico e blocco in modifica (capitolo 6).
+7. **Sito di amministrazione (`/amministrazione/`, codice in `web/revisione` - Flutter Web, `review_routes.py`)**: Applicazione di correzione di testi, metadati e stato di revisione, con autenticazione, ruoli, archivi assegnati, storico e blocco in modifica (capitolo 6).
 8. **Download dei documenti (`files_routes.py` + nginx)**: Unico punto di accesso ai file originali per chat e revisione. L'API decide l'accesso (archivio pubblico o utente autenticato e abilitato) e delega l'invio del file a nginx tramite `X-Accel-Redirect`.
 
 ## 3. Pipeline d'Ingestione Documentale End-to-End
@@ -103,7 +121,7 @@ Frontend e accesso ai documenti (stessa API, stesso database):
 [Inbound Act] ──► SOAP laws_atto_plus ──► RAM Decrypt p7m ──► [Manifest JSON]
 │
 ▼ (RabbitMQ: da-convertire)
-[Normalizzazione .md] ◄── [Gemini Vision OCR / Google Vision] ◄── Estrazione Ibrida (converter.py)
+[Normalizzazione .md] ◄── [OCR_PROVIDER] ◄── Estrazione Ibrida (converter.py)
 │
 ▼ (RabbitMQ: da-indicizzare)
 [Parent Chunking] ──► MySQL (Atomic Delete-Insert)
@@ -131,16 +149,16 @@ I documenti caricati manualmente dagli utenti vengono elaborati tramite il modul
 
 ### Fase B: Estrazione Ibrida, OCR Avanzato e Fallback Dinamico (`converter.py`)
 
-Il modulo `converter.py` consuma il messaggio e avvia la normalizzazione testuale tramite un approccio asincrono guidato da `AsyncLimiter` (limite di 10 chiamate/minuto per Gemini):
+Il modulo `converter.py` consuma il messaggio e avvia la normalizzazione testuale tramite un approccio asincrono guidato da `AsyncLimiter` (`OCR_RATE_PER_MINUTE` chiamate al minuto, predefinito 10, OCR esterno compreso):
 
 1. **Analisi della Densità Informativa (PDF)**:
-   - Estrae il testo di ogni pagina tramite PyMuPDF (`fitz`), applicando una maschera di ritaglio basata su `CROP_OCR_LIMIT` per escludere intestazioni e piè di pagina fissi.
-   - Se il numero di caratteri nativi estratti da una pagina è inferiore a 50, la pagina viene catalogata come **scansionata** o **immagine** ed inviata alla pipeline OCR. Se è superiore, viene convertita direttamente in Markdown strutturato tramite `pymupdf4llm`.
-2. **Generazione OCR tramite Gemini Vision**:
-   - La pagina scansionata o l'immagine nativa viene passata a Gemini Vision (`OCR_MODEL_NAME`) per una trascrizione accurata forzata in formato Markdown.
-3. **Bypass dei Filtri di Sicurezza (Google Cloud Vision Fallback)**:
-   - Se la chiamata API a Gemini fallisce o viene bloccata a causa delle rigide policy di filtraggio (es. flag `SAFETY`, `RECITATION` o `BLOCKLIST`), il sistema cattura l'eccezione `ValueError` o `APIError`.
-   - Per evitare l'arresto della catena di elaborazione (bloccante per documenti amministrativi contenenti falsi positivi), il sistema avvia un **fallback sincrono e immediato su Google Cloud Vision API** (`document_text_detection`).
+   - Estrae il testo di ogni pagina tramite PyMuPDF, con una maschera di ritaglio basata sulla costante `CROP_OCR_LIMIT` (oggi 0: nessun ritaglio).
+   - Se una pagina ha meno di 50 caratteri nativi, oppure più di 1500 elementi vettoriali e meno di 1000 caratteri (`inspect_page`), viene catalogata come **scansionata** o **immagine** ed inviata alla pipeline OCR. Altrimenti viene convertita direttamente in Markdown strutturato tramite `pymupdf4llm`.
+2. **Generazione OCR con il modello scelto** (`converter/src/ocr_provider.py`):
+   - La pagina scansionata o l'immagine nativa viene passata al modello multimodale `OCR_MODEL_NAME` del fornitore `OCR_PROVIDER` (`gemini`, `openai`, `anthropic`, `mistral`, `local` con vLLM o Ollama) per una trascrizione in formato Markdown. Rate limit, sovraccarico e rete vengono ritentati (`OCR_MAX_ATTEMPTS`); gli altri errori no.
+3. **Nessun ripiego automatico**:
+   - Se il modello OCR scelto (`OCR_PROVIDER`, locale o no) fallisce, resta irraggiungibile o rifiuta la pagina, il documento va in errore e non viene inviato ad altri servizi.
+   - `POST /review/document/external-ocr` (`external_ocr_routes.py`, permesso sul testo e blocco del documento) trascrive tutte le pagine su richiesta del revisore: modello esterno se `OCR_EXTERNAL_FALLBACK=true`; se fallisce o rifiuta (es. `SAFETY`, `RECITATION`, `BLOCKLIST` di Gemini, anche con testo parziale), Google Cloud Vision (`document_text_detection`) se `OCR_VISION_FALLBACK=true` e le credenziali ci sono. Un solo lavoro per documento (`GET` per stato e testo, `DELETE` per togliere il risultato): non dipende dalla pagina, si ritrova riaprendo il documento e un altro clic non lo ripete. Il testo entra nell'editor solo con **Inserisci nell'editor** e resta una proposta fino al salvataggio.
 4. **Scrittura in Watch**:
    - I flussi testuali derivati vengono fusi e scritti come file `.md` abbinati a un nuovo JSON manifesto figlio nella cartella `data/watch`. Il sistema pubblica un evento persistente sulla coda `da-indicizzare`.
 
@@ -169,11 +187,12 @@ Il worker di ingestion consuma l'evento sulla coda `da-indicizzare`, applicando 
 
 ## 4. Motore di Retrieval Avanzato & Reranking
 
-Il processo di recupero e ordinamento dei contesti all'interno di `worker.py` supera i limiti della semplice ricerca semantica (K-Nearest Neighbors) implementando una catena di elaborazione avanzata.
+Il processo di recupero e ordinamento dei contesti (pacchetto `rag/`, soprattutto `retrieval.py`) supera i limiti della semplice ricerca semantica (K-Nearest Neighbors) implementando una catena di elaborazione avanzata.
 
 ### A. Trasformazione delle Query ed Espansione Semantica
 
-1. **Riscrittura Conversazionale**: Il modello configurato in `QUERY_REWRITER_MODEL_NAME`, invocato tramite l'adapter provider-agnostico, analizza fino a `MAX_HISTORY_ITEMS` messaggi di cronologia, riscrive la domanda in forma autoconsistente (`standalone_query`), la scompone in sotto-quesiti distinti (`search_queries`, fino a `MAX_SUB_QUERIES`), estrae parole chiave lessicali (`keywords`) e — per le domande aggregative — l'elenco delle entità che la risposta deve coprire (`coverage_targets`).
+1. **Riscrittura Conversazionale**: Il modello configurato in `QUERY_REWRITER_MODEL_NAME`, invocato tramite l'adapter provider-agnostico, analizza fino a `MAX_HISTORY_ITEMS` messaggi di cronologia, riscrive la domanda in forma autoconsistente (`standalone_query`), la scompone in sotto-quesiti distinti (`search_queries`, fino a `MAX_SUB_QUERIES`), estrae parole chiave lessicali (`keywords`), — per le domande aggregative — l'elenco delle entità che la risposta deve coprire (`coverage_targets`) e il periodo degli atti eventualmente indicato nella domanda (`date_range`).
+   - **Periodo nella domanda** (`date_range`, validato da `parse_date_range`): solo quando la domanda limita gli atti per data ("fatti nel 2025", "dal 2023", "nell'ultimo anno", con la data odierna passata nel prompt), non quando l'anno fa parte del tema ("DUP 2025-2027", "lavori previsti per il 2026"). Il worker lo applica come filtro `data` — lo stesso dei Filtri della chat — **includendo sempre gli atti senza data**; se l'utente ha già impostato un periodo nei Filtri vale il suo. Il periodo esce da `search_queries` e `keywords` (ci pensa il filtro), resta per tutti i tentativi ed entra nella chiave della cache semantica. Date non valide o incoerenti: nessun filtro. Log: `[DATE]`.
 2. **Lookup del Concetto (`find_concepts`)**: avviene **prima** del rewriter, che riceve i concetti trovati come vocabolario verificato. Due livelli, uniti senza doppioni:
    - **Per nome** (`get_concepts_by_name`): un concetto il cui nome compare nella domanda corrente come parola intera, senza distinzione di maiuscole (es. "Versilia", "Piana di Lucca"), è preso con certezza. Gli alias da soli **non** fanno scattare il concetto: "scuole di Viareggio" non deve allargarsi a tutti i comuni della Versilia. Il dizionario è piccolo e si legge per intero a ogni domanda.
    - **Per similarità** (`get_concepts_by_similarity`): embedding (`SEMANTIC_SIMILARITY`) del testo di lookup — la domanda corrente più gli ultimi due turni della conversazione, per agganciare i follow-up brevi — confrontato con la collezione Qdrant `conceptual_dictionary`. Vengono considerati **tutti** i concetti sopra `QDRANT_CONCEPT_THRESHOLD` (`0.80`) fino a `QDRANT_CONCEPT_MAX_HITS` (`3`). Il confronto misura il significato dell'intera frase: una domanda lunga o una cronologia estesa può restare sotto soglia anche se il nome del concetto è presente, ed è il motivo del livello per nome.
@@ -312,6 +331,7 @@ Il sottosistema di revisione vive nell'API (`review_routes.py`, `files_routes.py
 - **Revoca**: logout, cambio password e disattivazione incrementano `token_version`, invalidando subito tutte le sessioni dell'utente (nessuna blacklist). Ruoli, archivi e stato dell'utente si rileggono a ogni richiesta, quindi una revoca vale senza nuovo login.
 - **Trasporto**: la revisione usa l'header `Authorization: Bearer`; il login imposta inoltre il cookie HttpOnly `rag_session` (SameSite=Lax, `Secure` salvo `SESSION_COOKIE_SECURE=false`), accettato **solo** da `/files` e da `/auth/me|logout`. È così che la chat apre i documenti riservati senza mai leggere il token da JavaScript; le rotte `/review` che modificano dati non accettano il cookie (nessun rischio CSRF).
 - **Separazione dalla chat**: le rotte `/review`, `/auth` e `/files` non accettano `API_SECRET_KEY`, e il token di un revisore non apre `/chat`.
+- **Tentativi ripetuti** (`review_login_failures`): ogni nome utente provato — esistente o no, così il blocco non rivela quali nomi sono validi — ha un contatore dei fallimenti di fila; arrivato a `LOGIN_MAX_FAILURES` (5) il nome è bloccato per `LOGIN_LOCKOUT_SECONDS` (900 s) e il login risponde `429` con `retry_after`, **senza verificare la password**. Un login riuscito azzera i contatori; un fallimento più vecchio della durata del blocco non conta più. Con `TRUSTED_PROXY_HOPS > 0` lo stesso vale per l'IP del client con soglia `LOGIN_IP_MAX_FAILURES` (20), contro i tentativi su molti nomi diversi: l'IP reale è ricavato da `X-Forwarded-For` tramite `ProxyFix` (`app.py`), contando solo gli hop dichiarati. Per un nome inesistente la password viene comunque verificata contro un hash fittizio, così il tempo di risposta non rivela se il nome esiste. Il blocco si toglie a mano con `manage_review_users unlock`. Limite noto: chi conosce un nome utente può tenerlo bloccato sbagliando la password di proposito (il blocco è temporaneo, non permanente).
 
 ### B. Ruoli, permessi e archivi
 
@@ -326,7 +346,7 @@ Il sottosistema di revisione vive nell'API (`review_routes.py`, `files_routes.py
 | `utenti.gestione` | Elenco utenti, sblocco forzato dei documenti |
 | `topic.tutti` | Tutti gli archivi senza assegnazione |
 
-Ruoli: `lettore`, `correttore`, `catalogatore`, `validatore`, `revisore` (testo + metadati + stato), `admin` (tutto). Senza `topic.tutti` un utente lavora solo sugli archivi in `review_user_topics`: tutte le rotte sul singolo documento passano da `_doc_key_from_request`, che lo verifica.
+Ruoli: `revisore` (testo + stato), `archivista` (testo + metadati + stato), `admin` (tutto). Senza `topic.tutti` un utente lavora solo sugli archivi in `review_user_topics`: tutte le rotte sul singolo documento passano da `_doc_key_from_request`, che lo verifica.
 
 ### C. Rotte principali (`/review`)
 
@@ -371,6 +391,43 @@ I metadati vivono in `parent_documents.metadata` e nel payload dei chunk su Qdra
 ### H. Frontend `revisione`
 
 Flutter Web con configurazione a runtime (`docker-entrypoint.sh` → `env-config.js`: `REVIEW_API_URL`, `FILES_URL`, `BASE_HREF`, `PROJECT_NAME`), così la stessa immagine funziona sotto qualunque percorso e dominio. All'avvio verifica il `/health` dell'API (ricavato da `REVIEW_API_URL`: `/api/review` → `/api/health`) e mostra la pagina di manutenzione se non risponde. L'editor del testo lavora sui blocchi Markdown nella vista formattata (`MdDocument`, `RichBlockController`) riscrivendo solo il blocco modificato, con il sorgente disponibile su richiesta; il file originale è mostrato in un iframe accanto al testo. Installazione e variabili: `web/revisione/README.md`.
+
+### I. API per i sistemi esterni (`external_routes.py`)
+
+Sotto `/external/v1`, con chiavi proprie in `Authorization: Bearer`. Le chiavi si gestiscono con `python -m utils.manage_api_keys` (`add`, `allow`, `deny`, `revoke`, `enable`, `rotate`, `list`): si mostrano una sola volta e nel database (`external_api_keys`, `external_api_key_topics`) resta solo l'hash SHA-256. Sono separate dalla chiave della chat e dagli utenti della revisione.
+
+| Rotta | Funzione |
+| --- | --- |
+| `GET /topics` | Topic abilitati per la chiave, con le sottocategorie. |
+| `GET /topics/<topic>/documents` | Documenti del topic, a pagine (`page`, `page_size` fino a 200, `sub_topic_id`), con `id` e metadati utili. |
+| `GET /topics/<topic>/documents/<id>` | Testo del documento presente nel database (parent in ordine) e metadati. Il testo corretto in revisione compare a ingestione completata. |
+| `POST /convert` | `multipart/form-data`: `file` (pdf, png, jpg, jpeg, txt, md), `format=markdown\|text`. Risponde `202` con `job_id`. Basta una chiave valida, anche senza topic. |
+| `GET /convert/<job_id>` | Stato (`queued`, `running`, `completed`, `failed`) e, a fine lavoro, `content`. Visibile solo alla chiave che lo ha creato. |
+
+Un topic non abilitato risponde `403`. I metadati esposti escludono chiavi di sistema, `Header N`, campi con `_` iniziale, valori vuoti e i campi tecnici di `CONTEXT_METADATA_EXCLUDE`.
+
+La conversione è asincrona: l'API salva il file in `/data/conversions/<job_id>/` e accoda il lavoro su `da-convertire-api`; il converter usa la stessa pipeline dei documenti (testo nativo e OCR) e scrive `status.json` e `result.md`. Il file ricevuto si cancella a fine lavoro, i lavori dopo `CONVERT_RETENTION_HOURS`. Le conversioni usano solo il modello OCR configurato: se una pagina non riesce, il lavoro fallisce con `code: conversion_failed`. Le API esterne non hanno ancora un limite di richieste per chiave.
+
+### J. Siti della chat (`site_routes.py`)
+
+Il frontend della chat è unico (`web/chat`, immagine `rag/web-chat`, nessuna variabile d'ambiente): all'avvio chiama `GET /api/site` sullo stesso indirizzo e il backend, dal dominio, risponde con nome, archivio, testo della home, pulsanti e filtro per data (tabella `chat_sites`). Il frontend compone la home: testo, statistiche da `/config`, pulsanti, limiti del sistema. Testo e pulsanti passano da `common/site_home.py`, che tiene solo i tag ammessi e i link http/https; `POST /review/admin/translate` traduce con l'LLM di sistema senza salvare. Il favicon è in `GET /api/site/icon`. Un dominio sconosciuto riceve 404 e la pagina "sito non configurato".
+
+Un sito attivo autorizza `/config`, `/chat`, `/status` e `/feedback` senza chiave, solo per il proprio archivio (altro `topic_id` → 403). `API_SECRET_KEY` resta valida per le chiamate da programma, per qualunque archivio, ma non arriva più ai browser. Il dominio si legge dall'header `Host`, quindi i proxy devono conservarlo. Falsificarlo dà accesso solo a un altro sito pubblico. Ogni processo tiene un sito in memoria per `SITE_CACHE_SECONDS`.
+
+### K. Amministrazione (`admin_routes.py`)
+
+Rotte sotto `/review/admin` con il token di sessione, usate dalla schermata Amministrazione del sito di amministrazione:
+
+| Rotte | Permesso | Funzione |
+|---|---|---|
+| `POST /users`, `PUT /users/<id>`, `POST /users/<id>/password`, `POST /users/<id>/unlock`, `GET /roles` | `utenti.gestione` | Utenti, ruoli, archivi, sblocco del login. Password e disattivazione chiudono le sessioni. Deve restare un amministratore attivo. |
+| `/topics`, `/topics/<t>/subtopics` | `archivi.gestione` | Configurazione degli archivi esistenti e sottocategorie. Creazione ed eliminazione degli archivi solo da riga di comando (`utils/manage_topics.py`), rifiutata se ci sono documenti o siti. |
+| `/sites`, `/sites/<dominio>/icon` | `archivi.gestione` | Configurazione dei siti esistenti e favicon (PNG, max 1 MB). Creazione ed eliminazione solo da riga di comando (`utils/manage_sites.py`); dominio e archivio non si cambiano. |
+| `/keys`, `/keys/<id>/rotate` | `archivi.gestione` | Credenziali esterne. La chiave si mostra solo alla creazione e alla rigenerazione. |
+
+Caricamento (`upload_routes.py`, permesso `documenti.caricamento`: archivista e admin): `POST /review/uploads` controlla archivio, sottocategoria, tipo reale e duplicati, scrive file e manifest in `staging/` e pubblica su `da-convertire`, come `direct.py`; il campo `folder` conserva le sottocartelle in `file_name`, come fa `direct.py`. La tabella `document_uploads` registra autore e stato; converter e ingestione lo aggiornano per `source` con `common/upload_status.py`. Il converter registra in `document_ocr` le pagine trascritte con l'OCR su quelle totali di ogni documento; `GET /review/documents` le restituisce e accetta `ocr=si|no`. Per i documenti indicizzati prima di questa tabella il dato si stima dai file archiviati con `python rebuild_document_ocr.py` nel container del converter (senza `--apply` non scrive; non chiama modelli, non tocca le righe presenti e si può rilanciare). `GET /review/uploads?status=errori|in_lavorazione|indicizzati|tutti` restituisce i soli caricamenti dell'utente (`uploaded_by`), con gli indicizzati degli ultimi `INDEXED_DAYS` (3) giorni, e i conteggi per filtro; `errori` comprende `da_inviare`. `POST /review/uploads/<id>/retry` riporta i file di un documento in errore in `watch/` (testo già ricavato) o in `staging/`, lo rimette sulla coda giusta e ne toglie i messaggi dalle DLQ; ricaricare il file elimina invece i resti del tentativo fallito. L'ingestione non ritenta le richieste rifiutate (4xx, tranne 408, 409, 425 e 429): il file va subito in errore. L'API deve poter scrivere su `DATA_FOLDER/staging` e spostare i file fra le cartelle della pipeline, e i limiti `UPLOAD_MAX_MB` e `client_max_body_size` vanno tenuti allineati.
+
+Per un nuovo sito: creare l'archivio con `utils/manage_topics.py`, creare il sito col suo dominio con `utils/manage_sites.py`, far arrivare il dominio a nginx. Il deploy non cambia; in Kubernetes servono solo il record DNS e l'ingress col certificato (o un ingress e un certificato wildcard).
 
 ## 7. Schema del Database Relazionale (MySQL)
 
@@ -460,7 +517,9 @@ Il database adotta il motore di archiviazione **InnoDB** con set di caratteri **
 10. **`review_audit`**: Storico di ogni modifica.
     - `action` ENUM(`content`, `metadata`, `status`), utente, documento, `old_value` / `new_value` (testo completo, JSON dei metadati o stato), `note`, `details` (JSON).
     - _Indici_: `idx_doc (source, topic_id, sub_topic_id, created_at)`, `idx_user (username, created_at)`. È anche la fonte dello stato di re-indicizzazione (§6.D).
-11. **`review_locks`**: Blocco in modifica.
+11. **`external_api_keys`** e **`external_api_key_topics`**: Credenziali dei sistemi esterni e topic abilitati (§6.I).
+12. **`review_login_failures`**: Tentativi di login falliti, per chiave `user:<nome>` o `ip:<indirizzo>` (PK `lkey`); `failed_count`, `last_failed_at`, `locked_until` (vedi §6.A).
+13. **`review_locks`**: Blocco in modifica.
     - PK (`source`, `topic_id`, `sub_topic_id`); `user_id` (FK `ON DELETE CASCADE`), `username`, `display_name`, `acquired_at`, `expires_at`. Contano solo le righe con `expires_at > NOW()`: quelle scadute restano finché qualcuno non riprende il documento.
 
 Le modifiche allo schema dei database già installati sono in `misc/migrations/` (es. `review_locks.sql`, `parent_metadata_cleanup.sql`).
@@ -491,7 +550,7 @@ La configurazione centralizzata raccoglie e convalida le variabili d'ambiente ne
 | ------------------------------------- | -------------------------------------------------- | :------------ | --------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `http_timeout_seconds`                | `HTTP_TIMEOUT_SECONDS`                             | `int`         | `300`                                               | Soglia di blocco delle chiamate HTTP esterne verso Sicr@Web e le API LLM.                                                                                                       |
 | `data_folder`                         | `DATA_FOLDER`                                      | `Path`        | dir di `config.py`                                  | Radice locale per `staging`, `watch`, `archive`, `error`.                                                                                                                       |
-| `log_level`                           | `LOG_LEVEL`                                        | `str`         | `"INFO"`                                            | Verbosità del logger centralizzato. **`DEBUG` in produzione** genera un volume elevato (traffico httpcore, dump del contesto e delle risposte grezze).                          |
+| `log_level`                           | `LOG_LEVEL`                                        | `str`         | `"INFO"`                                            | Verbosità del logger centralizzato. `httpx` e `httpcore` restano sempre a WARNING (`quiet_http_loggers`). **`DEBUG` in produzione** genera comunque un volume elevato (dump del contesto e delle risposte grezze). |
 | `hostname`                            | `HOSTNAME`                                         | `str`         | `socket.gethostname()`                              | Identificativo dell'istanza nei log e nella tabella `system_logs`, per attribuire l'errore al container o alla macchina corretta in un'esecuzione distribuita.                  |
 | `broker_host` / `broker_port`         | `BROKER_HOST` / `BROKER_PORT`                      | `str` / `int` | `"rabbitmq-service.rag.svc.cluster.local"` / `5672` | Endpoint RabbitMQ per la pipeline di **ingestion**. Non usato da `worker.py`, che costruisce il broker Celery da Redis.                                                         |
 | `broker_username` / `broker_password` | `BROKER_USERNAME` / `BROKER_PASSWORD`              | `str`         | `"guest"` / `"guest"`                               | Credenziali RabbitMQ.                                                                                                                                                           |
@@ -501,6 +560,8 @@ La configurazione centralizzata raccoglie e convalida le variabili d'ambiente ne
 | `db_host` / `db_port`                 | `MYSQL_SERVICE_HOST` / `MYSQL_SERVICE_PORT`        | `str` / `int` | `"localhost"` / `3306`                              | Endpoint MySQL.                                                                                                                                                                 |
 | `db_user` / `db_pass` / `db_name`     | `MYSQL_USER` / `MYSQL_PASSWORD` / `MYSQL_DATABASE` | `str`         | `"raguser"` / `""` / `"rag_db"`                     | Credenziali e nome del database.                                                                                                                                                |
 | `allowed_origins`                     | `ALLOWED_ORIGINS`                                  | `list[str]`   | `["*"]`                                             | Origini CORS ammesse dall'API Gateway.                                                                                                                                          |
+| `upload_max_mb` | `UPLOAD_MAX_MB` | `int` | `100` | Limite di ogni file caricato dal sito di amministrazione. |
+| `site_cache_seconds` | `SITE_CACHE_SECONDS` | `int` | `10` | Per quanto un processo dell'API ricorda un sito della chat: una modifica o un sito nuovo arrivano a tutti i processi entro questo tempo. |
 | `api_secret_key`                      | `API_SECRET_KEY`                                   | `str`         | `"default_key"`                                     | Bearer Token a protezione degli endpoint Flask.                                                                                                                                 |
 | `api_llm_key`                         | `API_LLM_KEY`                                      | `str`         | `"default_key"`                                     | Chiave per Google GenAI (generazione ed embedding).                                                                                                                             |
 
@@ -522,19 +583,31 @@ La configurazione centralizzata raccoglie e convalida le variabili d'ambiente ne
 
 Le chiamate a modelli linguistici **non sono legate a un fornitore specifico**: passano tutte attraverso l'adapter `llm_provider.py`, che espone due sole operazioni (`generate_json`, `generate_text`) e normalizza dietro un'interfaccia unica le differenze fra gli SDK — eccezioni di rate-limit, modalità JSON nativa (assente su Anthropic, emulata via system prompt), `finish_reason` di troncamento (`MAX_TOKENS` su Gemini, `length` su OpenAI, `max_tokens` su Anthropic) e obbligatorietà di `max_tokens` (richiesto solo da Anthropic). Il provider si sceglie con `LLM_PROVIDER` e i tre ruoli — rewriter, generatore, grader — hanno ciascuno il proprio modello configurabile, potendo quindi differenziare capacità e costo per stadio della pipeline.
 
-I default puntano a modelli Gemini, ma sono appunto default: `worker.py` non contiene alcun riferimento a un fornitore nelle fasi di riscrittura, generazione e grading.
+I default puntano a modelli Gemini, ma sono appunto default: il codice del motore (`rag/`) non contiene alcun riferimento a un fornitore nelle fasi di riscrittura, generazione e grading.
 
-> **Unica eccezione: gli embedding.** La generazione dei vettori **non** passa dall'adapter. `worker.py` istanzia direttamente un `genai.Client` e usa la costante `EMBEDDING_MODEL = "gemini-embedding-001"`, non configurabile da variabile d'ambiente. La conseguenza pratica: impostare `LLM_PROVIDER=openai` o `anthropic` cambia rewriter, generatore e grader, ma il sistema **continua a richiedere una `API_LLM_KEY` valida per Google**, poiché senza embedding non c'è né ricerca vettoriale né cache semantica. Il vincolo è deliberato — gli embedding devono restare coerenti con quelli già indicizzati in Qdrant, e cambiarne il modello richiederebbe la re-ingestione completa del corpus — ma va tenuto presente in caso di migrazione di fornitore.
+> **Gli embedding hanno un adapter separato** (`common/embedding.py`), scelto con `EMBEDDING_PROVIDER`: `gemini` (default, `gemini-embedding-001` con `EMBEDDING_DIMENSION`) oppure `local` (`sentence-transformers`, modello `LOCAL_EMBEDDING_MODEL`, default `BAAI/bge-m3`, dimensione letta dal modello). A differenza di `LLM_PROVIDER` **non** è cambiabile senza conseguenze: i vettori già in Qdrant restano legati al modello con cui sono stati creati, quindi cambiare fornitore richiede una collection nuova e la re-ingestione completa del corpus, altrimenti le similarità diventano sbagliate in modo silenzioso. Con il default `gemini`, impostare `LLM_PROVIDER` su un altro fornitore cambia rewriter, generatore e grader ma richiede ancora una `API_LLM_KEY` valida per Google per gli embedding.
 >
 > Il reranking è invece **interamente locale** (ONNX Cross-Encoder, nessuna chiamata esterna) e quindi indipendente da qualunque provider.
 
 | Proprietà                     | Variabile d'Ambiente          | Tipo            | Default                    | Impatto                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | ----------------------------- | ----------------------------- | :-------------- | -------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `llm_provider`                | `LLM_PROVIDER`                | `str`           | `"gemini"`                 | Adapter attivo: `gemini` \| `openai` \| `anthropic`. Non influenza gli embedding.                                                                                                                                                                                                                                                                                                                                                 |
+| `llm_provider`                | `LLM_PROVIDER`                | `str`           | `"gemini"`                 | Adapter attivo: `gemini` \| `openai` \| `anthropic` \| `mistral` \| `local`. Non influenza gli embedding.                                                                                                                                                                                                                                                                                                                                                 |
 | `query_rewriter_model_name`   | `QUERY_REWRITER_MODEL_NAME`   | `str`           | `"gemini-3.1-flash-lite"`  | De-contestualizzazione e scomposizione delle query.                                                                                                                                                                                                                                                                                                                                                                               |
 | `answer_generator_model_name` | `ANSWER_GENERATOR_MODEL_NAME` | `str`           | `"gemini-3.5-flash"`       | Sintesi finale e composizione strutturata.                                                                                                                                                                                                                                                                                                                                                                                        |
 | `grader_model_name`           | `GRADER_MODEL_NAME`           | `str`           | `"gemini-3.1-flash-lite"`  | Auditing e grading delle risposte.                                                                                                                                                                                                                                                                                                                                                                                                |
-| `ocr_model_name`              | `OCR_MODEL_NAME`              | `str`           | `"gemini-3-flash-preview"` | Modello Vision per la trascrizione dei documenti non nativi (`converter.py`).                                                                                                                                                                                                                                                                                                                                                     |
+| `local_llm_backend` | `LOCAL_LLM_BACKEND` | `str` | `"ollama"` | Con `LLM_PROVIDER=local`: `ollama` (sviluppo, bassa concorrenza) \| `vllm` (produzione, continuous batching). |
+| `local_llm_host` | `LOCAL_LLM_HOST` | `str` | `"http://localhost:11434"` | Server Ollama. |
+| `local_vllm_base_url` / `local_vllm_api_key` | `LOCAL_VLLM_BASE_URL` / `LOCAL_VLLM_API_KEY` | `str` | `"http://localhost:8000/v1"` / vuota | Server vLLM (API compatibile OpenAI). |
+| `embedding_provider` | `EMBEDDING_PROVIDER` | `str` | `"gemini"` | `gemini` \| `openai` \| `mistral` \| `local` \| `vllm`. Cambiarlo richiede una collection nuova e la re-ingestione completa. |
+| `embedding_dimension` | `EMBEDDING_DIMENSION` | `int` | `768` | Dimensione dei vettori del modello di embedding (768 è quella del predefinito Gemini); deve coincidere con quella della collection. |
+| `local_embedding_model` / `local_embedding_device` | `LOCAL_EMBEDDING_MODEL` / `LOCAL_EMBEDDING_DEVICE` | `str` | `"BAAI/bge-m3"` / auto | Con `EMBEDDING_PROVIDER=local`: modello `sentence-transformers` e dispositivo (`cpu` \| `cuda` \| `mps`). |
+| `local_vllm_embedding_model` / `local_vllm_embedding_base_url` | `LOCAL_VLLM_EMBEDDING_MODEL` / `LOCAL_VLLM_EMBEDDING_BASE_URL` | `str` | vuoti | Con `EMBEDDING_PROVIDER=vllm`: modello e, se diverso, indirizzo dell'istanza vLLM. |
+| `ocr_provider` | `OCR_PROVIDER` | `str` | `"gemini"` | Fornitore dell'OCR: `gemini` \| `openai` \| `anthropic` \| `mistral` \| `local`. Indipendente da `LLM_PROVIDER`. |
+| `ocr_rate_per_minute` / `ocr_max_attempts` | `OCR_RATE_PER_MINUTE` / `OCR_MAX_ATTEMPTS` | `int` | `10` / `6` | Chiamate OCR al minuto e tentativi sugli errori transitori. |
+| `ocr_external_fallback` | `OCR_EXTERNAL_FALLBACK` | `bool` | `false` | Attiva il modello esterno per il comando del revisore; mai in automatico. Con `true` servono i tre parametri seguenti: se mancano, il comando dà errore e non passa a Vision. |
+| `ocr_external_provider` / `ocr_external_model_name` / `ocr_external_api_key` | `OCR_EXTERNAL_ALTERNATIVE_PROVIDER` / `OCR_EXTERNAL_ALTERNATIVE_MODEL_NAME` / `OCR_EXTERNAL_API_KEY` | `str` | vuoti | Fornitore (`gemini`, `openai`, `anthropic`, `mistral`), modello e chiave del modello esterno. |
+| `ocr_vision_fallback` | `OCR_VISION_FALLBACK` | `bool` | `true` | Ammette Google Cloud Vision nel comando del revisore, se il modello esterno fallisce o è spento e le credenziali ci sono; mai in automatico. |
+| `ocr_model_name`              | `OCR_MODEL_NAME`              | `str`           | `"gemini-3-flash-preview"` solo con `gemini`, altrimenti obbligatorio | Modello multimodale per la trascrizione dei documenti non nativi (`converter.py`).                                                                                                                                                                                                                                                                                                                                                     |
 | `answer_max_tokens`           | `ANSWER_MAX_TOKENS`           | `Optional[int]` | **`None`**                 | Tetto di output della risposta. **`None` = nessun tetto esplicito**: il parametro non viene passato al provider e vale il massimo del modello. Accetta vuoto, `0`, `auto`, `none`, `model` → `None`. Impostare un intero solo per una ragione specifica di lunghezza: **non** per contenere i costi, poiché i token si pagano a consumo e un troncamento costa _più_ di una risposta lunga (il primo tentativo è inutilizzabile). |
 | `grader_max_tokens`           | `GRADER_MAX_TOKENS`           | `int`           | `256`                      | Tetto di output del Grader. Qui il tetto **non** è una capability da inseguire ma un _circuit breaker_: l'output è strutturalmente corto (JSON di 4 campi) e senza limite un loop di ripetizione genererebbe fino al soffitto del modello.                                                                                                                                                                                        |
 | `answer_thinking_level`       | `ANSWER_THINKING_LEVEL`       | `str`           | `"LOW"`                    | Budget di ragionamento interno del generatore. Su Gemini è **condiviso** col budget di output: è la prima leva da abbassare quando i log segnalano un troncamento causato dal thinking.                                                                                                                                                                                                                                           |
@@ -549,7 +622,7 @@ I default puntano a modelli Gemini, ma sono appunto default: `worker.py` non con
 | `max_history_items`         | `MAX_HISTORY_ITEMS`         | `int`      | `20`                                           | Finestra di cronologia passata al Query Rewriter.                                                   |
 | `max_sub_queries`           | `MAX_SUB_QUERIES`           | `int`      | `5`                                            | Sotto-query massime generate dal Rewriter.                                                          |
 | `qdrant_semantic_size`      | `QDRANT_SEMANTIC_SIZE`      | `int`      | `30`                                           | Candidati per ricerca vettoriale (moltiplicato dai profili di retry).                               |
-| `qdrant_semantic_threshold` | `QDRANT_SEMANTIC_THRESHOLD` | `float`    | `0.60`                                         | Similarità minima sotto la quale i Child sono esclusi.                                              |
+| `qdrant_semantic_threshold` | `QDRANT_SEMANTIC_THRESHOLD` | `float`    | `0.60`                                         | Similarità minima sotto la quale i Child sono esclusi. Dipende dal modello di embedding e va rivista quando lo si cambia: con Qwen3-Embedding-4B testi senza relazione arrivano a ~0.55-0.58.                         |
 | `qdrant_syntactic_size`     | `QDRANT_SYNTACTIC_SIZE`     | `int`      | `20`                                           | Candidati unici estratti dalla ricerca full-text.                                                   |
 | `keyword_max_hits`          | `KEYWORD_MAX_HITS`          | `int`      | `1000`                                         | Ricerca testuale a combinazioni: le parole chiave (alias di un concetto in OR) si combinano in AND, prima le combinazioni più ampie; quelle con più pezzi di così sono troppo generiche e si saltano (es. "lavori" da sola no, "lavori + scuole + versilia" sì). |
 | `qdrant_concept_threshold`  | `QDRANT_CONCEPT_THRESHOLD`  | `float`    | `0.80`                                         | Soglia di attivazione dell'espansione dal dizionario concettuale.                                   |
@@ -561,11 +634,11 @@ I default puntano a modelli Gemini, ma sono appunto default: `worker.py` non con
 | `rerank_max_length`         | `RERANK_MAX_LENGTH`         | `int`      | `512`                                          | Token massimi del tokenizer del Reranker.                                                           |
 | `min_prob_threshold`        | `MIN_PROB_THRESHOLD`        | `float`    | `0.02`                                         | Soglia sigmoidea sui logit; almeno 2 candidati sono sempre mantenuti.                               |
 | `onnx_model_cache_path`     | `RERANKER_MODEL_PATH`       | `str`      | `"./model_cache/mmarco-mMiniLMv2-L12-H384-v1"` | Percorso di pesi e tokenizer del modello ONNX.                                                      |
+| `rerank_provider` / `rerank_model_name` / `local_vllm_rerank_base_url` / `rerank_timeout_seconds` | `RERANK_PROVIDER` / `RERANK_MODEL_NAME` / `LOCAL_VLLM_RERANK_BASE_URL` / `RERANK_TIMEOUT_SECONDS` | `str` / `float` | `onnx` / vuoto / vuoto / `30` | `onnx` usa il modello locale su CPU. `vllm` chiama `POST /rerank` di un cross-encoder su server (es. DGX), con le sotto-query tutte in parallelo: pool e thread ONNX non contano. URL vuoto: `LOCAL_VLLM_BASE_URL`. Se il server non risponde la ricerca ripiega sulla similarità vettoriale. Cambiando modello vanno ricontrollate `MIN_PROB_THRESHOLD` ed `EXTRA_PARENTS_MIN_PROB`. |
 | `parents_per_query`         | `PARENTS_PER_QUERY`         | `int`      | `4`                                            | Quota garantita di Parent per sotto-query.                                                          |
 | `extra_parents`             | `EXTRA_PARENTS`             | `bool`     | `true`                                         | Posti extra per pertinenza: oltre alla quota, parent giudicati pertinenti dal reranker, fino a `MAX_SUB_QUERIES × PARENTS_PER_QUERY` parent in tutto.|
 | `extra_parents_min_prob`    | `EXTRA_PARENTS_MIN_PROB`    | `float`    | `0.5`                                          | Probabilità minima del reranker perché un parent entri tra i posti extra.                           |
 | `mmr_similarity_threshold`  | `MMR_SIMILARITY_THRESHOLD`  | `float`    | `0.92`                                         | Similarità oltre la quale MMR penalizza un candidato ridondante (attivo solo con `mmr_lambda < 1`). |
-| `allow_subtopic_selection`  | `ALLOW_SUBTOPIC_SELECTION`  | `bool`     | `True`                                         | Abilita la selezione dei sotto-argomenti nel flusso d'interrogazione.                               |
 | `protected_keys`            | _N/A_                       | `set[str]` | costante                                       | Metadati riservati (`parent_id`, `topic_id`, …) protetti da sovrascrittura in ingestion.            |
 
 ### E. Budget di Contesto
@@ -594,7 +667,13 @@ I default puntano a modelli Gemini, ma sono appunto default: `worker.py` non con
 | _N/A_ (`review_routes.py`) | `REVIEW_SESSION_HOURS` | `int` | `10` | Durata di una sessione. |
 | `review_lock_ttl_seconds` | `REVIEW_LOCK_TTL_SECONDS` | `int` | `300` (min `60`) | Durata del blocco in modifica senza rinnovi; il frontend lo rinnova ogni terzo di questo tempo. |
 | `files_x_accel_prefix` | `FILES_X_ACCEL_PREFIX` | `str` | `""` | Prefisso della location `internal` di nginx per `X-Accel-Redirect` (in k8s `/_protected_files/`). Vuoto: i file li invia l'API. |
-| `files_login_url` | `FILES_LOGIN_URL` | `str` | `"/revisione/"` | Pagina di login proposta da `/files` a chi apre un documento riservato senza sessione. |
+| `files_login_url` | `FILES_LOGIN_URL` | `str` | `"/amministrazione/"` | Pagina di login proposta da `/files` a chi apre un documento riservato senza sessione. |
+| `convert_max_upload_mb` | `CONVERT_MAX_UPLOAD_MB` | `int` | `50` | Dimensione massima dei documenti da convertire. Va tenuta sotto `client_max_body_size` di nginx (`/api/`: 60 MB). |
+| `convert_retention_hours` | `CONVERT_RETENTION_HOURS` | `int` | `48` | Ore di conservazione dei lavori di conversione e delle trascrizioni esterne non usate. |
+| `login_max_failures` | `LOGIN_MAX_FAILURES` | `int` | `5` (min `1`) | Tentativi di login falliti di fila dopo cui un nome utente è bloccato. |
+| `login_lockout_seconds` | `LOGIN_LOCKOUT_SECONDS` | `int` | `900` (min `60`) | Durata del blocco; un fallimento più vecchio non conta più. |
+| `login_ip_max_failures` | `LOGIN_IP_MAX_FAILURES` | `int` | `20` (min `1`) | Come sopra, per indirizzo IP (su nomi diversi). Attivo solo con `TRUSTED_PROXY_HOPS > 0`. |
+| `trusted_proxy_hops` | `TRUSTED_PROXY_HOPS` | `int` | `0` | Proxy fidati davanti all'API che aggiungono `X-Forwarded-For` (in k8s di solito 2: ingress + nginx). Con 0 l'IP è quello della connessione, cioè del proxy, e il limite per IP resta spento. Un valore più alto del reale permette al client di scegliersi l'IP. |
 
 L'API deve inoltre montare in lettura/scrittura lo stesso volume dati di converter e ingest (`processed/`, `watch/`, `ingestion/error/`).
 
@@ -619,9 +698,9 @@ Elenco delle capacità che il sistema oggi non offre e che rappresenterebbero un
 
 ### 9.1 Indipendenza dal fornitore di embedding
 
-Riscrittura, generazione e grading sono già provider-agnostici (§8.C). La generazione dei vettori no: è vincolata a Google tramite una costante interna, quindi anche adottando integralmente un altro fornitore per gli LLM il sistema continua a richiedere credenziali Google.
+Riscrittura, generazione e grading sono provider-agnostici (§8.C), e anche gli embedding hanno ora un adapter (`EMBEDDING_PROVIDER`, §8.C). Manca una verifica automatica di coerenza fra modello configurato e collection esistente.
 
-Rendere l'embedding configurabile alla pari degli altri stadi consentirebbe di scegliere il fornitore in base a criteri propri — costo, residenza del dato, qualità sulla lingua italiana amministrativa — indipendentemente da quale modello genera le risposte. Per un ente pubblico la voce ha anche una valenza di sovranità del dato: gli embedding sono l'unica componente che richiede l'invio dell'**intero corpus** a un servizio esterno, non solo delle query.
+Poter scegliere liberamente il fornitore degli embedding consente di scegliere il fornitore in base a criteri propri — costo, residenza del dato, qualità sulla lingua italiana amministrativa — indipendentemente da quale modello genera le risposte. Per un ente pubblico la voce ha anche una valenza di sovranità del dato: gli embedding sono l'unica componente che richiede l'invio dell'**intero corpus** a un servizio esterno, non solo delle query.
 
 Va tenuto presente che la dimensione del vettore è fissata alla creazione della collection Qdrant: cambiare modello comporta la re-indicizzazione completa dell'archivio. La configurabilità va quindi accompagnata da una verifica di coerenza fra modello configurato e indice esistente.
 
@@ -729,10 +808,15 @@ Due avvertenze sulla lettura dei sintomi:
 
 - **Logging Centralizzato su Database (`system_logs`)**: handler `MySQLLogHandler` integrato con il logging standard. Le anomalie di livello `WARNING` o superiore (con stacktrace, file e riga) vengono inserite a database. Il recupero delle connessioni dal pool è protetto da un ping preventivo (`conn.ping(reconnect=True)`).
 - **CronJob orario di pulizia cache semantica (`prune_semantic_cache`)**: task periodico di Celery Beat che rimuove da `semantic_cache` i record con timestamp superiore a `MAX_AGE_SECONDS` (24 ore), prevenendo l'obsolescenza dei contesti normativi.
+- **Riepilogo per richiesta nel log**: ogni task della chat scrive, comunque finisca (anche su errore o eccezione), una riga INFO `[SUMMARY]` con esito, tentativi, parent, periodo applicato e il tempo di ogni fase (`rag/timing.py`):
+  ```
+  [SUMMARY] esito=ok tentativi=1 parent=24 totale=31.0s | concetti 0.5s · riscrittura 1.1s · embedding 0.6s · cache 0.0s · ricerca 19.6s (vettori+testo 0.4s, rerank 18.9s) · generazione 7.5s · grader 1.3s
+  ```
+  I tempi di ricerca e rerank (`t_search_s`, `t_rerank_s`) finiscono anche in `rag_metrics.attempts_detail`. Per seguire una singola richiesta in un log a livello DEBUG basta filtrare per il suo `task_id`.
 - **Metriche per richiesta (`rag_metrics`)**: ogni task registra tentativi, cache hit, parametri di retrieval effettivi e `missing_targets` del Grader. Sui volumi, questi ultimi distinguono un problema di **ingestion** (documenti mai indicizzati per un'entità) da uno di **soglie** (presenti ma non agganciati dal retrieval).
 - **Retry delle API con backoff e jitter**: le interazioni con API LLM, embedding e vector DB sono protette da `tenacity`. Su rate-limit (429) o indisponibilità (503) si applica un backoff esponenziale con jitter casuale, che impedisce fenomeni di risonanza tra pod concorrenti.
 - **Script di amministrazione** (`utils/`, da eseguire nel pod dell'API con `python -m utils.<nome>`):
-  - `manage_review_users`: utenti (`add`, `password`, `disable`/`enable`, `list`), ruoli (`grant`, `revoke`, `roles`), archivi assegnati (`allow`, `deny`) e accesso pubblico/riservato degli archivi (`topics`, `public`, `private`).
+  - `manage_review_users`: utenti (`add`, `password`, `disable`/`enable`, `list`), ruoli (`grant`, `revoke`, `roles`), archivi assegnati (`allow`, `deny`), accesso pubblico/riservato degli archivi (`topics`, `public`, `private`) e sblocco dopo tentativi di login ripetuti (`unlock <utente> [--ip …]`).
   - `reindex_topic <topic>`: ripassa dall'ingestione i documenti già indicizzati di un archivio, copiando i pacchetti da `processed/` a `watch/` e pubblicandoli su `da-indicizzare` a lotti (`--batch`, `--max-pending` sulla profondità della coda). Di default solo i documenti il cui testo **indicizzato** contiene ancora `&nbsp;` o `<mark>` (rilanciandolo riprende da dove era arrivato; `--all` per tutti); salta i pacchetti già in `watch/` (correzioni della revisione in sospeso) e segnala i documenti indicizzati senza pacchetto su disco. `--dry-run` per vedere cosa farebbe. Dopo una re-indicizzazione estesa conviene svuotare la cache semantica (`qdrant_semantic_cache_reset`).
 - **Upgrade Infrastrutturale**: i miglioramenti di velocità sotto carico massivo richiederanno hardware dedicato (GPU/TPU) per svincolare l'Ente dalle code di elaborazione condivise.
 
@@ -792,11 +876,11 @@ Ogni pacchetto risponde a un preciso requisito algoritmico ed è strettamente ac
 
 2. **Convertitore Documentale (`converter.py`)**:
 
-- `PyMuPDF (fitz)` & `pymupdf4llm`: Consentono l'estrazione ad altissime prestazioni del testo nativo dai documenti PDF dell'Ente e la conversione strutturata in Markdown pulito.
+- `PyMuPDF` & `pymupdf4llm`: Consentono l'estrazione ad altissime prestazioni del testo nativo dai documenti PDF dell'Ente e la conversione strutturata in Markdown pulito.
 - `pillow (PIL)`: Utilizzato per manipolare e inviare i buffer delle immagini estratte alle API di OCR.
-- `google-cloud-vision`: Gestisce il fallback sincrono per l'estrazione visiva in caso di blocco di Gemini a causa delle policy di sicurezza.
+- `google-cloud-vision`: Ultimo tentativo del comando "Trascrivi con OCR esterno" in revisione.
 - `aio-pika`: Consente il consumo asincrono dei messaggi e la notifica simultanea al modulo di ingestion.
-- `aiolimiter`: Limita e regola la frequenza di chiamata delle API di Gemini Vision per evitare errori di timeout o saturazione delle quote.
+- `aiolimiter`: Limita e regola la frequenza delle chiamate OCR per evitare errori di timeout o saturazione delle quote.
 
 3. **Ingestione Dati (`ingest.py`)**:
 
@@ -804,7 +888,7 @@ Ogni pacchetto risponde a un preciso requisito algoritmico ed è strettamente ac
 - `qdrant-client`: Gestisce la connessione asincrona ad alta velocità verso il database vettoriale Qdrant for il caricamento dei Child Chunks.
 - `typeguard`: Richiesto dal nuovo SDK di Google GenAI per la validazione dinamica dei tipi di dati passati in chiamata.
 
-4. **Motore RAG e Reranking Locale (`worker.py` e `reranker.py`)**:
+4. **Motore RAG e Reranking Locale (`worker.py`, `rag/` e `reranker.py`)**:
 
 - `celery` & `redis`: Gestiscono la ricezione asincrona, la prioritizzazione e il tracciamento dei task della coda RAG.
 - `onnxruntime`: Consente l'esecuzione efficiente e multi-thread limitata del modello Cross-Encoder locale, eliminando la necessità di GPU per il riordinamento di 25 candidati.

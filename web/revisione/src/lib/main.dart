@@ -1,7 +1,9 @@
 import 'package:flutter/material.dart';
+import 'package:flutter_localizations/flutter_localizations.dart';
+import 'package:flutter_quill/flutter_quill.dart';
 
 import 'api.dart';
-import 'screens/documents_screen.dart';
+import 'screens/home_shell.dart';
 import 'screens/login_screen.dart';
 import 'screens/maintenance_screen.dart';
 import 'screens/no_access_screen.dart';
@@ -19,6 +21,14 @@ class ReviewApp extends StatelessWidget {
     return MaterialApp(
       title: AppSettings.projectName,
       debugShowCheckedModeBanner: false,
+      locale: const Locale('it'),
+      supportedLocales: const [Locale('it')],
+      localizationsDelegates: const [
+        GlobalMaterialLocalizations.delegate,
+        GlobalWidgetsLocalizations.delegate,
+        GlobalCupertinoLocalizations.delegate,
+        FlutterQuillLocalizations.delegate,
+      ],
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFF1F5C99)),
         useMaterial3: true,
@@ -76,7 +86,7 @@ class _SessionGateState extends State<_SessionGate> {
             if (!user.can(Permission.read) || user.hasNoTopics) {
               return NoAccessScreen(user: user);
             }
-            return const DocumentsScreen();
+            return const HomeShell();
           },
         );
       },

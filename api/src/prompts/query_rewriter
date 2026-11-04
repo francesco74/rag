@@ -12,7 +12,7 @@ Analyze the <chat_history>, the <last_query>, and the <verified_concepts>.
 - If <verified_concepts> is empty, or a concept listed is clearly irrelevant to the query, ignore it and follow the general rules below.
 - CRITICAL: verified_concepts NEVER changes the user's intent. It only provides vocabulary. If the detected concept contradicts what the user asked, ignore the concept.
 
-You MUST output exclusively a valid JSON object with four keys:
+You MUST output exclusively a valid JSON object with five keys:
 
 - "standalone_query" (string): The user's intent rewritten as a self-contained question,
   resolving any pronouns or references to previous messages. Do NOT change geographical
@@ -40,6 +40,13 @@ You MUST output exclusively a valid JSON object with four keys:
 
 - "keywords" (array of strings): 1 to 5 highly significant keywords or proper nouns extracted from the query, excluding stop words, optimized for exact-match text search. When verified concepts apply, you may include their most relevant aliases.
 
+- "date_range" (object or null): the period in which the requested DOCUMENTS were adopted or dated, as {{"from": "YYYY-MM-DD" or null, "to": "YYYY-MM-DD" or null}}. Today's date is {today}. The system applies it as a filter on the document date (documents without a date are kept).
+    - Set it ONLY when the user restricts the documents by their own date: "atti del 2025", "fatti nel 2025", "approvate nel 2024", "dal 2023 in poi" (only "from"), "fino a marzo 2024" (only "to"), "nell'ultimo anno", "lo scorso mese" (relative to today).
+    - A year alone means from YYYY-01-01 to YYYY-12-31; a month means its first and last day.
+    - Leave it null when the year or period is part of the SUBJECT, not the date of the documents: "DUP 2025-2027", "bilancio di previsione 2026", "lavori previsti per il 2026", "PNRR 2021-2026", "anno scolastico 2024/2025". Leave it null when the query has no time reference. When in doubt, null: a wrong period would hide relevant documents.
+    - In follow-up questions, resolve the period from the history as you do for standalone_query ("e quelli del 2024?" → 2024).
+    - When date_range is set, do NOT repeat the period in "search_queries" or "keywords" (the filter already handles it); keep it in "standalone_query".
+
 Respond with ONLY the JSON object, no preamble, no markdown fences.
 </instructions>
 
@@ -56,7 +63,8 @@ Output:
     "Sono previsti lavori a Castelnuovo di Garfagnana?"
   ],
   "coverage_targets": [],
-  "keywords": ["lavori", "Castelnuovo", "Garfagnana"]
+  "keywords": ["lavori", "Castelnuovo", "Garfagnana"],
+  "date_range": null
 }}
 </example>
 
@@ -77,7 +85,8 @@ Output:
     "lavori previsti Coreglia"
   ],
   "coverage_targets": ["Castelnuovo di Garfagnana", "Barga", "Gallicano", "Piazza al Serchio", "Coreglia"],
-  "keywords": ["lavori", "Garfagnana"]
+  "keywords": ["lavori", "Garfagnana"],
+  "date_range": null
 }}
 </example>
 
@@ -99,7 +108,8 @@ Output:
     "novità lavoro agile Coreglia"
   ],
   "coverage_targets": ["Castelnuovo di Garfagnana", "Barga", "Gallicano", "Piazza al Serchio", "Coreglia"],
-  "keywords": ["lavoro agile", "telelavoro", "Garfagnana"]
+  "keywords": ["lavoro agile", "telelavoro", "Garfagnana"],
+  "date_range": null
 }}
 </example>
 
@@ -118,7 +128,8 @@ Output:
     "prevenzione infortuni misure aziendali"
   ],
   "coverage_targets": [],
-  "keywords": ["DVR", "valutazione rischi", "sicurezza"]
+  "keywords": ["DVR", "valutazione rischi", "sicurezza"],
+  "date_range": null
 }}
 </example>
 
@@ -135,7 +146,8 @@ Output:
     "evoluzione orari e flessibilità uffici pubblici"
   ],
   "coverage_targets": [],
-  "keywords": ["uffici pubblici", "modalità lavoro", "flessibilità"]
+  "keywords": ["uffici pubblici", "modalità lavoro", "flessibilità"],
+  "date_range": null
 }}
 </example>
 
@@ -154,7 +166,8 @@ Output:
     "aggiornamenti lavoro da remoto disposizioni"
   ],
   "coverage_targets": [],
-  "keywords": ["lavoro agile", "telelavoro", "aggiornamenti"]
+  "keywords": ["lavoro agile", "telelavoro", "aggiornamenti"],
+  "date_range": null
 }}
 </example>
 
@@ -171,7 +184,40 @@ Output:
     "Chi è il sindaco di Barga?"
   ],
   "coverage_targets": [],
-  "keywords": ["sindaco", "Barga"]
+  "keywords": ["sindaco", "Barga"],
+  "date_range": null
+}}
+</example>
+
+<example>
+<chat_history></chat_history>
+<last_query>Quali determine di affidamento di servizi sono state fatte nel 2024?</last_query>
+<verified_concepts></verified_concepts>
+Output:
+{{
+  "standalone_query": "Quali determine di affidamento di servizi sono state adottate nel 2024?",
+  "search_queries": [
+    "determine di affidamento di servizi"
+  ],
+  "coverage_targets": [],
+  "keywords": ["affidamento", "servizi", "determina"],
+  "date_range": {{"from": "2024-01-01", "to": "2024-12-31"}}
+}}
+</example>
+
+<example>
+<chat_history></chat_history>
+<last_query>Cosa prevede il DUP 2025-2027 per le scuole?</last_query>
+<verified_concepts></verified_concepts>
+Output:
+{{
+  "standalone_query": "Cosa prevede il DUP 2025-2027 per le scuole?",
+  "search_queries": [
+    "Cosa prevede il DUP 2025-2027 per le scuole?"
+  ],
+  "coverage_targets": [],
+  "keywords": ["DUP", "2025-2027", "scuole"],
+  "date_range": null
 }}
 </example>
 

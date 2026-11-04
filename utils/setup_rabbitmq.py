@@ -5,6 +5,7 @@ import time
 import requests
 from requests.auth import HTTPBasicAuth
 from common.config import settings
+from common.utility import CONVERSION_QUEUE, CONVERSION_QUEUE_ARGS
 from common.db_logger import MySQLLogHandler, get_db_connection, init_db_pool
 
 # ==============================================================================
@@ -76,6 +77,13 @@ TOPOLOGY = {
                 "x-queue-type": "quorum"  # <-- Trasforma la coda in Quorum Queue
             },
             "description": "Coda input ingest — HA Quorum + Routing su DLQ"
+        },
+        {
+            "name": CONVERSION_QUEUE,
+            "durable": True,
+            "auto_delete": False,
+            "arguments": CONVERSION_QUEUE_ARGS,
+            "description": "Lavori di conversione delle API esterne: gli errori finiscono nello stato del lavoro"
         },
     ],
     "bindings": [

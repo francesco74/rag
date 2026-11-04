@@ -3,13 +3,15 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 
 import '../api.dart';
-import '../settings.dart';
 import '../widgets/common.dart';
 import '../widgets/user_menu.dart';
 import 'document_screen.dart';
 
 class DocumentsScreen extends StatefulWidget {
-  const DocumentsScreen({super.key});
+  const DocumentsScreen({super.key, required this.active});
+
+  /// false mentre è aperta un'altra funzione: l'elenco si aggiorna solo se visibile.
+  final bool active;
 
   @override
   State<DocumentsScreen> createState() => _DocumentsScreenState();
@@ -19,11 +21,13 @@ class _DocumentsScreenState extends State<DocumentsScreen> {
   final _api = ReviewApi.instance;
   final _search = TextEditingController();
   Timer? _debounce;
+  Timer? _refresh;
 
   List<Topic> _topics = [];
   String? _topicId;
   String? _subTopicId;
   String? _status;
+  String? _ocr;
   int _page = 1;
   static const _pageSize = 25;
 
@@ -36,10 +40,27 @@ class _DocumentsScreenState extends State<DocumentsScreen> {
     super.initState();
     _loadTopics();
     _load();
+    // I documenti arrivano dall'ingestione anche mentre la pagina è aperta.
+    _refresh = Timer.periodic(const Duration(seconds: 15), (_) {
+      if (widget.active && !_loading && (ModalRoute.of(context)?.isCurrent ?? false)) _load(silent: true);
+    });
+  }
+
+  @override
+  void didUpdateWidget(DocumentsScreen oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.active && !oldWidget.active) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        _loadTopics();
+        _load();
+      });
+    }
   }
 
   @override
   void dispose() {
+    _refresh?.cancel();
     _debounce?.cancel();
     _search.dispose();
     super.dispose();
@@ -48,32 +69,47 @@ class _DocumentsScreenState extends State<DocumentsScreen> {
   Future<void> _loadTopics() async {
     try {
       final topics = await _api.topics();
-      if (mounted) setState(() => _topics = topics);
+      if (!mounted) return;
+      // Un filtro su un archivio o una sottocategoria eliminati non si può più mostrare.
+      final topic = topics.where((t) => t.id == _topicId);
+      final stale = _topicId != null && topic.isEmpty ||
+          _subTopicId != null && !topic.expand((t) => t.subTopics).any((s) => s.id == _subTopicId);
+      setState(() {
+        _topics = topics;
+        if (topic.isEmpty) _topicId = null;
+        if (stale) _subTopicId = null;
+      });
+      if (stale) _load(page: 1);
     } catch (e) {
       if (mounted) showError(context, e);
     }
   }
 
-  Future<void> _load({int? page}) async {
-    setState(() {
-      _loading = true;
-      _error = null;
-      if (page != null) _page = page;
-    });
+  /// [silent]: aggiornamento di fondo, senza barra di avanzamento né errori a schermo.
+  Future<void> _load({int? page, bool silent = false}) async {
+    if (!silent) {
+      setState(() {
+        _loading = true;
+        _error = null;
+        if (page != null) _page = page;
+      });
+    }
     try {
       final result = await _api.documents(
         topicId: _topicId,
         subTopicId: _subTopicId,
         query: _search.text.trim(),
         status: _status,
+        ocr: _ocr,
         page: _page,
         pageSize: _pageSize,
       );
-      if (mounted) setState(() => _result = result);
+      // Se nel frattempo è partita una ricerca, vale il suo risultato.
+      if (mounted && !(silent && _loading)) setState(() => _result = result);
     } catch (e) {
-      if (mounted) setState(() => _error = e.toString());
+      if (mounted && !silent) setState(() => _error = e.toString());
     } finally {
-      if (mounted) setState(() => _loading = false);
+      if (mounted && !silent) setState(() => _loading = false);
     }
   }
 
@@ -99,7 +135,7 @@ class _DocumentsScreenState extends State<DocumentsScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: Text(AppSettings.projectName),
+        title: const Text('Revisione documenti'),
         actions: [
           const UserMenu(),
           const SizedBox(width: 8),
@@ -171,6 +207,15 @@ class _DocumentsScreenState extends State<DocumentsScreen> {
                     setState(() => _subTopicId = v);
                     _load(page: 1);
                   },
+          ),
+          _dropdown<String?>(
+            label: 'Trascrizione',
+            value: _ocr,
+            items: const {null: 'Tutte', 'si': 'Con OCR', 'no': 'Senza OCR'},
+            onChanged: (v) {
+              setState(() => _ocr = v);
+              _load(page: 1);
+            },
           ),
           _dropdown<String?>(
             label: 'Stato',
@@ -270,7 +315,23 @@ class _DocumentsScreenState extends State<DocumentsScreen> {
             mainAxisAlignment: MainAxisAlignment.center,
             crossAxisAlignment: CrossAxisAlignment.end,
             children: [
-              StatusChip(d.status),
+              Row(mainAxisSize: MainAxisSize.min, children: [
+                if ((d.ocrPages ?? 0) > 0) ...[
+                  Tooltip(
+                    message: 'Pagine trascritte con l\'OCR: da controllare con più attenzione',
+                    child: Chip(
+                      visualDensity: VisualDensity.compact,
+                      materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                      avatar: const Icon(Icons.document_scanner_outlined, size: 14),
+                      label: Text('OCR ${d.ocrPages}/${d.totalPages}'),
+                      labelStyle: theme.textTheme.labelSmall,
+                      backgroundColor: theme.colorScheme.tertiaryContainer,
+                    ),
+                  ),
+                  const SizedBox(width: 6),
+                ],
+                StatusChip(d.status),
+              ]),
               // Chi ha il documento aperto conta più di chi ne ha cambiato
               // lo stato: una riga sola, la tile ha altezza fissa.
               if (d.lockedBy == null && d.statusUpdatedBy != null)

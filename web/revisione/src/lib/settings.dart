@@ -17,7 +17,7 @@ extension type EnvConfigJS._(JSObject _) implements JSObject {
 class AppSettings {
   // URL dell'API (app.py) seguito dal prefisso delle rotte di revisione.
   static const String _defaultApiUrl = 'http://127.0.0.1:5000/review';
-  static const String _defaultProjectName = 'Revisione documenti';
+  static const String _defaultProjectName = 'Amministrazione';
 
   /// Può essere assoluto (https://host/api/review) o relativo al sito da
   /// cui si apre la pagina (/api/review): in quel caso si completa con

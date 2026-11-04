@@ -38,11 +38,11 @@ import pika
 from flask import Blueprint, g, has_request_context, jsonify, request
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from qdrant_client import QdrantClient, models
-from werkzeug.security import check_password_hash
+from werkzeug.security import check_password_hash, generate_password_hash
 
 from common.config import settings
 from common.db_logger import MySQLLogHandler, get_db_connection
-from common.utility import split_protected_metadata
+from common.utility import EXTERNAL_OCR_MARKER, split_protected_metadata
 from common.review_permissions import (PERM_ALL_TOPICS, PERM_METADATA, PERM_READ,
                                        PERM_STATUS, PERM_TEXT, PERM_USERS, ROLE_PERMISSIONS,
                                        permissions_for)
@@ -428,6 +428,67 @@ def _log_duration(response):
     return response
 
 
+# ==============================================================================
+# PROTEZIONE DEL LOGIN DAI TENTATIVI RIPETUTI
+# ==============================================================================
+#
+# Contatori in review_login_failures, uno per chiave:
+#   "user:<nome>"  per ogni nome utente provato, ESISTENTE O NO: se si
+#                  bloccassero solo gli utenti esistenti, il blocco stesso
+#                  rivelerebbe quali nomi sono validi;
+#   "ip:<indirizzo>" solo con TRUSTED_PROXY_HOPS > 0 (IP reale del client).
+# Dopo il numero massimo di fallimenti di fila la chiave è bloccata per
+# LOGIN_LOCKOUT_SECONDS, anche con la password giusta; un login riuscito
+# azzera i contatori. Un fallimento più vecchio della durata del blocco non
+# conta più (la serie riparte da 1). Orari del database (NOW()).
+
+# Hash fittizio: per un utente inesistente si verifica comunque una password,
+# così il tempo di risposta non rivela se il nome esiste.
+_DUMMY_PASSWORD_HASH = generate_password_hash("utente-inesistente")
+
+
+def _login_keys(username):
+    keys = {f"user:{username.lower()}": settings.login_max_failures}
+    if settings.trusted_proxy_hops > 0 and request.remote_addr:
+        keys[f"ip:{request.remote_addr}"] = settings.login_ip_max_failures
+    return keys
+
+
+def _login_lock_remaining(db, keys):
+    """Secondi di blocco rimasti (il più lungo fra le chiavi), 0 se nessun blocco."""
+    rows = db.all(
+        "SELECT lkey, TIMESTAMPDIFF(SECOND, NOW(), locked_until) AS remaining FROM review_login_failures "
+        f"WHERE lkey IN ({', '.join(['%s'] * len(keys))}) AND locked_until > NOW()",
+        tuple(keys),
+    )
+    return max((max(1, int(r["remaining"] or 0)) for r in rows), default=0)
+
+
+def _register_login_failure(db, keys):
+    """Conta un fallimento per ogni chiave e blocca quelle arrivate al massimo. Ritorna le chiavi bloccate."""
+    locked = []
+    for key, limit in keys.items():
+        db.execute(
+            "INSERT INTO review_login_failures (lkey, failed_count, last_failed_at) VALUES (%s, 1, NOW()) "
+            "ON DUPLICATE KEY UPDATE "
+            "failed_count = IF(last_failed_at < NOW() - INTERVAL %s SECOND, 1, failed_count + 1), "
+            "last_failed_at = NOW()",
+            (key, settings.login_lockout_seconds),
+        )
+        if db.execute(
+            "UPDATE review_login_failures SET locked_until = NOW() + INTERVAL %s SECOND, failed_count = 0 "
+            "WHERE lkey = %s AND failed_count >= %s",
+            (settings.login_lockout_seconds, key, limit),
+        ):
+            locked.append(key)
+    return locked
+
+
+def _lock_message(seconds):
+    minutes = max(1, -(-seconds // 60))
+    return f"Troppi tentativi di accesso falliti: riprova fra {minutes} minut{'o' if minutes == 1 else 'i'}."
+
+
 @bp.route("/auth/login", methods=["POST"])
 def login():
     data = request.get_json(silent=True) or {}
@@ -436,20 +497,38 @@ def login():
     if not username or not password:
         raise ApiError(400, "Nome utente e password obbligatori")
 
+    keys = _login_keys(username)
     with Db() as db:
+        remaining = _login_lock_remaining(db, keys)
+        if remaining:
+            # Durante il blocco la password non si verifica nemmeno: un
+            # attacco non deve poter capire se un tentativo era giusto.
+            log.warning(f"Login di '{username}' da {request.remote_addr} rifiutato: "
+                        f"bloccato per tentativi ripetuti ancora {remaining}s")
+            raise ApiError(429, _lock_message(remaining), retry_after=remaining)
         user = db.one(
             "SELECT id, username, display_name, active, password_hash, token_version "
             "FROM review_users WHERE username = %s",
             (username,),
         )
-        if not user or not user["active"] or not check_password_hash(user["password_hash"], password):
+        password_ok = check_password_hash(user["password_hash"] if user else _DUMMY_PASSWORD_HASH, password)
+        if not user or not user["active"] or not password_ok:
             # Il motivo resta nel log, non nella risposta: chi prova le
             # credenziali non deve sapere se l'utente esiste.
             reason = ("utente inesistente" if not user
                       else "utente disattivato" if not user["active"]
                       else "password errata")
+            locked = _register_login_failure(db, keys)
+            db.commit()
             log.warning(f"Login fallito per '{username}' da {request.remote_addr}: {reason}")
+            if locked:
+                log.warning(f"Tentativi ripetuti: {', '.join(locked)} bloccati per "
+                            f"{settings.login_lockout_seconds}s")
+                raise ApiError(429, _lock_message(settings.login_lockout_seconds),
+                               retry_after=settings.login_lockout_seconds)
             raise ApiError(401, "Credenziali non valide")
+        db.execute(f"DELETE FROM review_login_failures WHERE lkey IN ({', '.join(['%s'] * len(keys))})",
+                   tuple(keys))
         _attach_roles(db, user)
         db.execute("UPDATE review_users SET last_login_at = NOW() WHERE id = %s", (user["id"],))
         db.commit()
@@ -536,6 +615,10 @@ def _safe_under(root: pathlib.Path, *parts: str) -> pathlib.Path:
         log.warning(f"Percorso fuori da {root} rifiutato: {parts}")
         raise ApiError(400, "Percorso non valido")
     return candidate
+
+
+def external_ocr_available() -> bool:
+    return (DATA_FOLDER / EXTERNAL_OCR_MARKER).exists()
 
 
 def original_file_path(topic_id, sub_topic_id, file_name) -> pathlib.Path | None:
@@ -745,6 +828,7 @@ def _load_document(db, source, topic_id, sub_topic_id, include_content=True):
         "metadata": _document_metadata(parents),
         "protected_keys": sorted(settings.protected_keys),
         "original_file": None,
+        "external_ocr_available": external_ocr_available(),
         "review_status": {
             "status": status["status"] if status else "da_revisionare",
             "note": status["note"] if status else None,
@@ -973,6 +1057,7 @@ def list_documents():
     sub_topic_id = request.args.get("sub_topic_id", "").strip()
     query = request.args.get("q", "").strip()
     status = request.args.get("status", "").strip()
+    ocr = request.args.get("ocr", "").strip()
     try:
         page = max(1, int(request.args.get("page", 1)))
         page_size = min(100, max(1, int(request.args.get("page_size", 25))))
@@ -1009,8 +1094,18 @@ def list_documents():
             where.append("s.status = %s")
             params.append(status)
 
+    # Senza riga il dato non è noto (documenti precedenti): non conta né come sì né come no.
+    if ocr == "si":
+        where.append("o.ocr_pages > 0")
+    elif ocr == "no":
+        where.append("o.ocr_pages = 0")
+    elif ocr:
+        raise ApiError(400, "Filtro OCR non valido")
+
     base = (
         "FROM parent_documents p "
+        "LEFT JOIN document_ocr o ON o.source = p.source AND o.topic_id = p.topic_id "
+        "AND o.sub_topic_id = p.sub_topic_id "
         "LEFT JOIN review_status s ON s.source = p.source AND s.topic_id = p.topic_id "
         "AND s.sub_topic_id = p.sub_topic_id "
         "LEFT JOIN review_locks l ON l.source = p.source AND l.topic_id = p.topic_id "
@@ -1023,7 +1118,7 @@ def list_documents():
         total = db.one(f"SELECT COUNT(*) AS n {base}", tuple(params))["n"]
         rows = db.all(
             f"SELECT p.source, p.topic_id, p.sub_topic_id, p.file_name, p.metadata, p.created_at, "
-            f"s.status, s.updated_by, s.updated_at AS status_updated_at, "
+            f"s.status, s.updated_by, s.updated_at AS status_updated_at, o.ocr_pages, o.total_pages, "
             f"l.user_id AS lock_user_id, COALESCE(l.display_name, l.username) AS locked_by "
             f"{base} ORDER BY p.created_at DESC, p.source LIMIT %s OFFSET %s",
             tuple(params) + (page_size, (page - 1) * page_size),
@@ -1048,6 +1143,8 @@ def list_documents():
             "status": r["status"] or "da_revisionare",
             "status_updated_by": r["updated_by"],
             "status_updated_at": _iso(r["status_updated_at"]),
+            "ocr_pages": r["ocr_pages"],
+            "total_pages": r["total_pages"],
             # Chi ha il documento aperto in revisione (null se nessuno)
             "locked_by": r["locked_by"],
             "locked_by_me": r["lock_user_id"] == g.user["id"],
@@ -1113,7 +1210,8 @@ def get_history_entry(audit_id):
 # ENDPOINT: MODIFICHE
 # ==============================================================================
 
-def _publish_to_ingest(manifest_rel: str):
+def publish_to_queue(queue: str, payload: dict, queue_arguments: dict | None = None):
+    """Messaggio persistente su una coda; con queue_arguments la dichiara se manca."""
     params = pika.ConnectionParameters(
         host=settings.broker_host,
         port=settings.broker_port,
@@ -1125,15 +1223,21 @@ def _publish_to_ingest(manifest_rel: str):
     connection = pika.BlockingConnection(params)
     try:
         channel = connection.channel()
+        if queue_arguments is not None:
+            channel.queue_declare(queue=queue, durable=True, arguments=queue_arguments)
         channel.basic_publish(
             exchange="",
-            routing_key=INGEST_QUEUE,
-            body=json.dumps({"json_manifest_path": manifest_rel}).encode(),
+            routing_key=queue,
+            body=json.dumps(payload).encode(),
             properties=pika.BasicProperties(delivery_mode=2, content_type="application/json"),
         )
-        log.debug(f"RabbitMQ: pubblicato su '{INGEST_QUEUE}' json_manifest_path={manifest_rel}")
+        log.debug(f"RabbitMQ: pubblicato su '{queue}': {payload}")
     finally:
         connection.close()
+
+
+def _publish_to_ingest(manifest_rel: str):
+    publish_to_queue(INGEST_QUEUE, {"json_manifest_path": manifest_rel})
 
 
 @bp.route("/document/content", methods=["PUT"])

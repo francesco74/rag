@@ -30,8 +30,14 @@ _LOCK_UPSERT = (
 def translate(sql):
     sql = sql.replace("%s", "?")
     sql = re.sub(r"NOW\(\) \+ INTERVAL \? SECOND", "datetime(CURRENT_TIMESTAMP, '+' || ? || ' seconds')", sql)
+    sql = re.sub(r"NOW\(\) - INTERVAL \? SECOND", "datetime(CURRENT_TIMESTAMP, '-' || ? || ' seconds')", sql)
+    sql = sql.replace("TIMESTAMPDIFF(SECOND, NOW(), locked_until)",
+                      "CAST(ROUND((julianday(locked_until) - julianday(CURRENT_TIMESTAMP)) * 86400) AS INTEGER)")
+    sql = re.sub(r"\bIF\(", "iif(", sql)
     sql = sql.replace("NOW()", "CURRENT_TIMESTAMP").replace(" FOR UPDATE", "")
     sql = sql.replace("AS CHAR)", "AS TEXT)").replace("CHAR_LENGTH(", "LENGTH(")
+    if "INSERT INTO review_login_failures" in sql:
+        sql = sql.replace("ON DUPLICATE KEY UPDATE", "ON CONFLICT(lkey) DO UPDATE SET")
     if "INSERT INTO review_locks" in sql:
         sql = re.sub(r"ON DUPLICATE KEY UPDATE .*", _LOCK_UPSERT, sql)
     sql = re.sub(r"ON DUPLICATE KEY UPDATE .*",
@@ -65,6 +71,14 @@ class Conn:
 
 
 import common.db_logger as dbl
+from common import review_permissions as rp
+# Ruoli solo di prova, con un permesso ciascuno: i controlli delle singole rotte vanno
+# provati anche per combinazioni che i ruoli reali (revisore, archivista, admin) non hanno.
+rp.ROLE_PERMISSIONS.update({
+    "lettore": frozenset({rp.PERM_READ}),
+    "correttore": frozenset({rp.PERM_READ, rp.PERM_TEXT}),
+    "validatore": frozenset({rp.PERM_READ, rp.PERM_STATUS}),
+})
 dbl.init_db_pool = lambda: None
 dbl.get_db_connection = lambda: Conn()
 
@@ -80,10 +94,13 @@ CREATE TABLE review_users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT U
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, last_login_at TIMESTAMP);
 CREATE TABLE review_user_roles (user_id INT, role TEXT, PRIMARY KEY(user_id, role));
 CREATE TABLE review_user_topics (user_id INT, topic_id TEXT, PRIMARY KEY(user_id, topic_id));
+CREATE TABLE document_ocr (source TEXT, topic_id TEXT, sub_topic_id TEXT, ocr_pages INT, total_pages INT);
 CREATE TABLE review_status (source TEXT, topic_id TEXT, sub_topic_id TEXT, status TEXT, note TEXT,
   updated_by TEXT, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(source, topic_id, sub_topic_id));
 CREATE TABLE review_locks (source TEXT, topic_id TEXT, sub_topic_id TEXT, user_id INT, username TEXT,
   display_name TEXT, acquired_at TIMESTAMP, expires_at TIMESTAMP, PRIMARY KEY(source, topic_id, sub_topic_id));
+CREATE TABLE review_login_failures (lkey TEXT PRIMARY KEY, failed_count INT DEFAULT 0,
+  last_failed_at TIMESTAMP, locked_until TIMESTAMP);
 CREATE TABLE review_audit (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   user_id INT, username TEXT, action TEXT, source TEXT, topic_id TEXT, sub_topic_id TEXT,
   old_value TEXT, new_value TEXT, note TEXT, details TEXT);
@@ -94,13 +111,14 @@ INSERT INTO sub_topics VALUES ('delibere', 'giunta', 'Giunta');
 """)
 from werkzeug.security import generate_password_hash
 USERS = {  # username -> (ruoli, archivi assegnati)
-    "mrossi": (["revisore"], ["attiprovincia"]),
+    "mrossi": (["archivista"], ["attiprovincia"]),
     "lettore1": (["lettore"], ["attiprovincia"]),
     "multi": (["correttore", "validatore"], ["attiprovincia"]),   # più ruoli: testo e stato, non metadati
     "admin1": (["admin"], []),                                    # admin: tutti gli archivi senza assegnazione
     "senzaruoli": ([], ["attiprovincia"]),
     "solodelibere": (["revisore"], ["delibere"]),
     "senzatopic": (["revisore"], []),
+    "bersaglio": (["lettore"], ["attiprovincia"]),                # tentativi di login ripetuti
 }
 for i, (username, (roles, topics)) in enumerate(USERS.items(), start=1):
     c.execute("INSERT INTO review_users (id, username, password_hash) VALUES (?, ?, ?)",
@@ -171,8 +189,44 @@ check(r.status_code == 401, "la API key della chat non apre /review")
 r = cl.post("/auth/login", json={"username": "mrossi", "password": "sbagliata"}); check(r.status_code == 401, "password errata -> 401")
 r = cl.post("/auth/login", json={"username": "mrossi", "password": "passwordlunga"}); check(r.status_code == 200, "login")
 H = {"Authorization": "Bearer " + r.json["token"]}
-check(r.json["user"]["roles"] == ["revisore"] and "documenti.testo" in r.json["user"]["permissions"]
+check(r.json["user"]["roles"] == ["archivista"] and "documenti.testo" in r.json["user"]["permissions"]
       and "utenti.gestione" not in r.json["user"]["permissions"], "login restituisce ruoli e permessi")
+
+
+# --- protezione del login dai tentativi ripetuti ---
+cn0 = sqlite3.connect(DB_PATH)
+def try_login(username, password, ip="10.0.0.1"):
+    return cl.post("/auth/login", json={"username": username, "password": password},
+                   environ_base={"REMOTE_ADDR": ip})
+codes = [try_login("bersaglio", "sbagliata").status_code for _ in range(5)]
+check(codes == [401, 401, 401, 401, 429], f"5 password errate: al quinto tentativo blocco ({codes})")
+r = try_login("bersaglio", "passwordlunga")
+check(r.status_code == 429 and "token" not in r.json and r.json["retry_after"] > 800
+      and "riprova fra 15 minuti" in r.json["error"], "durante il blocco anche la password giusta è rifiutata")
+codes = [try_login("fantasma", "x").status_code for _ in range(5)]
+check(codes == [401, 401, 401, 401, 429], "utente inesistente: stesso comportamento, il blocco non rivela chi esiste")
+check(try_login("BERSAGLIO", "passwordlunga").status_code == 429, "il blocco non dipende dalle maiuscole")
+cn0.execute("UPDATE review_login_failures SET locked_until = datetime(CURRENT_TIMESTAMP, '-1 seconds')"); cn0.commit()
+r = try_login("bersaglio", "passwordlunga")
+check(r.status_code == 200, "blocco scaduto: si entra")
+check(cn0.execute("SELECT COUNT(*) FROM review_login_failures WHERE lkey = 'user:bersaglio'").fetchone()[0] == 0,
+      "login riuscito: contatore azzerato")
+try_login("bersaglio", "sbagliata")
+cn0.execute("UPDATE review_login_failures SET last_failed_at = datetime(CURRENT_TIMESTAMP, '-2000 seconds')"); cn0.commit()
+try_login("bersaglio", "sbagliata")
+check(cn0.execute("SELECT failed_count FROM review_login_failures WHERE lkey = 'user:bersaglio'").fetchone()[0] == 1,
+      "un fallimento più vecchio del blocco non conta più")
+# per IP, solo con proxy fidati dichiarati
+check(cn0.execute("SELECT COUNT(*) FROM review_login_failures WHERE lkey LIKE 'ip:%'").fetchone()[0] == 0,
+      "senza TRUSTED_PROXY_HOPS nessun contatore per IP")
+object.__setattr__(ra.settings, "trusted_proxy_hops", 1)
+object.__setattr__(ra.settings, "login_ip_max_failures", 3)
+codes = [try_login(f"spray{i}", "x", ip="10.9.9.9").status_code for i in range(3)]
+check(codes == [401, 401, 429], f"stesso IP, nomi diversi: blocco dell'IP al terzo ({codes})")
+check(try_login("lettore1", "passwordlunga", ip="10.9.9.9").status_code == 429, "IP bloccato: rifiutato anche un utente valido")
+check(try_login("lettore1", "passwordlunga", ip="10.9.9.8").status_code == 200, "da un altro IP si entra")
+object.__setattr__(ra.settings, "trusted_proxy_hops", 0)
+cn0.execute("DELETE FROM review_login_failures"); cn0.commit()
 
 
 def login(username):
@@ -298,7 +352,7 @@ check(cl.delete("/document/lock", headers=HA0, query_string={**KEY, "force": "1"
 check(cl.post("/document/lock", headers=HM, json=KEY).json["lock"]["held_by_me"], "poi il documento si riprende")
 
 # --- ruoli e permessi ---
-check(cl.get("/users", headers=H).status_code == 403, "revisore: /users -> 403")
+check(cl.get("/users", headers=H).status_code == 403, "archivista: /users -> 403")
 HA, _ = login("admin1")
 u = {i["username"]: i["roles"] for i in cl.get("/users", headers=HA).json["items"]}
 check(u["multi"] == ["correttore", "validatore"] and u["senzaruoli"] == [], "admin: /users con i ruoli")
@@ -379,7 +433,7 @@ u = {i["username"]: i["topics"] for i in cl.get("/users", headers=HA).json["item
 check(u["solodelibere"] == ["delibere"] and u["admin1"] is None, "/users con gli archivi")
 
 bm = browser("mrossi")
-check(bm.get(ATTO).status_code == 200, "revisore: file del proprio archivio riservato")
+check(bm.get(ATTO).status_code == 200, "archivista: file del proprio archivio riservato")
 cn.execute("DELETE FROM review_user_topics WHERE user_id = 1"); cn.commit()
 check(cl.get("/document", headers=H, query_string=KEY).status_code == 403, "archivio tolto: vale subito, senza nuovo login")
 check(bm.get(ATTO).status_code == 403, "file di un archivio tolto -> 403")
@@ -391,7 +445,7 @@ r = anon.get(GIUNTA)
 check(r.status_code == 200 and r.data.startswith(b"\xff\xd8") and r.headers["Cache-Control"].startswith("public"),
       "archivio pubblico: download anonimo")
 r = anon.get(ATTO, headers={"Accept": "text/html"})
-check(r.status_code == 401 and b"Accedi" in r.data and b"/revisione/" in r.data,
+check(r.status_code == 401 and b"Accedi" in r.data and b"/amministrazione/" in r.data,
       "archivio riservato, anonimo dal browser -> 401 con link al login")
 r = anon.get(ATTO, headers={"Accept": "application/json"})
 check(r.status_code == 401 and "riservato" in r.json["error"], "archivio riservato, anonimo da client -> 401 JSON")
@@ -520,6 +574,22 @@ check(chat.get("/auth/me").status_code == 401 and chat.get(ATTO).status_code == 
 check(browser().post("/auth/login", json={"username": "mrossi", "password": "sbagliata"}).status_code == 401,
       "/auth/login con password errata -> 401")
 
+# --- documenti passati dall'OCR
+listed = cl.get("/documents", headers=HA).json
+first, second = listed["items"][:2]
+ocr_db = sqlite3.connect(DB_PATH)
+ocr_db.execute("INSERT INTO document_ocr VALUES (?, ?, ?, 2, 4)", (first["source"], first["topic_id"], first["sub_topic_id"]))
+ocr_db.execute("INSERT INTO document_ocr VALUES (?, ?, ?, 0, 3)", (second["source"], second["topic_id"], second["sub_topic_id"]))
+ocr_db.commit()
+ocr_db.close()
+with_ocr = cl.get("/documents?ocr=si", headers=HA).json
+check([i["source"] for i in with_ocr["items"]] == [first["source"]] and with_ocr["items"][0]["ocr_pages"] == 2
+      and with_ocr["items"][0]["total_pages"] == 4, "filtro OCR: solo i documenti con pagine OCR, con il conteggio")
+without = cl.get("/documents?ocr=no", headers=HA).json
+check([i["source"] for i in without["items"]] == [second["source"]], "filtro senza OCR: esclude i documenti senza dato")
+check(listed["total"] > 2 and cl.get("/documents", headers=HA).json["total"] == listed["total"], "senza filtro: anche i documenti senza dato")
+check(cl.get("/documents?ocr=boh", headers=HA).status_code == 400, "filtro OCR non valido -> 400")
+
 # --- il logout libera i documenti aperti ---
 HDL, _ = login("solodelibere")
 check(cl.post("/document/lock", headers=HDL, json=DKEY).json["lock"]["held_by_me"], "blocco preso prima del logout")
@@ -530,6 +600,12 @@ check(cn.execute("SELECT COUNT(*) FROM review_locks WHERE username = 'solodelibe
 # --- disattivazione utente invalida il token ---
 cn.execute("UPDATE review_users SET active=0, token_version=token_version+1"); cn.commit()
 check(cl.get("/topics", headers=H).status_code == 401, "utente disattivato -> token invalido")
+
+# --- ruoli reali
+real = {r: rp.ROLE_PERMISSIONS[r] for r in ("revisore", "archivista")}
+check(rp.PERM_TEXT in real["revisore"] and rp.PERM_METADATA not in real["revisore"], "revisore: testo sì, metadati no")
+check({rp.PERM_TEXT, rp.PERM_METADATA} <= real["archivista"], "archivista: testo e metadati")
+check(not any(rp.PERM_USERS in v or rp.PERM_ARCHIVES in v for v in real.values()), "solo l'admin gestisce utenti e archivi")
 
 print("\nRISULTATO:", "FALLITO" if check.failed else "TUTTO OK")
 sys.exit(1 if check.failed else 0)

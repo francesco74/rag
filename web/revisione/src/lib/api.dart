@@ -41,7 +41,9 @@ abstract final class Permission {
   static const editText = 'documenti.testo';
   static const editMetadata = 'documenti.metadati';
   static const changeStatus = 'documenti.stato';
+  static const upload = 'documenti.caricamento';
   static const manageUsers = 'utenti.gestione';
+  static const manageArchives = 'archivi.gestione';
 
   /// Chi ha almeno uno di questi permessi apre i documenti in modifica
   /// (e li blocca per gli altri).
@@ -109,6 +111,8 @@ class DocumentSummary {
         data = j['data']?.toString(),
         indexedAt = j['indexed_at'] as String?,
         status = j['status'] as String,
+        ocrPages = j['ocr_pages'] as int?,
+        totalPages = j['total_pages'] as int?,
         statusUpdatedBy = j['status_updated_by'] as String?,
         lockedBy = j['locked_by'] as String?,
         lockedByMe = j['locked_by_me'] as bool? ?? false;
@@ -121,6 +125,8 @@ class DocumentSummary {
   final String? data;
   final String? indexedAt;
   final String status;
+  final int? ocrPages;
+  final int? totalPages;
   final String? statusUpdatedBy;
 
   /// Chi ha il documento aperto in revisione (null se nessuno).
@@ -212,6 +218,7 @@ class ReviewDocument {
         indexedAt = j['indexed_at'] as String?,
         metadata = Map<String, dynamic>.from(j['metadata'] as Map),
         protectedKeys = List<String>.from(j['protected_keys'] as List),
+        externalOcrAvailable = j['external_ocr_available'] == true,
         originalFile = j['original_file'] == null
             ? null
             : OriginalFile.fromJson(
@@ -233,6 +240,7 @@ class ReviewDocument {
         lockTtlSeconds = j['lock_ttl_seconds'] as int? ?? 300;
 
   final DocKey key;
+  final bool externalOcrAvailable;
   final String? fileName;
   final int parentCount;
   final String? indexedAt;
@@ -366,6 +374,7 @@ class ReviewApi {
     String? subTopicId,
     String? query,
     String? status,
+    String? ocr,
     int page = 1,
     int pageSize = 25,
   }) async {
@@ -374,6 +383,7 @@ class ReviewApi {
       if (subTopicId != null && subTopicId.isNotEmpty) 'sub_topic_id': subTopicId,
       if (query != null && query.isNotEmpty) 'q': query,
       if (status != null && status.isNotEmpty) 'status': status,
+      if (ocr != null) 'ocr': ocr,
       'page': '$page',
       'page_size': '$pageSize',
     });
@@ -401,6 +411,19 @@ class ReviewApi {
       'mark_reviewed': markReviewed,
     });
     return ReviewDocument.fromJson(res['document'] as Map<String, dynamic>);
+  }
+
+  /// Avvia la trascrizione con l'OCR esterno; se il documento ne ha già una, restituisce quella.
+  Future<Map<String, dynamic>> startExternalOcr(DocKey key) =>
+      _request('POST', '/document/external-ocr', body: key.toJson());
+
+  /// La trascrizione esterna del documento: `status` è "none" se non ce n'è.
+  Future<Map<String, dynamic>> externalOcrState(DocKey key) =>
+      _request('GET', '/document/external-ocr', query: key.toJson());
+
+  /// Toglie il risultato, usato o scartato.
+  Future<void> removeExternalOcr(DocKey key) async {
+    await _request('DELETE', '/document/external-ocr', query: key.toJson());
   }
 
   Future<ReviewDocument> saveMetadata(DocKey key, Map<String, dynamic> metadata,
@@ -455,6 +478,36 @@ class ReviewApi {
   Future<HistoryEntry> historyEntry(int id) async => HistoryEntry.fromJson(
       await _request('GET', '/document/history/$id'));
 
+  /// Rotte dell'amministrazione (/review/admin), lette direttamente dalla
+  /// relativa schermata. [admin] false per le rotte di /review già esistenti.
+  Future<Map<String, dynamic>> adminRequest(String method, String path,
+          {Object? body, Map<String, String>? query, bool admin = true}) =>
+      _request(method, '${admin ? '/admin' : ''}$path', body: body, query: query);
+
+  /// Carica un file da indicizzare. Errori come le altre chiamate (ApiException).
+  Future<Map<String, dynamic>> uploadFile(
+      {required String topicId,
+      required String subTopicId,
+      required String name,
+      String folder = '',
+      required List<int> bytes,
+      required bool replace}) async {
+    final req = http.MultipartRequest('POST', Uri.parse('${AppSettings.apiUrl}/uploads'))
+      ..headers['Authorization'] = 'Bearer $_token'
+      ..fields['topic_id'] = topicId
+      ..fields['sub_topic_id'] = subTopicId
+      ..fields['folder'] = folder
+      ..fields['replace'] = replace.toString()
+      ..files.add(http.MultipartFile.fromBytes('file', bytes, filename: name));
+    http.Response res;
+    try {
+      res = await http.Response.fromStream(await req.send());
+    } catch (e) {
+      throw ApiException(0, 'Servizio non raggiungibile o file troppo grande.');
+    }
+    return _decode(res);
+  }
+
   Future<Map<String, dynamic>> _request(String method, String path,
       {Map<String, String>? query, Object? body, bool auth = true}) async {
     final uri = Uri.parse('${AppSettings.apiUrl}$path')
@@ -477,7 +530,10 @@ class ReviewApi {
     } catch (e) {
       throw ApiException(0, 'Servizio di revisione non raggiungibile.');
     }
+    return _decode(res, auth: auth);
+  }
 
+  Map<String, dynamic> _decode(http.Response res, {bool auth = true}) {
     Map<String, dynamic> data = {};
     if (res.body.isNotEmpty) {
       try {

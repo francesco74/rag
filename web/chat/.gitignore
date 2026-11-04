@@ -1,0 +1,4 @@
+src/.dart_tool/
+src/build/
+src/.flutter-plugins*
+src/pubspec.lock

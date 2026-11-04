@@ -55,8 +55,13 @@ class _LoginDialogState extends State<_LoginDialog> {
       if (mounted) Navigator.pop(context, true);
     } on AuthException catch (e) {
       if (mounted) {
-        setState(() => _error =
-            e.message.isEmpty ? t('login_unreachable') : t('login_failed'));
+        // Un errore senza messaggio (rete, proxy, 5xx) non è una password
+        // sbagliata: come prima, "servizio non raggiungibile".
+        setState(() => _error = e.isLocked
+            ? t('login_locked')
+            : e.statusCode == 0 || e.message.isEmpty
+                ? t('login_unreachable')
+                : t('login_failed'));
       }
     } finally {
       if (mounted) setState(() => _busy = false);

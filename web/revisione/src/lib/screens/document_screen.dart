@@ -38,6 +38,11 @@ class _DocumentScreenState extends State<DocumentScreen> {
   // gli altri e lo rinnova finché resta qui; gli altri lo vedono in sola
   // lettura. Il backend rifiuta comunque i salvataggi senza blocco.
   DocLock? _lock;
+  bool _externalOcrRunning = false;
+  bool _externalOcrFollowed = false;
+  String? _externalOcrResult;
+  String? _externalOcrError;
+  String? _externalOcrBy;
   Timer? _lockTimer;
   late final JSFunction _onPageHide =
       ((web.Event _) => _releaseOnUnload()).toJS;
@@ -60,7 +65,7 @@ class _DocumentScreenState extends State<DocumentScreen> {
   void initState() {
     super.initState();
     _text.addListener(_onTextEdited);
-    _load();
+    _load().then((_) => _checkExternalOcr());
   }
 
   @override
@@ -546,9 +551,133 @@ class _DocumentScreenState extends State<DocumentScreen> {
     );
   }
 
+  /// Una trascrizione lasciata in corso o non ancora usata si ritrova riaprendo il documento.
+  Future<void> _checkExternalOcr() async {
+    if (!_api.can(Permission.editText) || !(_doc?.externalOcrAvailable ?? false)) return;
+    try {
+      _applyExternalOcr(await _api.externalOcrState(widget.docKey));
+    } catch (_) {
+      // Non impedisce di lavorare sul documento: il pulsante riprende il lavoro esistente.
+    }
+  }
+
+  void _applyExternalOcr(Map<String, dynamic> job) {
+    if (!mounted) return;
+    final status = job['status'] as String;
+    final active = status == 'queued' || status == 'running';
+    setState(() {
+      _externalOcrResult = status == 'completed' ? job['content'] as String : null;
+      _externalOcrError = status == 'failed' ? job['error'] as String? ?? 'Trascrizione non riuscita.' : null;
+      _externalOcrBy = job['requested_by'] as String?;
+      _externalOcrRunning = active;
+    });
+    if (active && !_externalOcrFollowed) unawaited(_followExternalOcr());
+  }
+
+  Future<void> _followExternalOcr() async {
+    _externalOcrFollowed = true;
+    try {
+      while (mounted && _externalOcrRunning) {
+        await Future<void>.delayed(const Duration(seconds: 3));
+        if (!mounted) return;
+        _applyExternalOcr(await _api.externalOcrState(widget.docKey));
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() => _externalOcrRunning = false);
+        showError(context, e);
+      }
+    } finally {
+      _externalOcrFollowed = false;
+    }
+  }
+
+  Future<void> _runExternalOcr() async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Trascrivere con l\'OCR esterno?'),
+        content: const Text('Il documento originale verrà inviato al servizio esterno configurato. '
+            'Puoi anche uscire: ritroverai il risultato riaprendo il documento, '
+            'e sarai tu a decidere se inserirlo nell\'editor.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Annulla')),
+          FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Invia all\'esterno')),
+        ],
+      ),
+    );
+    if (ok != true || !mounted) return;
+    try {
+      _applyExternalOcr(await _api.startExternalOcr(widget.docKey));
+    } catch (e) {
+      if (mounted) showError(context, e);
+    }
+  }
+
+  /// Il testo entra nell'editor come proposta: si salva con il solito pulsante.
+  Future<void> _insertExternalOcr() async {
+    if (_textDirty) {
+      final ok = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('Sostituire le modifiche non salvate?'),
+          content: const Text('La trascrizione esterna prenderà il posto del testo nell\'editor.'),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Annulla')),
+            FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Sostituisci')),
+          ],
+        ),
+      );
+      if (ok != true || !mounted) return;
+    }
+    setState(() {
+      _text.text = _externalOcrResult!;
+      _externalOcrResult = null;
+    });
+    showInfo(context, 'Trascrizione esterna nell\'editor: controllala e salva, oppure annulla le modifiche.');
+    await _removeExternalOcr();
+  }
+
+  Future<void> _removeExternalOcr() async {
+    try {
+      await _api.removeExternalOcr(widget.docKey);
+      if (mounted) setState(() {
+        _externalOcrResult = null;
+        _externalOcrError = null;
+      });
+    } catch (e) {
+      if (mounted) showError(context, e);
+    }
+  }
+
+  Widget? _externalOcrBanner(ThemeData theme) {
+    if (_externalOcrResult == null && _externalOcrError == null) return null;
+    final failed = _externalOcrError != null;
+    return Container(
+      width: double.infinity,
+      color: failed ? theme.colorScheme.errorContainer : theme.colorScheme.secondaryContainer,
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      child: Wrap(
+        crossAxisAlignment: WrapCrossAlignment.center,
+        spacing: 8,
+        children: [
+          Text(failed
+              ? 'Trascrizione esterna non riuscita: $_externalOcrError'
+              : 'Trascrizione esterna pronta${_externalOcrBy != null ? ', richiesta da $_externalOcrBy' : ''}.'),
+          if (_canEditText && !failed)
+            FilledButton(onPressed: _insertExternalOcr, child: const Text('Inserisci nell\'editor')),
+          if (_canEditText)
+            TextButton(onPressed: _removeExternalOcr, child: Text(failed ? 'Chiudi' : 'Scarta')),
+        ],
+      ),
+    );
+  }
+
   Widget _textTab() {
     final theme = Theme.of(context);
+    final banner = _externalOcrBanner(theme);
     return Column(children: [
+      if (banner != null) banner,
       Expanded(
           child: OcrTextEditor(controller: _text, readOnly: !_canEditText)),
       const Divider(height: 1),
@@ -573,6 +702,14 @@ class _DocumentScreenState extends State<DocumentScreen> {
           spacing: 8,
           runSpacing: 8,
           children: [
+            if (_doc!.externalOcrAvailable && _doc!.originalFile != null)
+              OutlinedButton.icon(
+                onPressed: _externalOcrRunning || _externalOcrResult != null || _savingText ? null : _runExternalOcr,
+                icon: _externalOcrRunning
+                    ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
+                    : const Icon(Icons.document_scanner_outlined),
+                label: Text(_externalOcrRunning ? 'Trascrizione in corso…' : 'Trascrivi con OCR esterno'),
+              ),
             if (_textDirty)
               Text('Modifiche non salvate',
                   style: TextStyle(color: theme.colorScheme.tertiary)),

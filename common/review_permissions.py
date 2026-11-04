@@ -14,20 +14,19 @@ PERM_READ = "documenti.lettura"        # elenco, dettaglio, file originale, stor
 PERM_TEXT = "documenti.testo"          # correzione del testo e re-indicizzazione
 PERM_METADATA = "documenti.metadati"   # modifica dei metadati
 PERM_STATUS = "documenti.stato"        # cambio dello stato di revisione
+PERM_UPLOAD = "documenti.caricamento"  # caricamento dei file da indicizzare
 PERM_USERS = "utenti.gestione"         # amministrazione degli utenti
+PERM_ARCHIVES = "archivi.gestione"     # archivi, siti della chat, credenziali esterne
 # Accesso a tutti gli archivi (topic) senza assegnazione. Gli altri utenti
 # lavorano solo sui topic assegnati (tabella review_user_topics).
 PERM_ALL_TOPICS = "topic.tutti"
 
-ALL_PERMISSIONS = frozenset({PERM_READ, PERM_TEXT, PERM_METADATA, PERM_STATUS, PERM_USERS,
-                             PERM_ALL_TOPICS})
+ALL_PERMISSIONS = frozenset({PERM_READ, PERM_TEXT, PERM_METADATA, PERM_STATUS, PERM_UPLOAD, PERM_USERS,
+                             PERM_ARCHIVES, PERM_ALL_TOPICS})
 
 ROLE_PERMISSIONS = {
-    "lettore": frozenset({PERM_READ}),
-    "correttore": frozenset({PERM_READ, PERM_TEXT}),
-    "catalogatore": frozenset({PERM_READ, PERM_METADATA}),
-    "validatore": frozenset({PERM_READ, PERM_STATUS}),
-    "revisore": frozenset({PERM_READ, PERM_TEXT, PERM_METADATA, PERM_STATUS}),
+    "revisore": frozenset({PERM_READ, PERM_TEXT, PERM_STATUS}),
+    "archivista": frozenset({PERM_READ, PERM_TEXT, PERM_METADATA, PERM_STATUS, PERM_UPLOAD}),
     "admin": ALL_PERMISSIONS,
 }
 

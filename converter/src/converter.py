@@ -3,13 +3,14 @@ import json
 import shutil
 import logging
 import asyncio
+import contextvars
 import io
 import time
 from pathlib import Path
 from PIL import Image
 from common.db_logger import MySQLLogHandler, init_db_pool
 
-import fitz          # PyMuPDF
+import pymupdf          # PyMuPDF
 import pymupdf4llm   # Native PDF to Markdown
 import aio_pika      # Asynchronous RabbitMQ client
 
@@ -18,14 +19,14 @@ import aio_pika      # Asynchronous RabbitMQ client
 from google.cloud import vision
 from aiolimiter import AsyncLimiter
 from tenacity import retry, stop_after_attempt, wait_random_exponential, retry_if_exception_type
-from google import genai
-from google.genai import types
-from google.genai import errors as genai_errors
 import multiprocessing as mp
 import queue
 
 from dotenv import load_dotenv
 from common.config import settings
+from common.upload_status import FAILED, PROCESSING, mark_upload, record_ocr
+from common.utility import CONVERSION_QUEUE, CONVERSION_QUEUE_ARGS, EXTERNAL_OCR_MARKER
+from ocr_provider import OcrBlockedError, OcrTransientError, clean_transcription, get_external_fallback, get_ocr_provider
 import html
 import re
 
@@ -227,15 +228,39 @@ LEGACY_EXTRACTION_TIMEOUT = 300.0  # 5 minuti - TENTATIVO 2: libreria SENZA layo
                                     # anzi essere più lenta. Il vero paracadute è il TENTATIVO 3 (OCR), quindi
                                     # non ha senso tenere timeout alti sui primi due livelli: tanto vale arrivare
                                     # prima all'OCR, che funziona indipendentemente da quanto è "brutta" la pagina.
-FALLBACK_OCR_TIMEOUT = 300.0       # 5 minuti - rasterizzazione di TUTTE le pagine per il fallback OCR (TENTATIVO 3/4)
+FALLBACK_OCR_TIMEOUT = 300.0       # 5 minuti - rasterizzazione di TUTTE le pagine per il fallback OCR (TENTATIVO 3)
 
-# Limiter asincrono: gestisce internamente la concorrenza garantendo max 10 chiamate/minuto
-GEMINI_LIMITER = AsyncLimiter(max_rate=10, time_period=60)
+# Limiter asincrono: gestisce internamente la concorrenza garantendo max OCR_RATE_PER_MINUTE chiamate/minuto
+OCR_LIMITER = AsyncLimiter(max_rate=settings.ocr_rate_per_minute, time_period=60)
 
-# Inizializzazione Client AI
-api_llm_key = settings.api_llm_key
-client = genai.Client(api_key=api_llm_key)
-vision_client = vision.ImageAnnotatorClient()
+# Creato al primo uso: senza credenziali Google il converter parte comunque.
+_vision_client = None
+
+
+# Pagine del file corrente {"ocr", "total"}, da registrare a fine conversione.
+PAGE_STATS = contextvars.ContextVar("page_stats", default=None)
+
+
+def _count_pages(ocr=0, total=0):
+    stats = PAGE_STATS.get()
+    if stats is not None:
+        stats["ocr"] += ocr
+        stats["total"] += total
+
+
+def inspect_page(page, crop_limit: int = CROP_OCR_LIMIT):
+    """La regola che manda una pagina all'OCR: la usa anche rebuild_document_ocr.py."""
+    try:
+        # get_drawings() estrae i tracciati vettoriali (linee, poligoni, curve CAD)
+        vector_count = len(page.get_drawings())
+    except Exception:
+        vector_count = 0
+
+    rect = page.rect
+    clip_rect = pymupdf.Rect(0, crop_limit, rect.width, rect.height - crop_limit) if rect.height > 200 else rect
+    char_count = len(page.get_text(sort=True, clip=clip_rect).strip())
+    return clip_rect, char_count, vector_count, (char_count < 50) or (vector_count > 1500 and char_count < 1000)
+
 
 def _cpu_heavy_pdf_extraction(file_path_str: str, file_bytes: bytes, crop_limit: int, use_ai_layout: bool = True):
     """
@@ -251,7 +276,7 @@ def _cpu_heavy_pdf_extraction(file_path_str: str, file_bytes: bytes, crop_limit:
                            hang, a scapito di qualità leggermente inferiore su
                            layout complessi (multi-colonna, tabelle articolate).
     """
-    import fitz
+    import pymupdf
     import pymupdf4llm
 
     # Limitiamo comunque i thread ONNX Runtime al numero di CPU realmente
@@ -265,30 +290,20 @@ def _cpu_heavy_pdf_extraction(file_path_str: str, file_bytes: bytes, crop_limit:
     print(f"[CHILD PROCESS] Avvio estrazione per {file_path_str} in modalità: {mode_label} (ONNX thread limit: {ONNX_THREAD_LIMIT})")
 
     if file_bytes:
-        doc = fitz.open(stream=file_bytes, filetype="pdf")
+        doc = pymupdf.open(stream=file_bytes, filetype="pdf")
     else:
-        doc = fitz.open(file_path_str)
+        doc = pymupdf.open(file_path_str)
 
     extracted_pages = []
     print(f"[CHILD PROCESS] Estrazione PDF iniziata per {file_path_str} ({len(doc)} pagine).")
     for p_num in range(len(doc)):
         page_t0 = time.time()
         page = doc[p_num]
-        try:
-            # get_drawings() estrae i tracciati vettoriali (linee, poligoni, curve CAD)
-            vector_count = len(page.get_drawings())
-        except Exception:
-            vector_count = 0
-        
-        rect = page.rect
-        clip_rect = fitz.Rect(0, crop_limit, rect.width, rect.height - crop_limit) if rect.height > 200 else rect
-        text = page.get_text(sort=True, clip=clip_rect).strip()
-        
-        char_count = len(text)
-        if  (char_count < 50) or (vector_count > 1500 and char_count < 1000):
+        clip_rect, char_count, vector_count, ocr_needed = inspect_page(page, crop_limit)
+        if ocr_needed:
             print(f"[CHILD PROCESS] Pagina {p_num}: Testo nativo insufficiente o rilevata presenza eccessiva di elementi vettoriali({char_count} chars / {vector_count} vettori). OCR necessario.")
             #log.debug(f"Pagina {p_num}: Rilevato testo nativo non sufficiente ({char_count} chars). Estrazione mediante OCR.")
-            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False, clip=clip_rect)
+            pix = page.get_pixmap(matrix=pymupdf.Matrix(2, 2), alpha=False, clip=clip_rect)
             extracted_pages.append({"type": "image", "content": pix.tobytes("png")})
             print(f"[CHILD PROCESS] Pagina {p_num}: COMPLETATA (rasterizzazione per OCR) in {time.time() - page_t0:.1f}s.")
         else:
@@ -304,29 +319,28 @@ def _cpu_heavy_pdf_extraction(file_path_str: str, file_bytes: bytes, crop_limit:
 
 def _rasterize_all_pages(file_path_str: str, file_bytes: bytes):
     """
-    TENTATIVO 3/4 della catena: usata solo quando SIA il tentativo con layout AI
+    TENTATIVO 3 della catena: usata solo quando SIA il tentativo con layout AI
     SIA quello in legacy mode sono andati in timeout (chiamata via _run_killable).
 
     Non usa né get_drawings() né pymupdf4llm.to_markdown(): a questo punto non ci
     fidiamo più di alcuna estrazione testuale nativa per l'intero documento, quindi
     rasterizziamo TUTTE le pagine (anche quelle con testo nativo abbondante) e le
-    passiamo tutte all'OCR (Gemini, con fallback automatico su Cloud Vision in
-    caso di errore — vedi _ocr_with_final_fallback).
+    passiamo tutte all'OCR (OCR_PROVIDER).
     """
-    import fitz
+    import pymupdf
 
     print(f"[CHILD PROCESS - FALLBACK OCR] Rasterizzazione completa di tutte le pagine per {file_path_str}")
 
     if file_bytes:
-        doc = fitz.open(stream=file_bytes, filetype="pdf")
+        doc = pymupdf.open(stream=file_bytes, filetype="pdf")
     else:
-        doc = fitz.open(file_path_str)
+        doc = pymupdf.open(file_path_str)
 
     rendered_pages = []
     for p_num in range(len(doc)):
         page_t0 = time.time()
         page = doc[p_num]
-        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+        pix = page.get_pixmap(matrix=pymupdf.Matrix(2, 2), alpha=False)
         rendered_pages.append(pix.tobytes("png"))
         print(f"[CHILD PROCESS - FALLBACK OCR] Pagina {p_num}: rasterizzata in {time.time() - page_t0:.1f}s.")
 
@@ -400,85 +414,119 @@ def try_extract_pdf_from_pkcs7(file_bytes: bytes, filename: str = "") -> bytes |
 # 2. MOTORE IBRIDO DI ESTRAZIONE E OCR
 # ==============================================================================
 
-def _cloud_vision_fallback(image: Image.Image) -> str:
-    """Esegue il fallback su Google Cloud Vision API in caso di blocco policy."""
-    log.info("Esecuzione fallback su Google Cloud Vision API...")
+def vision_enabled() -> bool:
+    """Vision si usa solo se OCR_VISION_FALLBACK lo ammette e le credenziali ci sono."""
+    credentials = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
+    return settings.ocr_vision_fallback and bool(credentials) and Path(credentials).is_file() and Path(credentials).stat().st_size > 0
+
+
+def _cloud_vision_transcribe(image: Image.Image) -> str:
+    """Trascrive la pagina con Google Cloud Vision: solo dal comando del revisore."""
+    global _vision_client
+    if _vision_client is None:
+        _vision_client = vision.ImageAnnotatorClient()
+    log.info("Invio della pagina a Google Cloud Vision...")
     img_byte_arr = io.BytesIO()
     image.save(img_byte_arr, format='PNG')
     vision_image = vision.Image(content=img_byte_arr.getvalue())
-    response = vision_client.document_text_detection(image=vision_image)
+    response = _vision_client.document_text_detection(image=vision_image)
     if response.error.message:
         log.error(f"Errore Cloud Vision API: {response.error.message}")
         raise Exception(f"Cloud Vision API Error: {response.error.message}")
-    log.debug("Fallback Cloud Vision completato con successo.")
+    log.debug("Trascrizione con Cloud Vision completata.")
     return response.full_text_annotation.text
 
-@retry(
-    # FIX: Cattura i Rate Limit (429) e gli Errori di Server (500/503) del nuovo SDK
-    retry=retry_if_exception_type((genai_errors.APIError, genai_errors.ServerError, genai_errors.ClientError)),
+OCR_RETRY = retry(
+    # Solo rate limit, sovraccarico e rete: gli altri errori non cambiano ritentando.
+    retry=retry_if_exception_type(OcrTransientError),
     wait=wait_random_exponential(multiplier=2, min=10, max=80),
-    stop=stop_after_attempt(20)
+    stop=stop_after_attempt(settings.ocr_max_attempts),
+    reraise=True,
 )
-async def async_ocr_generate(image_input, as_markdown=False) -> str:
-    """Interroga Gemini Vision API rispettando i limiti di rate e gestendo i fallback."""
-    async with GEMINI_LIMITER:
+
+
+async def _transcribe_page(provider, image_input, as_markdown) -> str:
+    async with OCR_LIMITER:
         prompt = "Transcribe the text in this image precisely. Format the output strictly as Markdown." if as_markdown else "Transcribe the text in this image precisely as raw text."
-        
-        log.debug("Chiamata a Gemini Vision API inviata.")
-        try:
-            response = await client.aio.models.generate_content(
-                model=OCR_MODEL_NAME,
-                contents=[prompt, image_input],
-                config=types.GenerateContentConfig(
-                    safety_settings=[
-                        types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_HARASSMENT, threshold=types.HarmBlockThreshold.BLOCK_NONE),
-                        types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold=types.HarmBlockThreshold.BLOCK_NONE),
-                        types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold=types.HarmBlockThreshold.BLOCK_NONE),
-                        types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold=types.HarmBlockThreshold.BLOCK_NONE)
-                    ]
-                )
-            )
 
-            if not response.candidates or not response.candidates[0].content.parts:
-                reason_enum = response.candidates[0].finish_reason if response.candidates else None
-                reason = reason_enum.name if reason_enum else "Unknown"
-                
-                if reason in ['SAFETY', 'RECITATION', 'BLOCKLIST', 'PROHIBITED_CONTENT', '3', '4']:
-                    log.warning(f"Gemini API bloccata per policy (Reason: {reason}). Avvio fallback visivo.")
-                    if not isinstance(image_input, Image.Image):
-                        log.error("Fallback Cloud Vision richiede un PIL.Image. Tipo ricevuto: %s", type(image_input))
-                        raise ValueError("Tipo immagine non supportato per il fallback.")
-                    fallback_text = await asyncio.to_thread(_cloud_vision_fallback, image_input)
-                    
-                    return fallback_text.strip()
-                raise ValueError(f"Gemini API Blocked Page. Exact Finish Reason: {reason}")
-            
-            log.debug("Risposta Gemini Vision ricevuta con successo.")
-            return response.text.strip().replace("-\n", "")
-            
-        except Exception as e:
-            log.error("Errore critico durante la generazione OCR con Gemini.", exc_info=True)
-            raise ValueError(f"OCR Generation Failed: {e}")
+        log.debug("Chiamata OCR inviata.")
+        text = clean_transcription(await provider.transcribe(image_input, prompt))
+        if not text:
+            raise ValueError("OCR: risposta vuota dal modello")
+        log.debug("Risposta OCR ricevuta con successo.")
+        return text
 
-async def _ocr_with_final_fallback(image: Image.Image, as_markdown: bool = True) -> str:
-    """
-    Wrapper di OCR a 2 tentativi (usato come 2°/3° livello della pipeline):
-    1) Prova Gemini (async_ocr_generate, con i suoi retry interni e l'eventuale
-       fallback automatico su Cloud Vision in caso di blocco policy).
-    2) Se anche questo fallisce definitivamente (retry esauriti, errore non
-       recuperabile, ecc.), esegue un ultimo tentativo diretto su Cloud Vision.
-    Se pure questo fallisce, l'eccezione viene propagata al chiamante.
-    """
+
+@OCR_RETRY
+async def async_ocr_generate(image_input, as_markdown=False) -> str:
+    """Interroga il modello OCR principale rispettando i limiti di rate."""
+    return await _transcribe_page(get_ocr_provider(), image_input, as_markdown)
+
+
+@OCR_RETRY
+async def external_ocr_generate(provider, image_input, as_markdown=False) -> str:
+    """Interroga il modello esterno come ripiego di quello principale."""
+    return await _transcribe_page(provider, image_input, as_markdown)
+
+
+def publish_external_ocr_availability():
+    """Solo il converter conosce chiavi e credenziali: segnala all'API se il comando del revisore è utilizzabile."""
     try:
-        return await async_ocr_generate(image, as_markdown=as_markdown)
+        external = get_external_fallback() is not None
     except Exception as e:
-        log.warning(f"OCR Gemini fallito definitivamente ({e}). Ultimo tentativo su Cloud Vision...")
+        # Il pulsante resta visibile: il revisore vedrà l'errore invece di un comando sparito.
+        log.error(f"Ripiego OCR esterno non utilizzabile: {e}")
+        external = True
+    marker = DATA_FOLDER / EXTERNAL_OCR_MARKER
+    if external or vision_enabled():
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.touch()
+    else:
+        marker.unlink(missing_ok=True)
+    log.info(f"OCR esterno su richiesta: modello esterno {'attivo' if external else 'spento'}, "
+             f"Vision {'attivo' if vision_enabled() else 'spento'}.")
+
+
+async def _external_transcribe_page(image: Image.Image) -> str:
+    """Una pagina per il comando del revisore: il modello esterno, poi Vision se abilitato."""
+    # Fuori dal try: una configurazione sbagliata ferma il lavoro, non lo manda a Vision.
+    external = get_external_fallback()
+    failure = "modello esterno non attivo"
+    if external:
         try:
-            fallback_text = await asyncio.to_thread(_cloud_vision_fallback, image)
-            return fallback_text.strip()
-        except Exception as e2:
-            log.error(f"Anche il fallback finale su Cloud Vision è fallito: {e2}", exc_info=True)
-            raise
+            return await external_ocr_generate(external, image, as_markdown=True)
+        except Exception as e:
+            failure = e
+            log.warning(f"OCR esterno non riuscito ({e}).")
+    if not vision_enabled():
+        raise ValueError(f"{failure}; Google Cloud Vision non è abilitato.")
+    return (await asyncio.to_thread(_cloud_vision_transcribe, image)).strip()
+
+
+async def transcribe_externally(file_path: Path, filename: str) -> str:
+    """Tutte le pagine all'OCR esterno, per scelta del revisore: non passa dal modello di OCR_PROVIDER."""
+    if file_path.suffix.lower() in IMG_EXTENSIONS:
+        with Image.open(file_path) as img:
+            return await _external_transcribe_page(img)
+    pdf_bytes = file_path.read_bytes()
+    extracted = try_extract_pdf_from_pkcs7(pdf_bytes, filename)
+    if extracted is not None:
+        pdf_bytes = extracted
+    with pymupdf.open(stream=pdf_bytes, filetype="pdf") as doc:
+        if len(doc) > settings.max_allowed_pages:
+            raise ValueError(f"Il file ha {len(doc)} pagine, oltre il limite di {settings.max_allowed_pages}.")
+    pages = await asyncio.to_thread(_run_killable, _rasterize_all_pages, (str(file_path), pdf_bytes), FALLBACK_OCR_TIMEOUT)
+    texts = []
+    for png_bytes in pages:
+        texts.append(await _external_transcribe_page(Image.open(io.BytesIO(png_bytes))))
+    return "\n\n---\n\n".join(texts)
+
+
+async def _ocr_page(image: Image.Image, as_markdown: bool = True) -> str:
+    """Una pagina con il modello OCR configurato. Se fallisce, il documento va in errore: nessun ripiego automatico."""
+    _count_pages(ocr=1)
+    return await async_ocr_generate(image, as_markdown=as_markdown)
+
 
 async def extract_hybrid_markdown_from_pdf_async(file_path: Path, file_bytes: bytes = None) -> str:
     """
@@ -487,9 +535,8 @@ async def extract_hybrid_markdown_from_pdf_async(file_path: Path, file_bytes: by
 
       1) pymupdf4llm CON layout AI (ONNX/GNN)      -> EXTRACTION_TIMEOUT (20 min)
       2) pymupdf4llm SENZA layout AI (legacy mode) -> LEGACY_EXTRACTION_TIMEOUT (10 min)
-      3) OCR completo via Gemini (rasterizzazione di tutte le pagine)
-      4) Se Gemini fallisce (non timeout, ma errore/policy block): Cloud Vision
-         -> già incapsulato dentro _ocr_with_final_fallback, chiamato dal livello 3.
+      3) OCR completo via OCR_PROVIDER (rasterizzazione di tutte le pagine)
+      Se l'OCR di una pagina fallisce (errore o rifiuto), il documento va in errore.
     """
     log.info(f"Avvio estrazione ibrida MULTI-PROCESSO per: {file_path.name}")
     md_pages = []
@@ -521,10 +568,10 @@ async def extract_hybrid_markdown_from_pdf_async(file_path: Path, file_bytes: by
                 log.warning(
                     f"TIMEOUT: anche l'estrazione in legacy mode (no ONNX) di {file_path.name} ha impiegato più di "
                     f"{int(LEGACY_EXTRACTION_TIMEOUT // 60)} minuti. Il worker è stato terminato forzatamente. "
-                    f"Provo TENTATIVO 3: OCR completo via Gemini/Vision."
+                    f"Provo TENTATIVO 3: OCR completo."
                 )
-                # --- TENTATIVO 3/4: OCR completo (Gemini, poi Vision se Gemini fallisce) ---
-                return await _fallback_full_ocr_gemini_then_vision(file_path, file_bytes)
+                # --- TENTATIVO 3: OCR completo (OCR_PROVIDER) ---
+                return await _fallback_full_ocr(file_path, file_bytes)
 
         # Tornati nell'Event Loop Async, gestiamo le eventuali chiamate API di rete (OCR
         # per le pagine senza testo nativo sufficiente, sia nel Tentativo 1 che nel 2)
@@ -532,7 +579,7 @@ async def extract_hybrid_markdown_from_pdf_async(file_path: Path, file_bytes: by
             if page_data["type"] == "image":
                 # Ricostruiamo l'oggetto PIL dai bytes generati dal processo figlio
                 img = Image.open(io.BytesIO(page_data["content"]))
-                ocr_md = await _ocr_with_final_fallback(img, as_markdown=True)
+                ocr_md = await _ocr_page(img, as_markdown=True)
                 md_pages.append(ocr_md)
             else:
                 md_pages.append(page_data["content"])
@@ -545,15 +592,12 @@ async def extract_hybrid_markdown_from_pdf_async(file_path: Path, file_bytes: by
         raise
 
 
-async def _fallback_full_ocr_gemini_then_vision(file_path: Path, file_bytes: bytes = None) -> str:
+async def _fallback_full_ocr(file_path: Path, file_bytes: bytes = None) -> str:
     """
-    TENTATIVO 3/4 della catena: usato quando SIA il tentativo con layout AI (ONNX)
+    TENTATIVO 3 della catena: usato quando SIA il tentativo con layout AI (ONNX)
     SIA quello in legacy mode (senza ONNX) sono andati in timeout.
 
-    Rasterizza tutte le pagine del documento e le passa a _ocr_with_final_fallback,
-    che tenta Gemini per prima cosa e, solo se Gemini fallisce (errore o policy
-    block), ripiega automaticamente su Google Cloud Vision — quindi qui non serve
-    gestire esplicitamente il "livello 4" (Vision), è già incapsulato lì dentro.
+    Rasterizza tutte le pagine del documento e le passa al modello OCR.
     """
     try:
         rendered_pages = await asyncio.to_thread(
@@ -575,15 +619,62 @@ async def _fallback_full_ocr_gemini_then_vision(file_path: Path, file_bytes: byt
     md_pages = []
     for png_bytes in rendered_pages:
         img = Image.open(io.BytesIO(png_bytes))
-        ocr_md = await _ocr_with_final_fallback(img, as_markdown=True)
+        ocr_md = await _ocr_page(img, as_markdown=True)
         md_pages.append(ocr_md)
 
-    log.info(f"Fallback OCR completo (Gemini/Vision) completato per {file_path.name}. Generati {len(md_pages)} blocchi.")
+    log.info(f"Fallback OCR completo completato per {file_path.name}. Generati {len(md_pages)} blocchi.")
     return "\n\n---\n\n".join(md_pages)
 
 # ==============================================================================
 # 3. CORE LOGIC - GESTIONE MESSAGGI (EVENT-DRIVEN)
 # ==============================================================================
+
+async def convert_file_to_markdown(attached_file_path: Path, filename: str) -> str | None:
+    """Testo Markdown di un file; None se il formato non è gestito."""
+    attached_ext = attached_file_path.suffix.lower()
+    if attached_ext == ".pdf":
+
+        pdf_bytes = attached_file_path.read_bytes()
+
+        try:
+            extracted = try_extract_pdf_from_pkcs7(pdf_bytes, filename)
+        except ValueError as e:
+            # Riconosciuto come busta PKCS7 ma estrazione fallita: caso
+            # anomalo, non ha senso procedere con i bytes ancora
+            # incapsulati (PyMuPDF fallirebbe comunque poco dopo con un
+            # errore meno chiaro). Meglio un fallimento esplicito qui.
+            raise ValueError(f"File '{filename}': {e}")
+
+        if extracted is not None:
+            log.warning(
+                f"Il file '{filename}' ha estensione .pdf ma il contenuto è in realtà "
+                f"una busta di firma digitale PKCS7/CMS (.p7m) non sbustata a monte. "
+                f"PDF incapsulato estratto con successo ({len(extracted)} bytes)."
+            )
+            pdf_bytes = extracted
+
+        with pymupdf.open(stream=pdf_bytes, filetype="pdf") as doc:
+            page_count = len(doc)
+
+        if page_count > settings.max_allowed_pages:
+            # Lanciamo un errore specifico che interrompe il job ed evita sprechi di CPU
+            raise ValueError(
+                f"Rifiutato: Il file '{filename}' ha {page_count} pagine, "
+                f"superando il limite massimo di {settings.max_allowed_pages}."
+            )
+
+        _count_pages(total=page_count)
+        return await extract_hybrid_markdown_from_pdf_async(attached_file_path, file_bytes=pdf_bytes)
+    elif attached_ext in [".txt", ".md"]:
+        return attached_file_path.read_text(encoding="utf-8", errors="ignore")
+    elif attached_ext in IMG_EXTENSIONS:
+        log.info(f"Rilevata immagine {filename}. Avvio OCR nativo...")
+        _count_pages(total=1)
+        with Image.open(attached_file_path) as img:
+            return await _ocr_page(img, as_markdown=True)
+    log.warning(f"Estensione {attached_ext} ignorata per il file {filename}.")
+    return None
+
 
 async def process_single_job(payload: dict, channel: aio_pika.Channel):
     """
@@ -627,6 +718,7 @@ async def process_single_job(payload: dict, channel: aio_pika.Channel):
         attached_files = manifest.get("files", [])
         original_source = manifest.get("source", str(rel_path))
         current_json_dir = file_path.parent
+        await asyncio.to_thread(mark_upload, original_source, PROCESSING)
         
         for filename in attached_files:
             # Risoluzione sul filesystem: usiamo solo il nome base di
@@ -641,54 +733,14 @@ async def process_single_job(payload: dict, channel: aio_pika.Channel):
             
             if not attached_file_path.exists():
                 log.warning(f"Allegato mancante {filename} nella cartella {current_json_dir.name}.")
+                await asyncio.to_thread(mark_upload, original_source, FAILED, f"File non trovato: {filename}")
                 continue
 
             log.info(f"Conversione allegato: {filename}")
-            attached_ext = attached_file_path.suffix.lower()
-            md_content = None
+            stats = {"ocr": 0, "total": 0}
+            PAGE_STATS.set(stats)
+            md_content = await convert_file_to_markdown(attached_file_path, filename)
 
-            # Pipeline di conversione
-            if attached_ext == ".pdf":
-
-                pdf_bytes = attached_file_path.read_bytes()
-
-                try:
-                    extracted = try_extract_pdf_from_pkcs7(pdf_bytes, filename)
-                except ValueError as e:
-                    # Riconosciuto come busta PKCS7 ma estrazione fallita: caso
-                    # anomalo, non ha senso procedere con i bytes ancora
-                    # incapsulati (fitz fallirebbe comunque poco dopo con un
-                    # errore meno chiaro). Meglio un fallimento esplicito qui.
-                    raise ValueError(f"File '{filename}': {e}")
-
-                if extracted is not None:
-                    log.warning(
-                        f"Il file '{filename}' ha estensione .pdf ma il contenuto è in realtà "
-                        f"una busta di firma digitale PKCS7/CMS (.p7m) non sbustata a monte. "
-                        f"PDF incapsulato estratto con successo ({len(extracted)} bytes)."
-                    )
-                    pdf_bytes = extracted
-
-                with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
-                    page_count = len(doc)
-                
-                if page_count > settings.max_allowed_pages:
-                    # Lanciamo un errore specifico che interrompe il job ed evita sprechi di CPU
-                    raise ValueError(
-                        f"Rifiutato: Il file '{filename}' ha {page_count} pagine, "
-                        f"superando il limite massimo di {settings.max_allowed_pages}."
-                    )
-                
-                md_content = await extract_hybrid_markdown_from_pdf_async(attached_file_path, file_bytes=pdf_bytes)
-            elif attached_ext in [".txt", ".md"]:
-                md_content = attached_file_path.read_text(encoding="utf-8", errors="ignore")
-            elif attached_ext in IMG_EXTENSIONS:
-                log.info(f"Rilevata immagine {filename}. Avvio OCR nativo...")
-                with Image.open(attached_file_path) as img:
-                    md_content = await _ocr_with_final_fallback(img, as_markdown=True)
-            else:
-                log.warning(f"Estensione {attached_ext} ignorata per il file {filename}.")
-            
             if md_content:
                 safe_stem = Path(filename).stem
                 # Se lo stem del JSON coincide già con quello dell'allegato
@@ -720,6 +772,9 @@ async def process_single_job(payload: dict, channel: aio_pika.Channel):
                     child_manifest["source"] = f"{original_source}::{filename}"
                 child_manifest["files"] = [filename]
                 
+                await asyncio.to_thread(record_ocr, child_manifest["source"], rel_path.parts[0], rel_path.parts[1],
+                                        stats["ocr"], stats["total"])
+
                 final_json_path = dest_dir / f"{unique_base_name}.json"
                 with open(final_json_path, "w", encoding="utf-8") as f:
                     json.dump(child_manifest, f, indent=2)
@@ -731,6 +786,8 @@ async def process_single_job(payload: dict, channel: aio_pika.Channel):
                     routing_key="da-indicizzare"
                 )
                 log.info(f"✓ Notificato Ingest per file generato: {unique_base_name}.json")
+            else:
+                await asyncio.to_thread(mark_upload, original_source, FAILED, "Nessun testo ricavato dal file")
 
             # Archiviazione allegato processato. Usiamo Path(filename).name
             # (solo il nome base) perché archive_target_dir mirrora già
@@ -748,6 +805,8 @@ async def process_single_job(payload: dict, channel: aio_pika.Channel):
 
     except Exception as e:
         log.error(f"Fallimento durante l'esplosione del manifest {rel_path}: {e}", exc_info=True)
+        if "original_source" in locals():
+            await asyncio.to_thread(mark_upload, original_source, FAILED, e)
         err_dir = ERROR_DIR / rel_path.parent
         err_dir.mkdir(parents=True, exist_ok=True)
         safe_move(file_path, err_dir / file_path.name)
@@ -757,6 +816,55 @@ async def process_single_job(payload: dict, channel: aio_pika.Channel):
 # ==============================================================================
 # 4. ORCHESTRAZIONE MESSAGE BROKER E LOOP PRINCIPALE
 # ==============================================================================
+
+async def process_conversion_job(job_id: str):
+    """
+    Lavoro delle API esterne (external_routes.py). Nella cartella del lavoro:
+    request.json e il file li scrive l'API; qui si aggiornano status.json e
+    result.md. Il file ricevuto si cancella a fine lavoro, comunque vada.
+    """
+    if not re.fullmatch(r"[0-9a-f]{32}", str(job_id)):
+        log.error(f"Lavoro di conversione con id non valido: {job_id!r}")
+        return
+    job_dir = settings.data_folder / "conversions" / job_id
+    if not (job_dir / "request.json").exists():
+        log.warning(f"Lavoro di conversione {job_id} non trovato (già scaduto?). Ignorato.")
+        return
+
+    def write_status(**status):
+        tmp = job_dir / "status.json.tmp"
+        tmp.write_text(json.dumps(status), encoding="utf-8")
+        tmp.replace(job_dir / "status.json")
+
+    request_data = json.loads((job_dir / "request.json").read_text(encoding="utf-8"))
+    input_path = job_dir / request_data["input_file"]
+    external_ocr = bool(request_data.get("external_ocr"))
+    write_status(status="running")
+    try:
+        if external_ocr:
+            md_content = await transcribe_externally(input_path, request_data["file_name"])
+        else:
+            md_content = await convert_file_to_markdown(input_path, request_data["file_name"])
+        if not md_content or not md_content.strip():
+            raise ValueError("Nessun testo estratto dal documento.")
+        tmp = job_dir / "result.md.tmp"
+        tmp.write_text(md_content, encoding="utf-8")
+        tmp.replace(job_dir / "result.md")
+        write_status(status="completed")
+        log.info(f"Conversione {job_id} completata: {len(md_content)} caratteri.")
+    except Exception as e:
+        log.error(f"Conversione {job_id} fallita: {e}", exc_info=True)
+        write_status(status="failed", code="conversion_failed",
+                     error=f"Trascrizione non riuscita: {e}" if external_ocr else "Conversione del documento non riuscita.")
+    finally:
+        input_path.unlink(missing_ok=True)
+
+
+async def on_conversion_message(message: aio_pika.IncomingMessage):
+    """Gli errori del lavoro finiscono in status.json: il messaggio si conferma comunque."""
+    async with message.process(requeue=False):
+        await process_conversion_job(json.loads(message.body.decode()).get("job_id"))
+
 
 async def on_message_received(message: aio_pika.IncomingMessage, channel: aio_pika.Channel):
     """Callback triggered all'arrivo di ogni messaggio da RabbitMQ."""
@@ -798,6 +906,10 @@ async def main_worker():
             await channel.set_qos(prefetch_count=CONCURRENCY_LIMIT)
 
             queue_in = await channel.get_queue("da-convertire")  # ← assume che esista già
+            # Conversioni delle API esterne: stesso limite di concorrenza dei documenti.
+            queue_conversions = await channel.declare_queue(
+                CONVERSION_QUEUE, durable=True, arguments=CONVERSION_QUEUE_ARGS)
+            await queue_conversions.consume(on_conversion_message)
 
             log.info(f"✓ Connessione stabilita. In ascolto sulla coda 'da-convertire' (concorrenza: {CONCURRENCY_LIMIT} file in parallelo).")
 
@@ -828,6 +940,7 @@ async def main_worker():
 
 if __name__ == "__main__":
     log.info("=== START: Servizio Normalizzazione Documentale (Event-Driven) ===")
+    publish_external_ocr_availability()
     try:
         asyncio.run(main_worker())
     except KeyboardInterrupt:
