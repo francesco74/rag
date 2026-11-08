@@ -523,7 +523,7 @@ Il database adotta il motore di archiviazione **InnoDB** con set di caratteri **
 13. **`review_locks`**: Blocco in modifica.
     - PK (`source`, `topic_id`, `sub_topic_id`); `user_id` (FK `ON DELETE CASCADE`), `username`, `display_name`, `acquired_at`, `expires_at`. Contano solo le righe con `expires_at > NOW()`: quelle scadute restano finché qualcuno non riprende il documento.
 
-Le modifiche allo schema dei database già installati sono in `misc/migrations/` (es. `review_locks.sql`, `parent_metadata_cleanup.sql`).
+Le modifiche allo schema dei database già installati sono in `misc/migrations/` (es. `parent_metadata_cleanup.sql`). Il passaggio di un'installazione dalla v3 alla v4 (MySQL, Qdrant, RabbitMQ, siti della chat e manifest Kubernetes) è descritto in [`misc/migrations/MIGRAZIONE_V3_V4.md`](misc/migrations/MIGRAZIONE_V3_V4.md).
 
 ## 8. Mappatura Dettagliata delle Variabili di Configurazione (`config.py`)
 
