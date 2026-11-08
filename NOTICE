@@ -1,9 +1,13 @@
 rag
-Copyright (C) 2026 Francesco Bertozzi <info@bertozzifrancesco.it>
+Copyright (C) 2025-2026 Francesco Bertozzi <info@bertozzifrancesco.it>
 
 Questo programma è software libero, distribuito con licenza GNU Affero General Public
 License, versione 3 o (a scelta) successiva (file LICENSE), con i termini aggiuntivi
 seguenti, ammessi dalla sezione 7 della licenza.
+
+Le versioni pubblicate fino al 2026-11-08 sono state distribuite con licenza Apache 2.0, che
+resta valida per chi le ha ricevute con quella licenza; sono disponibili anche con
+AGPL-3.0-or-later. Dalle versioni successive vale solo AGPL-3.0-or-later.
 
 Termini aggiuntivi (sezione 7, lettere b e c)
 
@@ -22,3 +26,6 @@ Additional terms under section 7(b) and 7(c) of the GNU AGPL v3:
 deployments, in the documentation and in any "about" or legal notices shown by the interface.
 (2) Modified versions must be reasonably marked as modified and must not be presented as
 the original version by the author.
+Versions published up to 2026-11-08 were released under the Apache License 2.0, which
+remains valid for those who received them under it; they are also available under
+AGPL-3.0-or-later. Later versions are licensed under AGPL-3.0-or-later only.

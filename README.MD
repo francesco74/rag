@@ -409,7 +409,7 @@ Il servizio `setup` risulta terminato (`Exited (0)`) dopo l'avvio: è normale, p
 
 ## Licenza
 
-Copyright (C) 2026 Francesco Bertozzi <info@bertozzifrancesco.it>.
+Copyright (C) 2025-2026 Francesco Bertozzi <info@bertozzifrancesco.it>.
 
 rag è software libero: si può ridistribuire e modificare secondo i termini della
 **GNU Affero General Public License** pubblicata dalla Free Software Foundation, versione 3
@@ -422,6 +422,7 @@ sorgente delle modifiche (art. 13 della licenza). Termini aggiuntivi (sezione 7,
 [`NOTICE`](NOTICE)): va conservata l'attribuzione all'autore e le versioni modificate vanno
 indicate come tali.
 
-Le versioni pubblicate fino al 2026-11-08 restano disponibili anche con la licenza Apache 2.0
-con cui erano state rilasciate. Le dipendenze mantengono le proprie licenze; tra queste
+Le versioni pubblicate fino al 2026-11-08 sono state distribuite con licenza Apache 2.0, che
+resta valida per chi le ha ricevute con quella licenza; sono disponibili anche con
+AGPL-3.0-or-later. Dalle versioni successive vale solo AGPL-3.0-or-later. Le dipendenze mantengono le proprie licenze; tra queste
 PyMuPDF e PyMuPDF4LLM (conversione dei PDF nel converter) sono AGPL-3.0.
