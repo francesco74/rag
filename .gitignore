@@ -1,5 +1,6 @@
 *
 !.gitignore
+!NOTICE
 !.env.example
 !ingestion/
 !saga_extract/

@@ -9,10 +9,14 @@ ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
 # --- Install System Dependencies ---
-# Update package lists and install LibreOffice.
+# LibreOffice Writer per DOCX/ODT (pa-common: conserva le tabelle con celle unite, che pandoc
+# perdeva) e font compatibili con i documenti Office.
 # Using --no-install-recommends keeps the image size smaller.
-# Cleaning up apt lists afterward also reduces image size.
+ENV HOME=/tmp
 RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        libreoffice-writer-nogui \
+        fonts-liberation fonts-dejavu-core fonts-crosextra-carlito fonts-crosextra-caladea && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 

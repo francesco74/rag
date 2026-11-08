@@ -1,8 +1,14 @@
-"""Test dell'OCR del converter con i veri SDK contro un server finto. Va eseguito nell'immagine del converter.
+"""Test dell'OCR e della conversione del converter (su pa-common) contro un server finto. Va
+eseguito nell'immagine del converter (serve LibreOffice per i documenti d'ufficio).
+
+I fornitori OCR con i veri SDK (Gemini, OpenAI, Anthropic, Mistral, vLLM, Ollama) e la
+conversione dei singoli formati sono provati in pa-common; qui la configurazione del RAG, il
+comando del revisore (modello esterno, Google Cloud Vision), i lavori di conversione, il
+conteggio delle pagine OCR e la ricostruzione di document_ocr.
 
 Uso:  python api/tests/test_ocr.py      (esce con 1 se qualcosa fallisce)
 """
-import asyncio, os, pathlib, sys, tempfile
+import asyncio, os, pathlib, shutil, subprocess, sys, tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path[:0] = [str(ROOT / "converter" / "src"), str(ROOT), str(ROOT / "api" / "tests")]
@@ -15,14 +21,20 @@ os.environ.update(AUTH_SECRET_KEY="x" * 40, API_SECRET_KEY="k", DATA_FOLDER=temp
                   LOCAL_VLLM_BASE_URL=fake.url + "/v1", OPENAI_BASE_URL=fake.url + "/v1", ANTHROPIC_BASE_URL=fake.url,
                   OCR_MODEL_NAME="qwen-vision", OCR_RATE_PER_MINUTE="100000", OCR_MAX_ATTEMPTS="3")
 
+import io
 from PIL import Image
-from tenacity import wait_none
-import ocr_provider
+from pa_common import processo
+from pa_common.conversione import Statistiche
+from pa_common.errori import OcrRifiutato, OcrTransitorio
+from pa_common.ocr import FornitoreOcr, Ocr
 import converter
 
-converter.async_ocr_generate.retry.wait = wait_none()
-converter.external_ocr_generate.retry.wait = wait_none()
-image = Image.new("RGB", (4, 4), "white")
+# I processi separati ("spawn") rilancerebbero questo script: qui basta la funzione.
+processo.esegui = lambda funzione, argomenti, timeout: funzione(*argomenti)
+
+buffer = io.BytesIO()
+Image.new("RGB", (4, 4), "white").save(buffer, format="PNG")
+png = buffer.getvalue()
 failures = 0
 
 
@@ -35,10 +47,6 @@ def check(label, got, expected=True):
         print(f"ok {label}")
 
 
-def ocr(as_markdown=True):
-    return asyncio.run(converter.async_ocr_generate(image, as_markdown=as_markdown))
-
-
 def fails_with(fn):
     try:
         fn()
@@ -47,62 +55,55 @@ def fails_with(fn):
         return type(e).__name__
 
 
-from common.utility import clean_ocr_text
+def senza_attese(ocr):
+    ocr._attesa = (0, 0)
+    return ocr
+
+
+from common.utility import clean_ocr_text, markdown_to_text, normalize_ws
 check("pulizia: sottolineato nei titoli", clean_ocr_text("## **<u>DETERMINAZIONE DIRIGENZIALE</u>**"), "## **DETERMINAZIONE DIRIGENZIALE**")
 check("pulizia: evidenziato e sottolineato, maiuscole", clean_ocr_text("_<U>pari a 695 mc.</U>_ <mark>x</mark>"), "_pari a 695 mc._ x")
 check("pulizia: altri tag restano", clean_ocr_text("m<sup>2</sup>"), "m<sup>2</sup>")
-check("clean: recinto e sillabazione", ocr_provider.clean_transcription("<think>x</think>\n```markdown\nparo-\nla\n```"), "parola")
+check("pulizia: spazi", normalize_ws("a&nbsp;&nbsp; b"), "a b")
+check("pulizia: Markdown in testo", markdown_to_text("| a | b |\n|---|---|\n| 1 | 2 |"), "a\tb\n\n1\t2")
 
-# --- vLLM: immagine inviata come data URL al modello scelto
+# --- Configurazione: OCR_PROVIDER=local con vLLM, il modello di OCR_MODEL_NAME
+ocr = senza_attese(converter.get_ocr())
+check("configurazione: vLLM e modello", (ocr.fornitore.nome, ocr.fornitore.modello, ocr.al_minuto, ocr.tentativi),
+      ("vllm", "qwen-vision", 100000, 3))
 fake.replies = [(200, "# Titolo\ntesto")]
-check("vllm: trascrizione", ocr(), "# Titolo\ntesto")
+check("vllm: trascrizione", asyncio.run(ocr.trascrivi(png)), "# Titolo\ntesto")
 path, body = fake.requests[-1]
 check("vllm: endpoint e modello", (path, body["model"]), ("/v1/chat/completions", "qwen-vision"))
-content = body["messages"][0]["content"]
-check("vllm: immagine", content[1]["image_url"]["url"].startswith("data:image/png;base64,"))
-check("vllm: Markdown richiesto", "Markdown" in content[0]["text"])
+fake.replies = [(429, {"error": {"message": "lento"}})] * 2 + [(200, "dopo il rate limit")]
+check("transitorio: ritentato", asyncio.run(ocr.trascrivi(png)), "dopo il rate limit")
 
-# --- Rate limit: si ritenta senza passare da Vision
-fake.requests.clear()
-fake.replies = [(429, {"error": {"message": "lento"}})] * 3 + [(200, "dopo il rate limit")]
-check("transitorio: ritentato", ocr(), "dopo il rate limit")
-
-fake.replies = [(500, {"error": {"message": "giù"}})] * 30
-check("transitorio: tentativi esauriti", fails_with(ocr), "OcrTransientError")
-fake.replies = []
-
-# --- Errore definitivo: nessun tentativo in più
-fake.requests.clear()
-fake.replies = [(400, {"error": {"message": "modello senza immagini"}})]
-check("definitivo: propagato", fails_with(ocr), "BadRequestError")
-check("definitivo: una sola chiamata", len(fake.requests), 1)
-
-# --- Risposta vuota: errore, non una pagina bianca nel documento
-fake.replies = [(200, "   ")]
-check("vuota: errore", fails_with(ocr), "ValueError")
-
-# --- Rifiuto del modello e ingestione: errore, nessun altro servizio
-filtered = (200, {"id": "x", "object": "chat.completion", "created": 0, "model": "m", "choices": [
-    {"index": 0, "finish_reason": "content_filter", "message": {"role": "assistant", "content": ""}}]})
-fake.replies = [filtered, filtered]
-check("bloccata: errore del fornitore", fails_with(ocr), "OcrBlockedError")
+# --- Rifiuto del modello in ingestione: documento in errore, nessun altro servizio
 def must_not_leave(*a, **k):
     raise AssertionError("uscita verso l'esterno")
-for name in ("get_external_fallback", "_cloud_vision_transcribe", "external_ocr_generate"):
-    setattr(converter, f"_saved_{name}", getattr(converter, name))
-    setattr(converter, name, must_not_leave)
-check("ingestione: rifiuto, documento in errore", fails_with(lambda: asyncio.run(converter._ocr_page(image))), "OcrBlockedError")
-fake.replies = [(400, {"error": {"message": "x"}})]
-check("ingestione: errore, documento in errore", fails_with(lambda: asyncio.run(converter._ocr_page(image))), "BadRequestError")
-for name in ("get_external_fallback", "_cloud_vision_transcribe", "external_ocr_generate"):
-    setattr(converter, name, getattr(converter, f"_saved_{name}"))
+filtered = (200, {"id": "x", "object": "chat.completion", "created": 0, "model": "m", "choices": [
+    {"index": 0, "finish_reason": "content_filter", "message": {"role": "assistant", "content": ""}}]})
+image_dir = pathlib.Path(tempfile.mkdtemp())
+(image_dir / "pagina.png").write_bytes(png)
+saved = converter.get_external_fallback, converter._cloud_vision_transcribe
+converter.get_external_fallback = converter._cloud_vision_transcribe = must_not_leave
+fake.replies = [filtered]
+check("ingestione: rifiuto, documento in errore",
+      fails_with(lambda: asyncio.run(converter.convert_file_to_markdown(image_dir / "pagina.png", "pagina.png"))), "OcrRifiutato")
+fake.replies = [(400, {"error": {"message": "modello senza immagini"}})]
+check("ingestione: errore, documento in errore",
+      fails_with(lambda: asyncio.run(converter.convert_file_to_markdown(image_dir / "pagina.png", "pagina.png"))), "ErroreOcr")
+converter.get_external_fallback, converter._cloud_vision_transcribe = saved
+fake.replies = []
 
 # --- Comando del revisore: modello esterno, poi Vision se abilitato
-class Scripted:
+class Scripted(FornitoreOcr):
+    nome, modello = "scripted", "prova"
+
     def __init__(self, *replies):
         self.replies, self.calls = list(replies), 0
 
-    async def transcribe(self, image, prompt):
+    async def trascrivi(self, image, prompt):
         self.calls += 1
         reply = self.replies.pop(0)
         if isinstance(reply, Exception):
@@ -110,23 +111,24 @@ class Scripted:
         return reply
 
 
-def on_demand(gemini, vision_on=True):
+def on_demand(fornitore, vision_on=True):
     used = []
-    def vision(_image):
+    def vision(_png):
         used.append("vision")
         return "da vision"
+    esterno = senza_attese(Ocr(fornitore)) if fornitore else None
     saved = converter.get_external_fallback, converter._cloud_vision_transcribe, converter.vision_enabled
-    converter.get_external_fallback, converter._cloud_vision_transcribe, converter.vision_enabled = lambda: gemini, vision, lambda: vision_on
+    converter.get_external_fallback, converter._cloud_vision_transcribe, converter.vision_enabled = lambda: esterno, vision, lambda: vision_on
     try:
         try:
-            return asyncio.run(converter._external_transcribe_page(image)), used
+            return asyncio.run(converter._external_transcribe_page(png)), used
         except Exception as e:
             return f"{type(e).__name__}: {e}", used
     finally:
         converter.get_external_fallback, converter._cloud_vision_transcribe, converter.vision_enabled = saved
 
 
-blocked, down = ocr_provider.OcrBlockedError("Gemini: RECITATION"), ocr_provider.OcrTransientError("giù")
+blocked, down = OcrRifiutato("Gemini: RECITATION"), OcrTransitorio("giù")
 check("richiesta: modello esterno", on_demand(Scripted("da gemini")), ("da gemini", []))
 gemini = Scripted(down, "da gemini")
 check("richiesta: esterno ritentato se transitorio", (on_demand(gemini), gemini.calls), (("da gemini", []), 2))
@@ -137,90 +139,54 @@ check("richiesta: rifiuto, Vision spento", (got, used), ("ValueError: Gemini: RE
 check("richiesta: esterno spento, Vision", on_demand(None), ("da vision", ["vision"]))
 check("richiesta: tutto spento", on_demand(None, vision_on=False)[1], [])
 
+
 def external(enabled=True, provider="openai", model="esterno-prova", key="chiave"):
     for name, value in (("fallback", enabled), ("provider", provider), ("model_name", model), ("api_key", key)):
         object.__setattr__(converter.settings, f"ocr_external_{name}", value)
-    ocr_provider._EXTERNAL_FALLBACK = None
-    return ocr_provider.get_external_fallback
+    converter._EXTERNAL_FALLBACK = None
+    return converter.get_external_fallback
+
 
 check("esterno: spento, nessun ripiego", external(enabled=False)(), None)
 check("esterno: fornitore sconosciuto", fails_with(external(provider="boh")), "ValueError")
 check("esterno: fornitore mancante", fails_with(external(provider="")), "ValueError")
 check("esterno: modello mancante", fails_with(external(model="")), "ValueError")
 check("esterno: chiave mancante", fails_with(external(key="")), "ValueError")
-for name, cls in (("gemini", "GeminiOcr"), ("openai", "OpenAICompatibleOcr"), ("anthropic", "AnthropicOcr"), ("mistral", "MistralOcr")):
+for name, cls in (("gemini", "OcrGemini"), ("openai", "OcrOpenAI"), ("anthropic", "OcrAnthropic"), ("mistral", "OcrMistral")):
     built = external(provider=name)()
-    check(f"esterno: {name}", (type(built).__name__, built._model), (cls, "esterno-prova"))
+    check(f"esterno: {name}", (type(built.fornitore).__name__, built.fornitore.modello), (cls, "esterno-prova"))
 fake.replies = [(200, "dal modello esterno")]
-check("esterno: usa il suo modello", (asyncio.run(external(provider="openai")().transcribe(image, "p")), fake.requests[-1][1]["model"]),
+check("esterno: usa il suo modello", (asyncio.run(external(provider="openai")().trascrivi(png)), fake.requests[-1][1]["model"]),
       ("dal modello esterno", "esterno-prova"))
 external(provider="boh")
 vision_calls = []
 saved = converter._cloud_vision_transcribe
 converter._cloud_vision_transcribe = vision_calls.append
-check("esterno: configurazione errata ferma il lavoro", (fails_with(lambda: asyncio.run(converter._external_transcribe_page(image))), vision_calls), ("ValueError", []))
+check("esterno: configurazione errata ferma il lavoro", (fails_with(lambda: asyncio.run(converter._external_transcribe_page(png))), vision_calls), ("ValueError", []))
 converter._cloud_vision_transcribe = saved
 external(enabled=False)
 
-# --- Gemini con il vero SDK: un rifiuto, anche con testo parziale, non è una trascrizione
-os.environ["GOOGLE_GEMINI_BASE_URL"] = fake.url
-real_gemini = ocr_provider.GeminiOcr(api_key="k", model="gemini-prova")
-def gemini_reply(reason, parts):
-    content = {"role": "model", "parts": parts} if parts else {}
-    fake.replies = [(200, {"candidates": [{"finishReason": reason, "content": content}]})]
-    return fails_with(lambda: asyncio.run(real_gemini.transcribe(image, "p")))
-check("gemini: rifiuto senza testo", gemini_reply("RECITATION", None), "OcrBlockedError")
-check("gemini: rifiuto con testo parziale", gemini_reply("RECITATION", [{"text": "parziale"}]), "OcrBlockedError")
-check("gemini: risposta normale", gemini_reply("STOP", [{"text": "ok"}]), None)
-check("gemini: modello del ripiego", "gemini-prova" in fake.requests[-1][0], True)
-del os.environ["GOOGLE_GEMINI_BASE_URL"]
-
-# --- Altri fornitori
-os.environ.setdefault("x", "y")
-provider = ocr_provider.OpenAICompatibleOcr()
-fake.replies = [(200, "openai ok")]
-check("openai", asyncio.run(provider.transcribe(image, "p")), "openai ok")
-
-provider = ocr_provider.AnthropicOcr()
-fake.replies = [(200, "claude ok")]
-check("anthropic", asyncio.run(provider.transcribe(image, "p")), "claude ok")
-check("anthropic: immagine", fake.requests[-1][1]["messages"][0]["content"][0]["source"]["media_type"], "image/png")
-
-provider = ocr_provider.MistralOcr()
-provider._client.sdk_configuration.server_url = fake.url
-fake.replies = [(200, "pixtral ok")]
-check("mistral: chat con immagine", asyncio.run(provider.transcribe(image, "p")), "pixtral ok")
-object.__setattr__(ocr_provider.settings, "ocr_model_name", "mistral-ocr-latest")
-provider = ocr_provider.MistralOcr()
-provider._client.sdk_configuration.server_url = fake.url
-fake.replies = [(200, {"model": "m", "pages": [
-    {"index": 0, "markdown": "pagina", "images": [], "dimensions": None}], "usage_info": {"pages_processed": 1}})]
-check("mistral: API OCR", asyncio.run(provider.transcribe(image, "p")), "pagina")
-check("mistral: endpoint OCR", fake.requests[-1][0], "/v1/ocr")
-
-check("ollama: si crea", type(ocr_provider.OllamaOcr()).__name__, "OllamaOcr")
-
-object.__setattr__(ocr_provider.settings, "ocr_provider", "local")
-object.__setattr__(ocr_provider.settings, "ocr_model_name", "")
+object.__setattr__(converter.settings, "ocr_model_name", "")
+converter._OCR = None
 try:
-    ocr_provider._build_provider()
+    converter.get_ocr()
     check("senza modello: errore", "nessun errore", "ValueError")
 except ValueError as e:
     check("senza modello: errore chiaro", "OCR_MODEL_NAME" in str(e), True)
+object.__setattr__(converter.settings, "ocr_model_name", "qwen-vision")
+converter._OCR = None
 
 # --- Lavoro del revisore: ogni pagina all'OCR esterno, senza passare dal modello locale
 import json, pymupdf
 calls = []
 
 
-async def fake_external_page(image):
+async def fake_external_page(_png):
     calls.append(1)
     return f"pagina {len(calls)}"
 
 
 real_page, converter._external_transcribe_page = converter._external_transcribe_page, fake_external_page
-# Il processo separato rilancerebbe questo script: qui basta la funzione.
-converter._run_killable = lambda target, args, timeout: target(*args)
 job_id = "a" * 32
 job_dir = converter.settings.data_folder / "conversions" / job_id
 job_dir.mkdir(parents=True)
@@ -234,13 +200,26 @@ check("lavoro esterno: esito", json.loads((job_dir / "status.json").read_text())
 check("lavoro esterno: ogni pagina", (job_dir / "result.md").read_text(), "pagina 1\n\n---\n\npagina 2")
 converter._external_transcribe_page = real_page
 
-# --- Documenti d'ufficio: testo e tabelle senza OCR
-import datetime, openpyxl, pandas, pypandoc
+# --- Documenti d'ufficio: testo e tabelle senza OCR (DOCX e ODT con LibreOffice)
+import datetime, openpyxl
+from odf.opendocument import OpenDocumentSpreadsheet
+from odf.table import Table, TableCell, TableRow
+from odf.text import P
 from common.file_intake import detect_extension_from_content
 office_dir = pathlib.Path(tempfile.mkdtemp())
-source_md = "# Determina\n\nIl **dirigente** dispone.\n\n| Voce | Importo |\n|---|---|\n| Pulizie | 1.200,00 |\n"
-for ext in ("docx", "odt"):
-    pypandoc.convert_text(source_md, ext, format="md", outputfile=str(office_dir / f"atto.{ext}"))
+if shutil.which("soffice"):
+    (office_dir / "atto.html").write_text("<html><body><h1>Determina</h1><p>Il <b>dirigente</b> dispone.</p>"
+                                          "<table><tr><td>Voce</td><td>Importo</td></tr>"
+                                          "<tr><td>Pulizie</td><td>1.200,00</td></tr></table></body></html>")
+    for ext, filtro in (("docx", "docx:MS Word 2007 XML"), ("odt", "odt")):
+        subprocess.run(["soffice", "--headless", "--convert-to", filtro, "--outdir", str(office_dir), str(office_dir / "atto.html")],
+                       check=True, capture_output=True, timeout=120)
+        check(f"ufficio: tipo riconosciuto atto.{ext}", detect_extension_from_content((office_dir / f"atto.{ext}").read_bytes()), f".{ext}")
+        text = asyncio.run(converter.convert_file_to_markdown(office_dir / f"atto.{ext}", f"atto.{ext}"))
+        check(f"ufficio: {ext} con titolo, grassetto e tabella",
+              ("# Determina" in text, "**dirigente**" in text, "| Pulizie | 1.200,00 |" in text), (True, True, True))
+else:
+    print("(LibreOffice non installato: DOCX e ODT non provati)")
 workbook = openpyxl.Workbook()
 workbook.active.title = "Spese"
 for row in (["Data", "Voce", "Importo"], [datetime.date(2026, 3, 1), "Pulizie", 1200.5], [None, None, None],
@@ -248,45 +227,58 @@ for row in (["Data", "Voce", "Importo"], [datetime.date(2026, 3, 1), "Pulizie", 
     workbook.active.append(row)
 workbook.create_sheet("Vuoto")
 workbook.save(office_dir / "conti.xlsx")
-pandas.DataFrame([["Comune", "Abitanti"], ["Lucca", 89000]]).to_excel(
-    office_dir / "comuni.ods", engine="odf", header=False, index=False, sheet_name="Comuni")
-for name in ("atto.docx", "atto.odt", "conti.xlsx", "comuni.ods"):
-    check(f"ufficio: tipo riconosciuto {name}", detect_extension_from_content((office_dir / name).read_bytes()),
-          pathlib.Path(name).suffix)
-for ext in ("docx", "odt"):
-    text = asyncio.run(converter.convert_file_to_markdown(office_dir / f"atto.{ext}", f"atto.{ext}"))
-    check(f"ufficio: {ext} con titolo, grassetto e tabella",
-          ("# Determina" in text, "**dirigente**" in text, "| Pulizie" in text and "1.200,00" in text), (True, True, True))
+documento = OpenDocumentSpreadsheet()
+tabella = Table(name="Comuni")
+for valori in (["Comune", "Abitanti"], ["Lucca", "89000"]):
+    riga = TableRow()
+    for v in valori:
+        cella = TableCell()
+        cella.addElement(P(text=v))
+        riga.addElement(cella)
+    tabella.addElement(riga)
+documento.spreadsheet.addElement(tabella)
+documento.save(str(office_dir / "comuni.ods"))
+for name in ("conti.xlsx", "comuni.ods"):
+    check(f"ufficio: tipo riconosciuto {name}", detect_extension_from_content((office_dir / name).read_bytes()), pathlib.Path(name).suffix)
+# date e numeri all'italiana; il nome del foglio come titolo se la cartella ne ha più di uno
 check("ufficio: xlsx", asyncio.run(converter.convert_file_to_markdown(office_dir / "conti.xlsx", "conti.xlsx")),
-      "## Spese\n\n| Data | Voce | Importo |\n|---|---|---|\n| 2026-03-01 | Pulizie | 1200.5 |\n| 2026-04-02 | a \\| b | 800 |")
+      "## Spese\n\n| Data | Voce | Importo |\n|---|---|---|\n| 01/03/2026 | Pulizie | 1200,5 |\n| 02/04/2026 | a \\| b | 800 |\n")
 check("ufficio: ods", asyncio.run(converter.convert_file_to_markdown(office_dir / "comuni.ods", "comuni.ods")),
-      "## Comuni\n\n| Comune | Abitanti |\n|---|---|\n| Lucca | 89000 |")
+      "| Comune | Abitanti |\n|---|---|\n| Lucca | 89000 |\n")
 check("ufficio: zip qualsiasi non è un documento", detect_extension_from_content(b"PK\x03\x04 non un archivio"), None)
+(office_dir / "ignoto.xyz").write_bytes(b"x")
+check("formato non gestito: ignorato", asyncio.run(converter.convert_file_to_markdown(office_dir / "ignoto.xyz", "ignoto.xyz")), None)
 
 # --- Conteggio delle pagine OCR
+class Trascrive:
+    async def trascrivi(self, png, *, markdown=True):
+        return "trascritto: " + "parole " * 20
+
+
 async def counted(path, name):
-    stats = {"ocr": 0, "total": 0}
-    converter.PAGE_STATS.set(stats)
-    await converter.convert_file_to_markdown(path, name)
-    return stats
+    stats = Statistiche()
+    await converter.convert_file_to_markdown(path, name, stats)
+    return stats.pagine_ocr, stats.pagine
 
 
-object.__setattr__(converter.settings, "ocr_vision_fallback", True)
-converter.async_ocr_generate = lambda image, as_markdown=False: asyncio.sleep(0, "trascritto")
+converter.get_ocr = lambda: Trascrive()
 image_path = job_dir / "pagina.png"
-image.save(image_path)
-check("pagine OCR: immagine", asyncio.run(counted(image_path, "pagina.png")), {"ocr": 1, "total": 1})
-converter._run_killable = lambda target, args, timeout: [{"type": "text", "content": "nativo"}, {"type": "image", "content": image_path.read_bytes()}]
+image_path.write_bytes(png)
+check("pagine OCR: immagine", asyncio.run(counted(image_path, "pagina.png")), (1, 1))
 pdf_path = job_dir / "misto.pdf"
-pdf.save(pdf_path)
-check("pagine OCR: pdf misto", asyncio.run(counted(pdf_path, "misto.pdf")), {"ocr": 1, "total": 2})
+with pymupdf.open() as misto:
+    pagina = misto.new_page()
+    for i in range(8):
+        pagina.insert_text((50, 50 + 16 * i), f"Riga {i} del testo nativo della determina, abbastanza lunga.")
+    misto.new_page()
+    misto.save(pdf_path)
+check("pagine OCR: pdf misto", asyncio.run(counted(pdf_path, "misto.pdf")), (1, 2))
 text_path = job_dir / "nota.txt"
 text_path.write_text("testo")
-check("pagine OCR: testo", asyncio.run(counted(text_path, "nota.txt")), {"ocr": 0, "total": 0})
+check("pagine OCR: testo", asyncio.run(counted(text_path, "nota.txt")), (0, 0))
 
 # --- Ricostruzione di document_ocr dai file archiviati
 import json, time
-import pymupdf
 import rebuild_document_ocr as rebuild
 
 archive = pathlib.Path(tempfile.mkdtemp())
@@ -296,7 +288,7 @@ with pymupdf.open() as doc:
     doc.new_page().insert_text((50, 50), "testo nativo " * 10)
     doc.new_page()
     doc.save(series / "misto.pdf")
-image.save(series / "foto.jpg")
+Image.new("RGB", (4, 4), "white").save(series / "foto.jpg")
 (series / "nota.txt").write_text("testo")
 (series / "rotto.pdf").write_bytes(b"non un pdf")
 docs = {"misto.pdf": "direct://arc/ser/sotto/misto.pdf", "foto.jpg": "direct://arc/ser/sotto/foto.jpg",
@@ -305,7 +297,7 @@ docs = {"misto.pdf": "direct://arc/ser/sotto/misto.pdf", "foto.jpg": "direct://a
 for name, source in docs.items():
     (series / f"{name}.json").write_text(json.dumps({"source": source, "files": [f"sotto/{name}"]}))
 (series / "atto.json").write_text(json.dumps({"source": "sicraweb://1", "files": ["a.jpg"]}))
-image.save(series / "a.jpg")
+Image.new("RGB", (4, 4), "white").save(series / "a.jpg")
 (series / "atto_a.json").write_text(json.dumps({"source": "sicraweb://1::a.jpg", "files": ["a.jpg"]}))
 (series / "estraneo.json").write_text(json.dumps({"source": "direct://altro.jpg", "files": ["a.jpg"]}))
 (series / "guasto.json").write_text("{")
@@ -333,6 +325,7 @@ rebuild.inspect_page = original_inspect
 
 marker = converter.DATA_FOLDER / converter.EXTERNAL_OCR_MARKER
 cred = converter.DATA_FOLDER / "cred.json"
+object.__setattr__(converter.settings, "ocr_vision_fallback", True)
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(cred)
 converter.publish_external_ocr_availability()
 check("credenziali assenti: niente Vision", marker.exists(), False)

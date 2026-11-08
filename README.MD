@@ -406,3 +406,22 @@ docker compose --env-file .env.local logs -f worker | grep SUMMARY           # r
 ```
 
 Il servizio `setup` risulta terminato (`Exited (0)`) dopo l'avvio: è normale, perché prepara code e collection e poi si ferma.
+
+## Licenza
+
+Copyright (C) 2026 Francesco Bertozzi <info@bertozzifrancesco.it>.
+
+rag è software libero: si può ridistribuire e modificare secondo i termini della
+**GNU Affero General Public License** pubblicata dalla Free Software Foundation, versione 3
+o (a scelta) successiva ([`LICENSE`](LICENSE), identificativo SPDX `AGPL-3.0-or-later`).
+È distribuito nella speranza che sia utile, ma **senza alcuna garanzia**, nemmeno implicita
+di commerciabilità o di idoneità a uno scopo particolare.
+
+Chi offre rag modificato come servizio in rete deve rendere disponibile agli utenti il codice
+sorgente delle modifiche (art. 13 della licenza). Termini aggiuntivi (sezione 7, file
+[`NOTICE`](NOTICE)): va conservata l'attribuzione all'autore e le versioni modificate vanno
+indicate come tali.
+
+Le versioni pubblicate fino al 2026-11-08 restano disponibili anche con la licenza Apache 2.0
+con cui erano state rilasciate. Le dipendenze mantengono le proprie licenze; tra queste
+PyMuPDF e PyMuPDF4LLM (conversione dei PDF nel converter) sono AGPL-3.0.

@@ -1,0 +1,24 @@
+rag
+Copyright (C) 2026 Francesco Bertozzi <info@bertozzifrancesco.it>
+
+Questo programma è software libero, distribuito con licenza GNU Affero General Public
+License, versione 3 o (a scelta) successiva (file LICENSE), con i termini aggiuntivi
+seguenti, ammessi dalla sezione 7 della licenza.
+
+Termini aggiuntivi (sezione 7, lettere b e c)
+
+1. Attribuzione. Chi copia, modifica o distribuisce il programma, o lo offre come servizio
+   in rete, deve conservare questo file NOTICE e le note di copyright, e riportare
+   l'attribuzione "rag – Francesco Bertozzi" nella documentazione e, se l'interfaccia
+   mostra informazioni legali o sul programma, anche lì.
+2. Versioni modificate. Le versioni modificate devono essere indicate come tali, in modo
+   ragionevole, e non presentate come la versione originale dell'autore.
+
+---
+
+Additional terms under section 7(b) and 7(c) of the GNU AGPL v3:
+(1) The above copyright notice, this NOTICE file and the author attribution
+"rag – Francesco Bertozzi" must be preserved in all copies, modified versions and network
+deployments, in the documentation and in any "about" or legal notices shown by the interface.
+(2) Modified versions must be reasonably marked as modified and must not be presented as
+the original version by the author.

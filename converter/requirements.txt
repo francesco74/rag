@@ -1,25 +1,11 @@
-Pillow>=10.0.0
-PyMuPDF>=1.23.0
-pymupdf4llm>=0.0.12
-# AI & Cloud Vision
-google-genai
-openai>=1.40,<3
-anthropic>=0.40
-mistralai>=2,<3
-ollama>=0.5
+# Conversione in Markdown (PDF con PyMuPDF4LLM e OCR, documenti d'ufficio con LibreOffice,
+# fogli di calcolo), OCR con tutti i fornitori, buste .p7m: libreria condivisa con atti-pa
+# (https://github.com/francesco74/pa-common), versione fissata dal tag
+pa-common[tutto] @ https://github.com/francesco74/pa-common/archive/refs/tags/v0.1.0.tar.gz
+
+# Comando del revisore: ripiego su Google Cloud Vision
 google-cloud-vision>=3.4.0
 
-# Concorrenza, Resilienza e Rate Limiting
-aiolimiter>=1.1.0
-tenacity>=8.2.0
 python-dotenv
 aio_pika>=8.0.0
 mysql-connector-python==9.5.0
-
-asn1crypto>=1.5.1
-
-# Documenti d'ufficio: pandoc (incluso nel pacchetto) per docx/odt, pandas per xlsx/ods
-pypandoc_binary>=1.13
-pandas>=2.0
-openpyxl>=3.1
-odfpy>=1.4

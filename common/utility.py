@@ -5,10 +5,11 @@ import re
 import secrets
 from typing import Optional
 
+from pa_common.testo import markdown_in_testo, normalizza_spazi, pulisci_ocr
+
 
 _SENTINEL_DATES_ISO = {"0001-01-01"}
 log = logging.getLogger("UTILITY")
-_WS_RE = re.compile(r'(?:&nbsp;|&#160;|\xa0|\s)+')
 
 # Lo scrive il converter, che ha chiavi e credenziali: l'API sa così se l'OCR esterno è utilizzabile.
 EXTERNAL_OCR_MARKER = "converter/ocr_esterno_disponibile"
@@ -125,86 +126,16 @@ def quiet_http_loggers():
         logging.getLogger(name).setLevel(logging.WARNING)
 
 
-def normalize_ws(text: str) -> str:
-    """Collassa entità HTML di spaziatura e whitespace ripetuto in un solo
-    spazio. Applicata al momento della query (rerank e rendering), NON in
-    ingestione: i vettori in Qdrant restano calcolati sul testo originale."""
-    if not text:
-        return text
-    return _WS_RE.sub(' ', text).strip()
-
-# Spazio non separabile scritto dall'OCR come entità HTML o come carattere.
-_NBSP = r'(?:&nbsp;|&#160;|&#xa0;|\xa0)'
-_NBSP_RE = re.compile(_NBSP, re.IGNORECASE)
-_LEADING_RE = re.compile(rf'^(?:[ \t]|{_NBSP})*', re.IGNORECASE)
-# Evidenziato e sottolineato: li aggiunge l'estrazione del PDF, il Markdown non li ha.
-_MARK_RE = re.compile(r'</?(?:mark|u)\s*>', re.IGNORECASE)
-_GAP_RE = re.compile(r' {3,}')            # colonne allineate a spazi
-_SPACES_RE = re.compile(r' {2,}')
-_BLANK_LINES_RE = re.compile(r'\n{3,}')
-
-
-def clean_ocr_text(text: str) -> str:
-    """
-    Toglie dal testo OCR gli spazi usati per imitare l'impaginazione, senza
-    perdere la struttura Markdown né le colonne di dati.
-
-    L'OCR riproduce rientri e allineamenti con sequenze di &nbsp; (decine per
-    una firma allineata a destra): per l'LLM sono solo token sprecati, perché
-    non "vede" la pagina. Regole, riga per riga:
-      - rientro iniziale fatto con &nbsp; (impaginazione): tolto. Un rientro
-        di soli spazi normali resta: in Markdown annida elenchi e codice;
-      - 3 o più spazi dentro la riga (colonne allineate): una tabulazione, che
-        l'LLM legge come "colonna successiva" ("Repairs  £45   £12");
-      - 2 spazi dentro la riga (es. dopo il punto, a macchina): uno;
-      - nelle righe di tabella Markdown (| ... |) gli spazi multipli sono solo
-        imbottitura delle celle: uno;
-      - spazi a fine riga: tolti; più di una riga vuota di fila: una;
-      - tag <mark> e <u> dell'estrazione: tolti, il testo che racchiudono resta.
-    I blocchi di codice (```) restano come sono.
-    """
-    if not text:
-        return text
-    text = _MARK_RE.sub('', text)
-    out = []
-    in_code = False
-    for line in text.split('\n'):
-        if line.lstrip().startswith('```'):
-            in_code = not in_code
-            out.append(line.rstrip())
-            continue
-        if in_code:
-            out.append(line)
-            continue
-        lead = _LEADING_RE.match(line).group(0)
-        body = line[len(lead):]
-        # Rientro con &nbsp; = impaginazione dell'OCR; solo spazi = Markdown
-        indent = '' if _NBSP_RE.search(lead) else lead.replace('\t', '    ')
-        body = _NBSP_RE.sub(' ', body).replace('\t', '   ').rstrip()
-        if body.startswith('|'):
-            body = _SPACES_RE.sub(' ', body)
-        else:
-            body = _SPACES_RE.sub(' ', _GAP_RE.sub('\t', body))
-        out.append(indent + body)
-    return _BLANK_LINES_RE.sub('\n\n', '\n'.join(out)).strip('\n')
-
-
-_MD_RULES = (
-    (re.compile(r'<!--.*?-->', re.DOTALL), ''),
-    (re.compile(r'^\s*```[^\n]*$', re.MULTILINE), ''),
-    (re.compile(r'!\[([^\]]*)\]\([^)]*\)'), r'\1'),            # immagini
-    (re.compile(r'\[([^\]]+)\]\([^)]*\)'), r'\1'),             # collegamenti
-    (re.compile(r'</?[a-zA-Z][^>\n]*>'), ''),                     # tag HTML
-    (re.compile(r'^[ \t]*\|?[ \t:|-]*-[ \t:|-]*\|?[ \t]*$', re.MULTILINE), ''),  # separatori di tabella
-    (re.compile(r'^[ \t]{0,3}#{1,6}[ \t]+', re.MULTILINE), ''),    # titoli
-    (re.compile(r'^[ \t]*(?:-{3,}|\*{3,}|_{3,})[ \t]*$', re.MULTILINE), ''),  # righe orizzontali
-    (re.compile(r'^[ \t]*>[ \t]?', re.MULTILINE), ''),             # citazioni
-    (re.compile(r'(\*\*|__)(?=\S)(.+?)(?<=\S)\1'), r'\2'),       # grassetto
-    (re.compile(r'(?<![\w*])\*(?=\S)(.+?)(?<=\S)\*(?![\w*])'), r'\1'),  # corsivo
-    (re.compile(r'(?<![\w_])_(?=\S)(.+?)(?<=\S)_(?![\w_])'), r'\1'),
-    (re.compile(r'~~(.+?)~~'), r'\1'),
-    (re.compile(r'`([^`\n]+)`'), r'\1'),
-)
+# Pulizia del testo: in pa-common (pa_common.testo, condiviso con atti-pa).
+#   normalize_ws: entità HTML di spaziatura e spazi ripetuti in un solo spazio. Applicata al
+#     momento della query (rerank e rendering), NON in ingestione: i vettori in Qdrant
+#     restano calcolati sul testo originale.
+#   clean_ocr_text: toglie dal testo OCR gli spazi usati per imitare l'impaginazione, senza
+#     perdere la struttura Markdown né le colonne di dati.
+#   markdown_to_text: testo semplice dal Markdown, le righe di tabella diventano colonne.
+normalize_ws = normalizza_spazi
+clean_ocr_text = pulisci_ocr
+markdown_to_text = markdown_in_testo
 
 
 def is_permanent_error(error: Exception) -> bool:
@@ -216,19 +147,6 @@ def is_permanent_error(error: Exception) -> bool:
         status = getattr(error, "code", None)
     return isinstance(status, int) and 400 <= status < 500 and status not in (408, 409, 425, 429)
 
-
-def markdown_to_text(markdown: str) -> str:
-    """Testo semplice dal Markdown: via la formattazione, le righe di tabella diventano colonne con tabulazioni."""
-    text = clean_ocr_text(markdown or "")
-    for pattern, replacement in _MD_RULES:
-        text = pattern.sub(replacement, text)
-    lines = []
-    for line in text.split("\n"):
-        stripped = line.strip()
-        if stripped.startswith("|") and stripped.endswith("|") and len(stripped) > 1:
-            line = "\t".join(cell.strip() for cell in stripped[1:-1].split("|"))
-        lines.append(line.rstrip())
-    return _BLANK_LINES_RE.sub("\n\n", "\n".join(lines)).strip()
 
 
 # Coda dei lavori di conversione: la usano API, converter e setup_rabbitmq, che

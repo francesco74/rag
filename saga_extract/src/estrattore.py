@@ -10,7 +10,7 @@ import pika
 import os
 from common.db_logger import MySQLLogHandler, init_db_pool
 from dotenv import load_dotenv
-from asn1crypto.cms import ContentInfo
+from pa_common.ingresso import sbusta_p7m
 from common.utility import clean_iso_date
 
 load_dotenv()
@@ -103,48 +103,17 @@ def get_dati_atto_da_leggi_atto_plus(repwss_client, uid: str):
 
 
 def try_extract_pdf_from_pkcs7(file_bytes: bytes, filename: str = "") -> Optional[bytes]:
-    """
-    Tenta di interpretare file_bytes come busta di firma PKCS7/CMS (CAdES) e,
-    se lo è, ne estrae il contenuto incapsulato (il PDF originale).
-
-    NON si basa sul nome del file (Sicr@Web può restituire allegati con
-    estensione ".pdf" il cui contenuto è in realtà ancora una busta CAdES non
-    sbustata — mislabeling a monte, confermato su file reali) né su euristiche
-    sui byte grezzi: usiamo asn1crypto per un parsing ASN.1 vero, controllando
-    semanticamente il campo content_type.
-
-    Restituisce:
-    - None se file_bytes NON è una struttura PKCS7 valida (caso normale: PDF
-      nativo già in chiaro) — il chiamante deve procedere con file_bytes
-      originali, nessun errore da segnalare.
-    - i bytes del PDF estratto, se file_bytes è una busta PKCS7 di tipo
-      signed_data e l'estrazione riesce.
-
-    Solleva ValueError SOLO se la struttura è riconosciuta come PKCS7
-    signed_data ma l'estrazione del contenuto incapsulato fallisce
-    (caso anomalo/da indagare, distinto da "non era affatto una busta").
-    """
-    try:
-        content_info = ContentInfo.load(file_bytes)
-    except Exception:
-        # Non è (o non è un valido) ASN.1: quasi certamente un PDF nativo normale.
-        return None
-
-    if content_info['content_type'].native != 'signed_data':
-        # E' una struttura ASN.1 valida ma non una busta di firma: non il nostro caso.
-        return None
-
-    try:
-        signed_data = content_info['content']
-        encap_content_info = signed_data['encap_content_info']
-        raw_content = encap_content_info['content'].native
-        extracted_bytes = raw_content if isinstance(raw_content, bytes) else encap_content_info['content'].chosen.contents
+    """Il documento dentro una busta di firma PKCS7/CAdES, None se il contenuto non è una busta
+    (caso normale: PDF nativo già in chiaro). Si basa sul CONTENUTO, non sul nome: Sicr@Web può
+    restituire allegati ".pdf" che sono ancora buste CAdES non sbustate (mislabeling a monte,
+    confermato su file reali). Solleva ValueError se è una busta ma il documento non si estrae.
+    L'implementazione è in pa-common (pa_common.ingresso.sbusta_p7m), condivisa con atti-pa."""
+    documento = sbusta_p7m(file_bytes)
+    if documento is not None:
         log.debug("Sbustamento completato per %s", filename)
-        return extracted_bytes
-    except Exception as e:
-        log.error("Fallimento sbustamento P7M per %s: %s", filename, str(e))
-        raise ValueError(f"Decodifica P7M fallita: {str(e)}")
-    
+    return documento
+
+
 def get_rabbitmq_channel():
     """Inizializza la connessione al broker per pubblicare gli eventi."""
     try:

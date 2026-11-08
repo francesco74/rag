@@ -11,3 +11,7 @@ aiolimiter
 google-api-core==2.28.1
 mysql-connector-python==9.5.0
 tiktoken
+
+# libreria condivisa con atti-pa (https://github.com/francesco74/pa-common): pulizia del testo
+# (common/utility.py), file in ingresso e buste .p7m (common/file_intake.py); versione dal tag
+pa-common @ https://github.com/francesco74/pa-common/archive/refs/tags/v0.1.0.tar.gz

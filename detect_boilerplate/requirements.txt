@@ -36,3 +36,7 @@ google-genai>=0.1.1
 # quindi con --no-vectors lo script non carica affatto worker.py e resta
 # leggero. Per un CronJob dedicato alla sola scrittura MySQL, esegui con
 # --no-vectors e ometti google-genai.
+
+# libreria condivisa con atti-pa (https://github.com/francesco74/pa-common): pulizia del testo
+# (common/utility.py), file in ingresso e buste .p7m (common/file_intake.py); versione dal tag
+pa-common @ https://github.com/francesco74/pa-common/archive/refs/tags/v0.1.0.tar.gz

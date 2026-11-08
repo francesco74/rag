@@ -149,12 +149,13 @@ I documenti caricati manualmente dagli utenti vengono elaborati tramite il modul
 
 ### Fase B: Estrazione Ibrida, OCR Avanzato e Fallback Dinamico (`converter.py`)
 
-Il modulo `converter.py` consuma il messaggio e avvia la normalizzazione testuale tramite un approccio asincrono guidato da `AsyncLimiter` (`OCR_RATE_PER_MINUTE` chiamate al minuto, predefinito 10, OCR esterno compreso):
+Il modulo `converter.py` consuma il messaggio e avvia la normalizzazione testuale. La conversione, l'OCR e i controlli sui file sono nella libreria **pa-common** (<https://github.com/francesco74/pa-common>, condivisa con atti-pa, versione fissata nei `requirements.txt`); nel converter restano code, cartelle, registro su database, comando del revisore e Google Cloud Vision. L'OCR rispetta `OCR_RATE_PER_MINUTE` chiamate al minuto (predefinito 10, OCR esterno compreso):
 
-1. **Analisi della Densità Informativa (PDF)**:
-   - Estrae il testo di ogni pagina tramite PyMuPDF, con una maschera di ritaglio basata sulla costante `CROP_OCR_LIMIT` (oggi 0: nessun ritaglio).
-   - Se una pagina ha meno di 50 caratteri nativi, oppure più di 1500 elementi vettoriali e meno di 1000 caratteri (`inspect_page`), viene catalogata come **scansionata** o **immagine** ed inviata alla pipeline OCR. Altrimenti viene convertita direttamente in Markdown strutturato tramite `pymupdf4llm`.
-2. **Generazione OCR con il modello scelto** (`converter/src/ocr_provider.py`):
+1. **Analisi della Densità Informativa (PDF)** (`pa_common.conversione.pdf`):
+   - Le buste di firma `.p7m` si sbustano anche quando l'allegato è dichiarato `.pdf` (Sicr@Web) e il contenuto deve corrispondere all'estensione (`pa_common.ingresso`).
+   - Se una pagina ha meno di 50 caratteri nativi, oppure più di 1500 elementi vettoriali e meno di 1000 caratteri (`ispeziona_pagina`), viene catalogata come **scansionata** o **immagine** ed inviata alla pipeline OCR. Altrimenti viene convertita direttamente in Markdown strutturato tramite `pymupdf4llm`, in un processo separato con la catena layout AI (10 minuti), modalità semplice (5 minuti), OCR di tutte le pagine. Intestazioni e piè di pagina ripetuti in almeno metà delle pagine e i numeri di pagina si tolgono; le pagine sono separate da `---`.
+   - Documenti d'ufficio: DOCX e ODT con LibreOffice e lettura dell'ODT (le tabelle con celle unite restano, pandoc le perdeva); fogli di calcolo con una tabella per foglio, numeri e date all'italiana.
+2. **Generazione OCR con il modello scelto** (`pa_common.ocr`, configurato in `converter.py`):
    - La pagina scansionata o l'immagine nativa viene passata al modello multimodale `OCR_MODEL_NAME` del fornitore `OCR_PROVIDER` (`gemini`, `openai`, `anthropic`, `mistral`, `local` con vLLM o Ollama) per una trascrizione in formato Markdown. Rate limit, sovraccarico e rete vengono ritentati (`OCR_MAX_ATTEMPTS`); gli altri errori no.
 3. **Nessun ripiego automatico**:
    - Se il modello OCR scelto (`OCR_PROVIDER`, locale o no) fallisce, resta irraggiungibile o rifiuta la pagina, il documento va in errore e non viene inviato ad altri servizi.
@@ -169,7 +170,7 @@ Il worker di ingestion consuma l'evento sulla coda `da-indicizzare`, applicando 
 1. **Risoluzione dei Parametri dal DB**:
    - Recupera i parametri di chunking interrogando la tabella MySQL `sub_topics`. Se non presenti, applica i default di sistema (`chunk_size = 500`, `chunk_overlap = 100`, `parent_chunk_size = 1500`, `use_markdown_splitter = True`).
    - Le chiavi di sistema (`settings.protected_keys`) eventualmente presenti tra i `metadati` del manifest vengono scartate con un WARNING (`split_protected_metadata`): i campi di sistema li imposta l'ingest.
-2. **Pulizia del testo OCR (`clean_ocr_text`, `common/utility.py`)**:
+2. **Pulizia del testo OCR (`clean_ocr_text`, `common/utility.py`, da `pa_common.testo`)**:
    - Prima dello splitting il testo viene ripulito degli spazi con cui l'OCR imita l'impaginazione: rientri fatti con `&nbsp;` (decine per una firma allineata a destra) rimossi; sequenze di 3+ spazi dentro la riga (colonne allineate) sostituite da una tabulazione; doppi spazi ridotti a uno; imbottitura delle celle delle tabelle Markdown, spazi finali, righe vuote ripetute e tag `<mark>` eliminati. Rientri di soli spazi normali (elenchi annidati) e blocchi di codice restano invariati.
    - Il file `.md` su disco **non** viene modificato: la revisione mostra al revisore l'impaginazione originale dell'OCR. La pulizia vale solo per parent, chunk ed embedding.
    - I documenti indicizzati prima dell'introduzione della pulizia si ripassano con `utils/reindex_topic.py` (capitolo 10).

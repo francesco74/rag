@@ -23,7 +23,10 @@ from pathlib import Path
 import pymupdf
 
 from common.db_logger import get_db_connection, init_db_pool
-from converter import ARCHIVE_DIR, IMG_EXTENSIONS, inspect_page, try_extract_pdf_from_pkcs7
+from pa_common.conversione.pdf import ispeziona_pagina as inspect_page
+from pa_common.ingresso import sbusta_p7m
+
+from converter import ARCHIVE_DIR, IMG_EXTENSIONS
 
 TEXT_EXTENSIONS = (".txt", ".md", ".docx", ".odt", ".xlsx", ".ods")
 FORK = mp.get_context("fork")
@@ -32,7 +35,7 @@ FORK = mp.get_context("fork")
 def _count_pdf_pages(path, pipe):
     try:
         data = path.read_bytes()
-        data = try_extract_pdf_from_pkcs7(data, path.name) or data
+        data = sbusta_p7m(data) or data
         with pymupdf.open(stream=data, filetype="pdf") as doc:
             pipe.send((sum(inspect_page(page)[3] for page in doc), len(doc)))
     except Exception as e:
