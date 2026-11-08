@@ -104,6 +104,33 @@ check("embedding: query", embedding.embed_query("testo"), [0.5, 0.5])
 path, body = fake.requests[-1]
 check("embedding: richiesta", (path, body["model"], "dimensions" in body), ("/v1/embeddings", "BAAI/bge-m3", False))
 check("embedding: documenti", asyncio.run(provider.embed_documents_batch(["a", "b"])), [[0.5, 0.5], [0.5, 0.5]])
+check("embedding: senza istruzione", body["input"], ["testo"])
+
+# --- Istruzione per le domande (Qwen3-Embedding): solo sulle domande della ricerca
+object.__setattr__(settings, "embedding_query_instruction", "Given a question, retrieve passages")
+provider = embedding.init_embedding()
+embedding.embed_query("chi firma?")
+check("istruzione: domanda", fake.requests[-1][1]["input"], ["Instruct: Given a question, retrieve passages\nQuery:chi firma?"])
+embedding.embed_queries_batch(["a", "b"])
+check("istruzione: più domande", [t.split("Query:")[1] for t in fake.requests[-1][1]["input"]], ["a", "b"])
+embedding.embed_for_semantic_query("concetto")
+check("istruzione: non nei confronti tra frasi", fake.requests[-1][1]["input"], ["concetto"])
+asyncio.run(provider.embed_documents_batch(["doc"]))
+check("istruzione: non nei documenti", fake.requests[-1][1]["input"], ["doc"])
+object.__setattr__(settings, "embedding_query_instruction", None)
+
+# --- Vettori di dimensione diversa da EMBEDDING_DIMENSION: errore chiaro e permanente
+from common.utility import is_permanent_error
+object.__setattr__(settings, "embedding_dimension", 3)
+provider = embedding.init_embedding()
+for label, call in (("query", lambda: embedding.embed_query("x")),
+                    ("documenti", lambda: asyncio.run(provider.embed_documents_batch(["x"])))):
+    try:
+        call()
+        check(f"dimensione errata: {label}", False)
+    except embedding.EmbeddingDimensionError as e:
+        check(f"dimensione errata: {label}", ("2 dimensioni" in str(e), is_permanent_error(e)), (True, True))
+object.__setattr__(settings, "embedding_dimension", 2)
 
 print(f"\n{'TUTTO OK' if not failures else f'{failures} FALLITI'}")
 sys.exit(1 if failures else 0)

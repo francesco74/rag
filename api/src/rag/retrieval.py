@@ -220,6 +220,11 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
                     limit=semantic_size,
                     score_threshold=semantic_threshold,
                     query_filter=models.Filter(must=must_conditions),
+                    # Con la copia int8 (setup_qdrant.collection_params): ricerca sulla copia
+                    # compressa, poi i migliori oversampling x limite riordinati con i vettori
+                    # pieni. Senza quantizzazione Qdrant ignora questi parametri.
+                    search_params=models.SearchParams(quantization=models.QuantizationSearchParams(
+                        rescore=True, oversampling=settings.qdrant_oversampling)),
                     with_vectors=needs_vectors  # centroid-per-parent: solo se MMR è attivo
                 )
                 points = [group.hits[0] for group in res.groups if group.hits]

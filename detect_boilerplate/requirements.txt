@@ -25,10 +25,12 @@ python-dotenv>=1.0.0
 mysql-connector-python>=8.2.0
 
 # --- Solo se NON usi --no-vectors ------------------------------------
-# La sincronizzazione dei vettori-frase importa embed_for_semantic_query da
-# worker.py, che usa il client Google GenAI. Con --no-vectors lo script
-# popola solo MySQL e questa dipendenza non viene toccata.
+# La sincronizzazione dei vettori-frase usa embed_for_semantic_query di
+# common/embedding.py: client Google GenAI con EMBEDDING_PROVIDER=gemini,
+# client OpenAI con openai e vllm (es. Qwen3-Embedding sul DGX). Con
+# --no-vectors lo script popola solo MySQL e non li usa.
 google-genai>=0.1.1
+openai>=1.40,<3
 
 # NOTA: numpy, onnxruntime, transformers, celery, redis ecc. NON servono a
 # questo script. Vengono trascinati solo se importi worker.py per intero;

@@ -25,7 +25,9 @@ Supported providers (set via EMBEDDING_PROVIDER env var, default: gemini):
   local     — sentence-transformers dentro il processo (nell'immagine dell'API,
               non in quella dell'ingestione).
   vllm      — modello servito da vLLM (LOCAL_VLLM_EMBEDDING_MODEL), con lo
-              stesso protocollo di OpenAI. Simmetrico.
+              stesso protocollo di OpenAI. Simmetrico, salvo l'istruzione
+              facoltativa per le domande (EMBEDDING_QUERY_INSTRUCTION) dei
+              modelli che la prevedono, come Qwen3-Embedding.
 
 Ogni provider espone un attributo `dimension`: è la dimensionalità dei vettori
 prodotti, da usare per configurare VectorParams(size=...) in Qdrant quando si
@@ -410,11 +412,29 @@ class LocalEmbeddingProvider(EmbeddingProvider):
 # ==============================================================================
 # VLLM PROVIDER
 # ==============================================================================
+class EmbeddingDimensionError(ValueError):
+    """Il modello restituisce vettori di lunghezza diversa da EMBEDDING_DIMENSION.
+    Errore di configurazione: status_code 400 lo rende permanente per
+    common.utility.is_permanent_error, così l'ingestione non lo ritenta."""
+    status_code = 400
+
+
 class VLLMEmbeddingProvider(OpenAIEmbeddingProvider):
     """
     vLLM parla il protocollo di OpenAI: cambiano indirizzo e modello. La
     dimensione è quella nativa del modello, da dichiarare in EMBEDDING_DIMENSION
-    (bge-m3: 1024): a differenza di OpenAI non si può chiedere una troncatura.
+    (bge-m3: 1024, Qwen3-Embedding-4B: 2560): non si chiede una troncatura, e
+    ogni risposta è controllata: un vettore di lunghezza diversa è un errore
+    chiaro qui, non un rifiuto poco leggibile di Qdrant più avanti.
+
+    Domande e documenti: i modelli asimmetrici come Qwen3-Embedding vogliono
+    le DOMANDE della ricerca precedute da un'istruzione ("Instruct: <compito>
+    \nQuery:<domanda>") e i documenti senza. Con EMBEDDING_QUERY_INSTRUCTION
+    impostata, embed_query ed embed_queries_batch la aggiungono; documenti e
+    confronti frase-frase (embed_for_semantic_query: concetti, boilerplate)
+    restano senza, perché confrontano testi dello stesso tipo. L'istruzione
+    tocca solo i vettori delle domande: cambiarla non richiede di ricalcolare
+    i documenti, ma svuotare la cache semantica (contiene vettori di domande).
     """
 
     def __init__(self):
@@ -432,14 +452,37 @@ class VLLMEmbeddingProvider(OpenAIEmbeddingProvider):
         self._async_client = AsyncOpenAI(api_key=api_key, base_url=base_url)
         self._RateLimitError = RateLimitError
         self._APIStatusError = APIStatusError
-        log.info(f"✓ VLLMEmbeddingProvider initialized (model={self.model_name}, dim={self.dimension}).")
+        self.query_instruction = settings.embedding_query_instruction
+        log.info(f"✓ VLLMEmbeddingProvider initialized (model={self.model_name}, dim={self.dimension}, "
+                 f"istruzione per le domande: {'sì' if self.query_instruction else 'no'}).")
+
+    def _checked(self, response):
+        vectors = [d.embedding for d in response.data]
+        for vector in vectors:
+            if len(vector) != self.dimension:
+                raise EmbeddingDimensionError(
+                    f"Il modello '{self.model_name}' restituisce vettori di {len(vector)} dimensioni, "
+                    f"EMBEDDING_DIMENSION è {self.dimension}: allinearli (e le collection di Qdrant).")
+        return vectors
+
+    def _as_query(self, text):
+        if not self.query_instruction:
+            return text
+        return f"Instruct: {self.query_instruction}\nQuery:{text}"
 
     def _embed_sync(self, texts):
         try:
             response = self._client.embeddings.create(model=self.model_name, input=texts)
-            return [d.embedding for d in response.data]
         except (self._RateLimitError, self._APIStatusError) as e:
             self._raise_if_rate_limited(e)
+        return self._checked(response)
+
+    def embed_query(self, query):
+        return _retry_with_backoff(lambda: self._embed_sync([self._as_query(query)]))[0]
+
+    def embed_queries_batch(self, queries_list):
+        texts = [queries_list] if isinstance(queries_list, str) else queries_list
+        return _retry_with_backoff(lambda: self._embed_sync([self._as_query(t) for t in texts]))
 
     async def embed_documents_batch(self, texts):
         if not texts:
@@ -448,9 +491,9 @@ class VLLMEmbeddingProvider(OpenAIEmbeddingProvider):
         async def _attempt():
             try:
                 response = await self._async_client.embeddings.create(model=self.model_name, input=texts)
-                return [d.embedding for d in response.data]
             except (self._RateLimitError, self._APIStatusError) as e:
                 self._raise_if_rate_limited(e)
+            return self._checked(response)
 
         return await _retry_with_backoff_async(_attempt)
 

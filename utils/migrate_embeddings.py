@@ -1,224 +1,266 @@
 """
-migrate_embeddings.py — Re-embedding di TUTTE le collection Qdrant legate a
-EMBEDDING_PROVIDER, ripartendo dal testo già salvato nel payload dei punti.
-Nessun bisogno di rifare OCR/conversion né richiamare converter.py.
+migrate_embeddings.py — cambio del modello di embedding: ricalcolo dei vettori
+di tutte le collection Qdrant a partire dal testo già salvato nel payload. Non
+servono né la conversione né l'OCR. Procedura completa:
+misc/migrations/MIGRAZIONE_EMBEDDING.md.
 
-Il worker (worker.py) tocca QUATTRO collection con vettori nello stesso
-spazio embedding, non solo una:
+Collection coinvolte (tutte nello stesso spazio vettoriale):
 
-    document_chunks         i chunk indicizzati (retrieval principale)
-    conceptual_dictionary   dizionario concetti/alias (get_concepts_by_similarity)
-    boilerplate_phrases     frasi ricorrenti da filtrare (load_active_boilerplate)
-    semantic_cache          cache delle risposte già date
+    document_chunks         payload "content", lo stesso testo embeddato da ingest.py
+    conceptual_dictionary   "concept: alias, alias" come in populate_concepts.py
+    boilerplate_phrases     payload "phrase" come in detect_boilerplate.py
+    semantic_cache          cache di risposte: non si ricalcola, si ricrea vuota
 
-Le prime tre hanno contenuto "sorgente" (documenti/concetti/frasi) e vanno
-RI-EMBEDDATE. semantic_cache è una cache derivata, non va migrata: si
-ricrea VUOTA con la nuova dimensione, altrimenti il primo save_to_semantic_cache
-dopo lo switch di provider fallisce con un dimension mismatch su una
-collection che ha ancora vettori Gemini.
+Comandi, da lanciare in ordine con la NUOVA configurazione di embedding
+(EMBEDDING_PROVIDER, EMBEDDING_DIMENSION...) e i servizi fermi:
 
-ATTENZIONE sui campi testo per conceptual_dictionary e boilerplate_phrases:
-a differenza di document_chunks (payload["content"], confermato in ingest.py),
-NON ho visto lo script che popola queste due collection. I campi qui sotto
-(MIGRATIONS) sono la mia migliore ipotesi guardando come worker.py LEGGE quei
-payload (get_concepts_by_similarity, load_active_boilerplate) — verifica
-prima di lanciare in produzione: lo script si ferma da solo con un errore
-esplicito se il campo atteso manca dal payload, non embedda mai stringhe vuote
-in silenzio.
+    python -m utils.migrate_embeddings stato
+    python -m utils.migrate_embeddings ricalcola     # -> <nome>__nuovo, le originali non si toccano
+    python -m utils.migrate_embeddings sostituisci   # originali -> <nome>__vecchio, __nuovo -> originali
+    python -m utils.migrate_embeddings ripristina    # per tornare indietro: __vecchio -> originali
+    python -m utils.migrate_embeddings pulisci --conferma   # a migrazione confermata: elimina le copie
 
-Uso:
-    EMBEDDING_PROVIDER=local python migrate_embeddings.py
-    EMBEDDING_PROVIDER=local python migrate_embeddings.py --collections document_chunks
-    EMBEDDING_PROVIDER=local python migrate_embeddings.py --suffix _bge --reset-cache
+Qdrant non sa rinominare una collection: "sostituisci" e "ripristina" copiano i
+punti (vettori e payload, stessi id) senza ricalcolare nulla e ricreano gli
+indici del payload uguali a quelli della collection di partenza. document_chunks
+nasce con i parametri di utils/setup_qdrant.collection_params (vettori su disco e
+copia int8 in RAM, se QDRANT_CHUNKS_QUANTIZATION è attiva).
 
-Dopo aver verificato le nuove collection (query di prova, confronto risultati),
-il modo più semplice per non toccare le costanti QDRANT_COLLECTION/
-CACHE_COLLECTION/CONCEPT_COLLECTION/BOILERPLATE_COLLECTION in worker.py è:
-droppare le vecchie collection e rinominare le nuove (rename_collection di
-Qdrant) allo stesso nome originale. Fino a quel momento le vecchie restano
-intatte come rollback immediato.
+Ogni comando si può rilanciare: "ricalcola" riparte da capo sulle collection
+__nuovo, "sostituisci" salta quelle già sostituite, e nessuna collection è
+cancellata prima che la sua copia sia completa e verificata.
 """
 import argparse
 import asyncio
 import logging
+import sys
 
-from qdrant_client import AsyncQdrantClient, models
+from qdrant_client import QdrantClient, models
 
 from common.config import settings
-from common.embedding import init_embedding, embed_documents_batch, get_embedding_provider
+from common.embedding import embed_documents_batch, embed_for_semantic_query, get_embedding_provider, init_embedding
+from utils.setup_qdrant import collection_params
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - MIGRATE - %(levelname)s - %(message)s")
 log = logging.getLogger("MigrateEmbeddings")
 
-SCROLL_BATCH = 200       # punti letti per ogni giro di scroll da Qdrant
-EMBED_SUBBATCH = 100     # testi per ogni chiamata a embed_documents_batch
+SCROLL_BATCH = 256       # punti letti per ogni giro di scroll
+EMBED_SUBBATCH = 64      # testi per ogni chiamata di embedding
+LOG_EVERY = 5000         # punti tra un messaggio di avanzamento e l'altro
+NEW, OLD = "__nuovo", "__vecchio"
+CACHE = "semantic_cache"
 
 
-# ==============================================================================
-# REGISTRY: una entry per ogni collection "sorgente" da ri-embeddare.
-# `extract_text(payload) -> str | None`: None => punto scartato (loggato).
-# ==============================================================================
-def _extract_content(payload: dict) -> str | None:
-    text = (payload.get("content") or "").strip()
-    return text or None
+def _content(payload):
+    return (payload.get("content") or "").strip() or None
 
 
-def _extract_concept(payload: dict) -> str | None:
-    # ASSUNZIONE (vedi docstring): il testo embeddato è "concept" + eventuali
-    # "aliases", concatenati — coerente con come get_concepts_by_similarity
-    # interroga per similarità semantica su entrambi. Se il tuo script di
-    # popolamento embeddava SOLO il concept, togli la riga aliases sotto.
+def _concept(payload):
     concept = (payload.get("concept") or "").strip()
     aliases = payload.get("aliases") or []
     if not concept:
         return None
-    if aliases:
-        return f"{concept}: {', '.join(aliases)}"
-    return concept
+    return f"{concept}: {', '.join(aliases)}" if aliases else concept
 
 
-def _extract_phrase(payload: dict) -> str | None:
-    # ASSUNZIONE (vedi docstring): presume che il payload contenga il testo
-    # della frase sotto "phrase". worker.py, in lettura, recupera solo
-    # "phrase_hash" da Qdrant (il testo vero vive in MySQL) — se il tuo
-    # script di popolamento NON scrive anche "phrase" nel payload Qdrant,
-    # questa collection va ri-embeddata leggendo da MySQL
-    # (tabella boilerplate_phrases, colonna phrase) invece che da qui.
-    text = (payload.get("phrase") or "").strip()
-    return text or None
+def _phrase(payload):
+    return (payload.get("phrase") or "").strip() or None
 
 
-MIGRATIONS = {
-    "document_chunks": _extract_content,
-    "conceptual_dictionary": _extract_concept,
-    "boilerplate_phrases": _extract_phrase,
+# Collection da ricalcolare: testo dal payload e tipo di embedding usato da chi la
+# popola: "documenti" per i chunk (ingest.py), "frasi" per concetti e boilerplate
+# (embed_for_semantic_query). Con Gemini sono proiezioni diverse; con i modelli
+# simmetrici coincidono, salvo l'istruzione delle domande, che qui non entra mai.
+SOURCES = {
+    "document_chunks": (_content, "documenti"),
+    "conceptual_dictionary": (_concept, "frasi"),
+    "boilerplate_phrases": (_phrase, "frasi"),
 }
 
-# Collection derivate: NON si ri-embeddano, si ricreano vuote con la nuova
-# dimensione (vedi motivazione nella docstring del modulo).
-CACHE_COLLECTIONS = ["semantic_cache"]
+
+def _exists(client, name):
+    return client.collection_exists(name)
 
 
-async def ensure_collection(client: AsyncQdrantClient, name: str, dimension: int, recreate: bool = False):
-    exists = await client.collection_exists(name)
-    if exists and recreate:
-        await client.delete_collection(name)
-        exists = False
-        log.info(f"Collection '{name}' esistente droppata (--reset-cache).")
-    if exists:
-        log.info(f"Collection '{name}' già esistente, la riuso (verifica tu che la dimensione combaci).")
-        return
-    await client.create_collection(
-        collection_name=name,
-        vectors_config=models.VectorParams(size=dimension, distance=models.Distance.COSINE),
-    )
-    log.info(f"Collection '{name}' creata (dim={dimension}).")
+def _count(client, name):
+    return client.count(name, exact=True).count
 
 
-async def migrate_one(client: AsyncQdrantClient, source: str, target: str, extract_text, dimension: int):
-    log.info(f"--- Migrazione '{source}' -> '{target}' ---")
-    await ensure_collection(client, target, dimension)
+def _copy_indexes(client, schema, target):
+    for field, index in (schema or {}).items():
+        client.create_payload_index(target, field_name=field, field_schema=index.params or index.data_type, wait=True)
 
-    next_offset = None
-    total_migrated = 0
-    total_skipped = 0
 
+def _create_like(client, source, target, dimension=None):
+    """Crea target con gli indici del payload di source e i suoi parametri, oppure,
+    con dimension, i parametri di collection_params per la nuova dimensione."""
+    info = client.get_collection(source)
+    if dimension is None:
+        vectors = info.config.params.vectors
+        if not isinstance(vectors, models.VectorParams):
+            sys.exit(f"'{source}' ha vettori con nome: non gestiti da questo script.")
+        params = {"vectors_config": vectors, "quantization_config": info.config.quantization_config}
+    else:
+        params = collection_params(target.removesuffix(NEW), dimension)
+    client.create_collection(collection_name=target, **params)
+    _copy_indexes(client, info.payload_schema, target)
+
+
+def _replace(client, source, target):
+    """target = copia esatta di source (parametri, indici, punti), verificata."""
+    if _exists(client, target):
+        client.delete_collection(target)
+    _create_like(client, source, target)
+    offset = None
     while True:
-        points, next_offset = await client.scroll(
-            collection_name=source,
-            limit=SCROLL_BATCH,
-            offset=next_offset,
-            with_payload=True,
-            with_vectors=False,   # non ci serve il vettore vecchio, solo il payload/testo
-        )
-        if not points:
+        points, offset = client.scroll(source, limit=SCROLL_BATCH, offset=offset, with_payload=True, with_vectors=True)
+        if points:
+            client.upsert(target, wait=True,
+                          points=[models.PointStruct(id=p.id, vector=p.vector, payload=p.payload) for p in points])
+        if offset is None:
             break
+    expected, copied = _count(client, source), _count(client, target)
+    if copied != expected:
+        sys.exit(f"Copia '{source}' -> '{target}' incompleta: {copied} punti su {expected}. "
+                 "Nulla è stato cancellato: rilanciare il comando.")
+    log.info(f"'{source}' -> '{target}': {copied} punti copiati.")
 
-        texts, valid_points = [], []
-        for p in points:
-            text = extract_text(p.payload or {})
-            if text is None:
-                total_skipped += 1
-                continue
-            texts.append(text)
-            valid_points.append(p)
 
-        new_vectors = []
+async def _embed(texts, kind):
+    if kind == "documenti":
+        return await embed_documents_batch(texts)
+    return [await asyncio.to_thread(embed_for_semantic_query, t) for t in texts]
+
+
+async def _recompute(client, name, dimension):
+    extract, kind = SOURCES[name]
+    target = name + NEW
+    if _exists(client, target):
+        client.delete_collection(target)
+    _create_like(client, name, target, dimension=dimension)
+    offset, done, skipped, next_log = None, 0, 0, LOG_EVERY
+    while True:
+        points, offset = client.scroll(name, limit=SCROLL_BATCH, offset=offset, with_payload=True, with_vectors=False)
+        texts = [(p, extract(p.payload or {})) for p in points]
+        skipped += sum(1 for _, text in texts if text is None)
+        texts = [(p, text) for p, text in texts if text is not None]
         for i in range(0, len(texts), EMBED_SUBBATCH):
-            sub = texts[i:i + EMBED_SUBBATCH]
-            new_vectors.extend(await embed_documents_batch(sub))
-
-        new_points = [
-            models.PointStruct(id=p.id, vector=vec, payload=p.payload)
-            for p, vec in zip(valid_points, new_vectors)
-        ]
-        if new_points:
-            await client.upsert(collection_name=target, points=new_points)
-
-        total_migrated += len(new_points)
-        log.info(f"[{source}] Migrati {total_migrated} punti finora (scartati: {total_skipped})...")
-
-        if next_offset is None:
+            part = texts[i:i + EMBED_SUBBATCH]
+            vectors = await _embed([text for _, text in part], kind)
+            client.upsert(target, wait=True, points=[models.PointStruct(id=p.id, vector=v, payload=p.payload)
+                                                     for (p, _), v in zip(part, vectors)])
+            done += len(part)
+        if done >= next_log:
+            log.info(f"[{name}] {done} punti ricalcolati...")
+            next_log = done + LOG_EVERY
+        if offset is None:
             break
-
-    log.info(f"✓ [{source}] Completato: {total_migrated} punti in '{target}' (scartati: {total_skipped}).")
-    if total_skipped and total_migrated == 0:
-        log.error(
-            f"[{source}] TUTTI i punti scartati: il campo testo atteso non è nel payload. "
-            f"Controlla l'assunzione in MIGRATIONS per questa collection prima di considerarla migrata."
-        )
+    total = _count(client, name)
+    log.info(f"✓ '{name}' -> '{target}': {done} punti ricalcolati su {total}"
+             f"{f', {skipped} senza testo (non copiati)' if skipped else ''}.")
+    if total and not done:
+        sys.exit(f"'{name}': nessun punto con testo nel payload, controllare il campo atteso.")
 
 
-async def run(collections: list[str], suffix: str, reset_cache: bool):
-    init_embedding()  # legge EMBEDDING_PROVIDER dall'env corrente
+def _reset_cache(client, dimension):
+    """La cache contiene vettori di domande del modello precedente: si ricrea vuota."""
+    schema = client.get_collection(CACHE).payload_schema if _exists(client, CACHE) else {}
+    if _exists(client, CACHE):
+        client.delete_collection(CACHE)
+    client.create_collection(collection_name=CACHE, **collection_params(CACHE, dimension))
+    _copy_indexes(client, schema, CACHE)
+    log.info(f"'{CACHE}' ricreata vuota (dimensione {dimension}).")
+
+
+def cmd_stato(client, _args):
+    for name in [*SOURCES, CACHE]:
+        for full in (name, name + NEW, name + OLD):
+            if not _exists(client, full):
+                continue
+            info = client.get_collection(full)
+            vectors = info.config.params.vectors
+            quant = "int8 in RAM" if info.config.quantization_config else "nessuna"
+            print(f"{full:34} punti {_count(client, full):>9}   dimensione {vectors.size:>5}   "
+                  f"vettori su disco {'sì' if vectors.on_disk else 'no'}   quantizzazione {quant}")
+
+
+async def cmd_ricalcola(client, args):
+    init_embedding()
     provider = get_embedding_provider()
-    log.info(f"Provider attivo per il re-embedding: {provider.model_name} (dim={provider.dimension})")
+    probe = await _embed(["prova di dimensione"], "documenti")   # il fornitore vllm verifica la lunghezza
+    log.info(f"Modello {provider.model_name}: vettori di {len(probe[0])} dimensioni.")
+    for name in args.collections:
+        if _exists(client, name):
+            await _recompute(client, name, provider.dimension)
+        else:
+            log.warning(f"'{name}' non esiste: saltata.")
+    log.info("Ricalcolo completato. Prossimo passo: sostituisci.")
 
-    client = AsyncQdrantClient(host=settings.qdrant_host, port=settings.qdrant_port, timeout=120.0)
 
-    for source in collections:
-        extract_text = MIGRATIONS[source]
-        target = f"{source}{suffix}"
-        await migrate_one(client, source, target, extract_text, provider.dimension)
+def cmd_sostituisci(client, args):
+    for name in args.collections:
+        if not _exists(client, name + NEW):
+            log.info(f"'{name}': " + ("già sostituita." if _exists(client, name + OLD)
+                                      else f"'{name + NEW}' non esiste, saltata (lanciare prima ricalcola)."))
+            continue
+        if not _exists(client, name + OLD):
+            _replace(client, name, name + OLD)   # copia per tornare indietro, prima di toccare l'originale
+        client.delete_collection(name)
+        _replace(client, name + NEW, name)
+        client.delete_collection(name + NEW)
+        log.info(f"✓ '{name}' sostituita (la precedente è in '{name + OLD}').")
+    _reset_cache(client, settings.embedding_dimension)
+    log.info("Sostituzione completata. Dopo le verifiche: pulisci --conferma.")
 
-    if reset_cache:
-        for source in CACHE_COLLECTIONS:
-            target = f"{source}{suffix}"
-            log.info(f"--- Reset (vuoto) '{target}' ---")
-            await ensure_collection(client, target, provider.dimension, recreate=True)
-            log.info(f"✓ '{target}' pronta, vuota — la cache si ripopola da sola con l'uso.")
 
-    await client.close()
-    log.info("✓ Migrazione completata per tutte le collection richieste.")
+def cmd_ripristina(client, args):
+    dimension = None
+    for name in args.collections:
+        if not _exists(client, name + OLD):
+            log.warning(f"'{name + OLD}' non esiste: '{name}' resta com'è.")
+            continue
+        if _exists(client, name):
+            client.delete_collection(name)
+        _replace(client, name + OLD, name)
+        dimension = client.get_collection(name).config.params.vectors.size
+        log.info(f"✓ '{name}' ripristinata da '{name + OLD}'.")
+    if dimension:
+        _reset_cache(client, dimension)
+    log.info("Ripristino completato: rimettere la configurazione di embedding precedente.")
+
+
+def cmd_pulisci(client, args):
+    if not args.conferma:
+        sys.exit("Elimina le copie __vecchio e le __nuovo rimaste: aggiungere --conferma.")
+    for name in args.collections:
+        for full in (name + OLD, name + NEW):
+            if _exists(client, full):
+                client.delete_collection(full)
+                log.info(f"Eliminata '{full}'.")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Cambio del modello di embedding: ricalcolo delle collection Qdrant.")
+    sub = parser.add_subparsers(dest="comando", required=True)
+    for name in ("stato", "ricalcola", "sostituisci", "ripristina", "pulisci"):
+        p = sub.add_parser(name)
+        p.add_argument("--collections", default=",".join(SOURCES),
+                       help=f"separate da virgola, tra {list(SOURCES)} (default: tutte)")
+        if name == "pulisci":
+            p.add_argument("--conferma", action="store_true")
+    args = parser.parse_args()
+    args.collections = [c.strip() for c in args.collections.split(",") if c.strip()]
+    unknown = [c for c in args.collections if c not in SOURCES]
+    if unknown:
+        parser.error(f"Collection sconosciute: {unknown}. Valide: {list(SOURCES)}")
+
+    client = QdrantClient(host=settings.qdrant_host, port=settings.qdrant_port, timeout=300)
+    if args.comando == "ricalcola":
+        asyncio.run(cmd_ricalcola(client, args))
+    else:
+        {"stato": cmd_stato, "sostituisci": cmd_sostituisci, "ripristina": cmd_ripristina,
+         "pulisci": cmd_pulisci}[args.comando](client, args)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Ri-embedda le collection Qdrant sorgente con un nuovo provider e resetta la cache."
-    )
-    parser.add_argument(
-        "--collections",
-        default="all",
-        help=f"Comma-separated tra {list(MIGRATIONS.keys())}, oppure 'all' (default).",
-    )
-    parser.add_argument(
-        "--suffix",
-        default="_local",
-        help="Suffisso applicato al nome sorgente per ottenere il nome target (default: _local).",
-    )
-    parser.add_argument(
-        "--reset-cache",
-        action="store_true",
-        help="Ricrea anche semantic_cache (vuota, nuova dimensione) col suffisso indicato.",
-    )
-    args = parser.parse_args()
-
-    if args.collections == "all":
-        selected = list(MIGRATIONS.keys())
-    else:
-        selected = [c.strip() for c in args.collections.split(",") if c.strip()]
-        unknown = [c for c in selected if c not in MIGRATIONS]
-        if unknown:
-            parser.error(f"Collection sconosciute: {unknown}. Valide: {list(MIGRATIONS.keys())}")
-
-    asyncio.run(run(selected, args.suffix, args.reset_cache))
+    main()

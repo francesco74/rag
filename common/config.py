@@ -182,6 +182,12 @@ class Settings:
     qdrant_semantic_size: int
     qdrant_semantic_threshold: float
     qdrant_concept_threshold: float
+    # document_chunks creata con i vettori su disco e una copia int8 in RAM
+    # (utils/setup_qdrant.py, utils/migrate_embeddings.py): conta solo alla
+    # creazione della collection. La ricerca usa la copia compressa e riordina
+    # i migliori qdrant_oversampling x limite risultati con i vettori pieni.
+    qdrant_chunks_quantization: bool
+    qdrant_oversampling: float
     max_context_chars: int
     max_sub_queries: int
     onnx_model_cache_path: str
@@ -294,6 +300,10 @@ class Settings:
     # un modello); vuoto = local_vllm_base_url.
     local_vllm_embedding_model: str | None
     local_vllm_embedding_base_url: str | None
+    # Solo per i modelli asimmetrici (es. Qwen3-Embedding): il compito, in inglese,
+    # premesso alle DOMANDE della ricerca ("Instruct: <compito>\nQuery:<domanda>").
+    # Vuota = nessuna istruzione. Vedi VLLMEmbeddingProvider in common/embedding.py.
+    embedding_query_instruction: str | None
 
     # Usati solo quando local_llm_backend="vllm". base_url punta al server
     # OpenAI-compatible esposto da vLLM (es. "http://localhost:8000/v1" —
@@ -528,6 +538,8 @@ def load_settings() -> Settings:
         qdrant_semantic_size = int(os.environ.get("QDRANT_SEMANTIC_SIZE") or 30),
 
         qdrant_semantic_threshold = float(os.environ.get("QDRANT_SEMANTIC_THRESHOLD") or 0.60),
+        qdrant_chunks_quantization = _parse_bool(os.environ.get("QDRANT_CHUNKS_QUANTIZATION"), default=True),
+        qdrant_oversampling = max(1.0, float(os.environ.get("QDRANT_OVERSAMPLING") or 2.0)),
         max_context_chars = max_context_chars,
         max_sub_queries = int(os.environ.get("MAX_SUB_QUERIES") or 5),
 
@@ -578,6 +590,7 @@ def load_settings() -> Settings:
 
         local_vllm_embedding_model = os.environ.get("LOCAL_VLLM_EMBEDDING_MODEL", "").strip() or None,
         local_vllm_embedding_base_url = os.environ.get("LOCAL_VLLM_EMBEDDING_BASE_URL", "").strip() or None,
+        embedding_query_instruction = os.environ.get("EMBEDDING_QUERY_INSTRUCTION", "").strip() or None,
         local_vllm_base_url = os.environ.get("LOCAL_VLLM_BASE_URL", "").strip() or "http://localhost:8000/v1",
         local_vllm_api_key = os.environ.get("LOCAL_VLLM_API_KEY", "").strip() or None,
 

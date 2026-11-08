@@ -13,14 +13,28 @@ QDRANT_COLLECTION = "document_chunks"
 CACHE_COLLECTION = "semantic_cache"
 CONCEPT_COLLECTION = "conceptual_dictionary"  
 
+def collection_params(name, dimension):
+    """Parametri di creazione di una collection, condivisi con utils/migrate_embeddings.py.
+
+    document_chunks, con QDRANT_CHUNKS_QUANTIZATION (default), tiene i vettori
+    pieni su disco e in RAM solo una copia int8 (un quarto dello spazio): la
+    ricerca scorre la copia compressa e riordina i migliori risultati con i
+    vettori pieni (rag/retrieval.py, QDRANT_OVERSAMPLING). Le altre collection
+    sono piccole e restano in RAM.
+    """
+    params = {"vectors_config": models.VectorParams(size=dimension, distance=models.Distance.COSINE)}
+    if name == QDRANT_COLLECTION and settings.qdrant_chunks_quantization:
+        params["vectors_config"].on_disk = True
+        params["quantization_config"] = models.ScalarQuantization(
+            scalar=models.ScalarQuantizationConfig(type=models.ScalarType.INT8, quantile=0.99, always_ram=True))
+    return params
+
+
 async def create_collection_if_missing(client, name):
     """Crea la collection solo se non esiste."""
     if not await client.collection_exists(name):
         log.info(f"Creazione collection: {name} (dimensione {settings.embedding_dimension})")
-        await client.create_collection(
-            collection_name=name,
-            vectors_config=models.VectorParams(size=settings.embedding_dimension, distance=models.Distance.COSINE)
-        )
+        await client.create_collection(collection_name=name, **collection_params(name, settings.embedding_dimension))
     else:
         log.info(f"Collection {name} già esistente.")
 
