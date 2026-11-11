@@ -109,6 +109,11 @@ services:
     build:
       context: .
       dockerfile: api/Dockerfile
+      # In locale il reranking è ONNX su CPU (RERANK_PROVIDER predefinito): servono i modelli
+      # locali, con il modello in api/model_cache (cd api && python build_fast_model.py).
+      # MODELLI_LOCALI=0 per un'immagine leggera con RERANK_PROVIDER=vllm in .env.local.
+      args:
+        MODELLI_LOCALI: ${MODELLI_LOCALI:-1}
     command: sh -c "python -m utils.setup_qdrant && python -m utils.setup_rabbitmq"
     environment:
       <<: *backend-env

@@ -1,0 +1,28 @@
+# Una tantum (migrazione v3 -> v4): i file in /data diventano dell'utente 1000, con cui
+# girano API, converter e ingestion. In v3 l'API girava come root e i file che ha
+# scritto (caricamenti, manifest corretti in revisione) non sarebbero modificabili.
+#
+#   kubectl apply -f deploy/k8s/permessi-dati.yaml
+#   kubectl -n rag wait --for=condition=complete job/permessi-dati --timeout=30m
+#   kubectl -n rag delete job permessi-dati
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: permessi-dati
+  namespace: rag
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: chown
+        image: busybox
+        command: ["sh", "-c", "chown -R 1000:1000 /data && echo fatto"]
+        volumeMounts:
+        - name: rag-storage
+          mountPath: /data
+      volumes:
+      - name: rag-storage
+        persistentVolumeClaim:
+          claimName: rag-storage

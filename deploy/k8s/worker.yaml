@@ -1,0 +1,58 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+  namespace: rag
+  labels:
+    app: worker
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: worker
+  template:
+    metadata:
+      labels:
+        app: worker
+    spec:
+      imagePullSecrets:
+        - name: provincia-regcreds
+      containers:
+      - name: worker
+        image: registry.intranet.provincia.lucca/rag/rest:v4.0.0
+        imagePullPolicy: Always
+          #imagePullPolicy: IfNotPresent
+        command: ["celery", "-A", "worker.celery_app", "worker", "--loglevel=info", "--concurrency=2"]
+        envFrom:
+        - configMapRef:
+            name: rag-config
+        - secretRef:
+            name: rag-secrets
+        env:
+        - name: GOOGLE_APPLICATION_CREDENTIALS
+          value: "/var/secrets/google/key.json"
+        - name: DATA_FOLDER
+          value: "/data"
+        resources:
+          limits:
+            cpu: "4"
+            memory: 6Gi
+          requests:
+            cpu: "4"
+            memory: 6Gi
+        volumeMounts:
+        - name: google-vision-key
+          mountPath: /var/secrets/google
+          readOnly: true
+        - name: rag-storage
+          mountPath: /data
+      volumes:
+      - name: google-vision-key
+        secret:
+          secretName: google-vision-key # Deve corrispondere al nome del Secret su K8s
+      - name: rag-storage
+        persistentVolumeClaim:
+          claimName: rag-storage
+

@@ -1,9 +1,13 @@
-import os
+"""
+Elimina una collection di Qdrant (chiede conferma; --force no). Per svuotare la cache
+delle risposte c'è utils/qdrant_semantic_cache_reset, che la ricrea.
+
+    python -m utils.qdrant_delete_collection document_chunks__vecchio
+"""
 import argparse
 from qdrant_client import QdrantClient
 from qdrant_client.http.exceptions import UnexpectedResponse
 from common.config import settings
-from common.db_logger import MySQLLogHandler, get_db_connection, init_db_pool
 
 def delete_qdrant_collection(collection_name, force=False):
     print(f"Connessione a Qdrant ({settings.qdrant_host}:{settings.qdrant_port}) in corso...\n")

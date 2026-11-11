@@ -1,14 +1,21 @@
-# Se un documento ha superato correttamente l'estrazione ed ha il suo JSON pronto nella cartella staging, 
-# ma l'evento RabbitMQ è andato perso o non è mai partito, questo script 
-# lo individua e lo inietta direttamente nella pipeline del Converter.
+"""
+Pubblica su da-convertire i manifest rimasti in staging/ senza il loro messaggio (evento
+RabbitMQ perso o mai partito): il converter li elabora come quelli appena estratti. I file
+caricati dall'amministrazione tornano "in coda".
 
-import os
+Attenzione: pubblica TUTTI i manifest in staging/, anche quelli ancora in coda o in
+lavorazione, che verrebbero elaborati due volte. Va lanciato con le code vuote
+(rabbitmqctl list_queues) e il converter fermo o inattivo.
+
+    python -m utils.recovery.publish_orphans
+"""
 import json
 import logging
 import pika
 from pathlib import Path
 from common.config import settings
-from common.db_logger import MySQLLogHandler, get_db_connection, init_db_pool
+from common.db_logger import init_db_pool
+from common.upload_status import QUEUED, mark_upload
 
 logging.basicConfig(level=settings.log_level, format='%(asctime)s - STAGING PUBLISHER - %(levelname)s - %(message)s')
 
@@ -36,6 +43,7 @@ def main():
         logging.error(f"Impossibile connettersi al broker: {e}")
         return
 
+    init_db_pool()
     success_count = 0
     for json_path in json_files:
         try:
@@ -52,6 +60,12 @@ def main():
                 properties=pika.BasicProperties(delivery_mode=pika.DeliveryMode.Persistent)
             )
             success_count += 1
+            try:
+                source = json.loads(json_path.read_text(encoding="utf-8")).get("source")
+            except (OSError, ValueError):
+                source = None
+            if source:
+                mark_upload(source, QUEUED)
         except Exception as e:
             logging.error(f"Errore accodamento {json_path.name}: {e}")
 

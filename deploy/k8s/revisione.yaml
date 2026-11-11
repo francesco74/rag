@@ -1,0 +1,41 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: revisione
+  namespace: rag
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: revisione
+  template:
+    metadata:
+      labels:
+        app: revisione
+    spec:
+      imagePullSecrets:
+      - name: provincia-regcreds
+      containers:
+      - image: registry.intranet.provincia.lucca/rag/web-revisione:v4.0.0
+        imagePullPolicy: Always
+        name: revisione
+        env:
+        - name: REVIEW_API_URL
+          value: /api/review
+        # Deve coincidere con la location del proxy (k8s/nginx.yaml)
+        - name: BASE_HREF
+          value: /amministrazione/
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: revisione
+  namespace: rag
+spec:
+  ports:
+  - port: 80
+    protocol: TCP
+    targetPort: 80
+  selector:
+    app: revisione
+

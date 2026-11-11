@@ -1,0 +1,12 @@
+# Credenziali del registry interno. Si crea con
+#   kubectl -n rag create secret docker-registry provincia-regcreds \
+#     --docker-server=registry.intranet.provincia.lucca --docker-username=... --docker-password=...
+# (regcreds.yaml, con i dati veri, è escluso da git).
+apiVersion: v1
+kind: Secret
+metadata:
+  name: provincia-regcreds
+  namespace: rag
+type: kubernetes.io/dockerconfigjson
+data:
+  .dockerconfigjson: ""

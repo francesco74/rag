@@ -1,0 +1,64 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ingestion
+  namespace: rag
+  labels:
+    app: ingestion
+spec:
+  replicas: 1 # Definisce quanti pod di ingestion tenere sempre attivi
+  selector:
+    matchLabels:
+      app: ingestion
+  template:
+    metadata:
+      labels:
+        app: ingestion
+    spec:
+      imagePullSecrets:
+        - name: provincia-regcreds
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000  # Assicura che il PVC sia leggibile dal gruppo 1000
+      volumes:
+      - name: rag-storage
+        persistentVolumeClaim:
+          claimName: rag-storage
+          readOnly: false
+      - name: google-vision-key
+        secret:
+          secretName: google-vision-key
+      restartPolicy: Always # MODIFICA CRITICA: I Deployment accettano SOLO "Always"
+      initContainers:
+      - name: fix-permissions
+        image: busybox
+        command: ["sh", "-c", "chown -R 1000:1000 /data"]
+        securityContext:
+          runAsUser: 0 # Deve girare come root per cambiare i permessi
+        volumeMounts:
+        - name: rag-storage
+          mountPath: "/data"
+      containers:
+      - name: ingestion
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+        image: registry.intranet.provincia.lucca/rag/ingestion:v4.0.0
+        imagePullPolicy: Always
+        volumeMounts:
+          - name: rag-storage
+            mountPath: "/data"
+          - name: google-vision-key
+            mountPath: /var/secrets/google
+        envFrom:
+        - configMapRef:
+            name: rag-config
+        - secretRef:
+            name: rag-secrets
+        env:
+        - name: GOOGLE_APPLICATION_CREDENTIALS
+          value: /var/secrets/google/key.json
+        - name: DATA_FOLDER
+          value: "/data"

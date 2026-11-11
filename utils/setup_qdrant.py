@@ -1,10 +1,17 @@
-import os
+"""
+Crea le collection di Qdrant che mancano (document_chunks, semantic_cache,
+conceptual_dictionary) e i loro indici sul payload. Non tocca le collection esistenti:
+si può rilanciare quando si vuole. Esce con errore se Qdrant non risponde.
+
+    python -m utils.setup_qdrant
+"""
 import asyncio
 import logging
-from dotenv import load_dotenv
+import sys
+
 from qdrant_client import AsyncQdrantClient, models
+
 from common.config import settings
-from common.db_logger import MySQLLogHandler, get_db_connection, init_db_pool
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 log = logging.getLogger("qdrant_setup")
@@ -51,6 +58,7 @@ async def safe_create_payload_index(client, collection_name, field_name, field_s
         log.warning(f"Impossibile creare indice '{field_name}' su '{collection_name}': {e}")
 
 async def setup_infrastructure():
+    client = None
     try:
         client = AsyncQdrantClient(
             host=settings.qdrant_host, 
@@ -111,9 +119,13 @@ async def setup_infrastructure():
         
     except Exception as e:
         log.critical(f"Errore critico durante il setup di Qdrant: {e}")
+        raise
     finally:
         if client:
             await client.close()
 
 if __name__ == "__main__":
-    asyncio.run(setup_infrastructure())
+    try:
+        asyncio.run(setup_infrastructure())
+    except Exception:
+        sys.exit(1)

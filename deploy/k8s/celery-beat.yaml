@@ -1,0 +1,42 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: celery-beat
+  namespace: rag
+  labels:
+    app: celery-beat
+spec:
+  replicas: 1 
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: celery-beat
+  template:
+    metadata:
+      labels:
+        app: celery-beat
+    spec:
+      imagePullSecrets:
+      - name: provincia-regcreds
+      containers:
+      - name: celery-beat
+        # Use the SAME image as the worker (v1.0b3-mmarco) so it has the task definitions
+        image: registry.intranet.provincia.lucca/rag/rest:v4.0.0
+        imagePullPolicy: Always
+        
+        # --- COMMAND FOR BEAT ---
+        command: ["python", "-m", "celery"]
+        args: ["-A", "worker.celery_app", "beat", "--loglevel=info"]
+        envFrom:
+        - configMapRef:
+            name: rag-config
+        - secretRef:
+            name: rag-secrets 
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "50m"
+          limits:
+            memory: "256Mi"
+            cpu: "100m"

@@ -4,9 +4,9 @@ compilasse. Non trascrive nulla e non chiama modelli: rilegge i file archiviati
 in processed/ con la stessa regola del converter. Va eseguito nel container del
 converter, dopo la migrazione misc/migrations/document_ocr.sql.
 
-    python rebuild_document_ocr.py                     # solo elenco, non scrive
+    python rebuild_document_ocr.py --dry-run           # solo elenco, non scrive
     python rebuild_document_ocr.py --topic attiprovincia
-    python rebuild_document_ocr.py --apply
+    python rebuild_document_ocr.py                     # registra tutti gli archivi
 
 Le righe già presenti non vengono mai toccate, quindi si può rilanciare. Il
 risultato è una stima: un PDF finito a suo tempo nell'OCR completo per timeout
@@ -154,7 +154,7 @@ def rebuild(root, documents, known, apply, timeout, topic=None):
 
 def main():
     parser = argparse.ArgumentParser(description="Ricostruisce le pagine OCR dei documenti già indicizzati.")
-    parser.add_argument("--apply", action="store_true", help="scrive nel database; senza, mostra soltanto il risultato")
+    parser.add_argument("--dry-run", action="store_true", help="mostra soltanto il risultato, senza scrivere nel database")
     parser.add_argument("--topic", help="limita il lavoro a un archivio")
     parser.add_argument("--timeout", type=float, default=300, help="secondi massimi per ogni file (predefinito 300)")
     args = parser.parse_args()
@@ -164,14 +164,15 @@ def main():
     documents = set(_rows(f"SELECT DISTINCT source, topic_id, sub_topic_id FROM parent_documents{where}", params))
     known = set(_rows(f"SELECT source, topic_id, sub_topic_id FROM document_ocr{where}", params))
 
-    done, problems = rebuild(ARCHIVE_DIR, documents, known, args.apply, args.timeout, args.topic)
+    apply = not args.dry_run
+    done, problems = rebuild(ARCHIVE_DIR, documents, known, apply, args.timeout, args.topic)
 
     print(f"\nDocumenti indicizzati: {len(documents)}; con il dato già presente: {len(documents & known)}; "
-          f"{'registrati' if args.apply else 'da registrare'}: {done}; senza dato: {len(problems)}.")
+          f"{'registrati' if apply else 'da registrare'}: {done}; senza dato: {len(problems)}.")
     for problem in problems:
         print(f"  {problem}")
-    if not args.apply:
-        print("Nessuna scrittura: per registrare rilancia con --apply.")
+    if not apply:
+        print("Nessuna scrittura (--dry-run): per registrare rilancia senza --dry-run.")
     sys.exit(1 if problems else 0)
 
 

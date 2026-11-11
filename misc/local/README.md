@@ -22,7 +22,11 @@ docker compose --env-file .env.local exec api python -m utils.manage_review_user
 | http://localhost:8082 | phpMyAdmin (utente `raguser` con `MYSQL_PASSWORD`, oppure `root` con `MYSQL_ROOT_PASSWORD`) |
 | `127.0.0.1:3307` | MySQL |
 
-La prima build è lunga: l'immagine dell'API contiene il reranker e le sue dipendenze.
+La prima build è lunga: in locale l'immagine dell'API contiene il reranker ONNX e le sue
+dipendenze (`MODELLI_LOCALI=1`, predefinito nel compose). Il modello va preparato una volta,
+prima della build: `cd api && python build_fast_model.py` (finisce in `api/model_cache`, escluso
+da git). Con un reranker su server (`RERANK_PROVIDER=vllm` in `.env.local`) si può costruire
+l'immagine leggera: `MODELLI_LOCALI=0 docker compose --env-file .env.local up -d --build`.
 
 ## Dati e documenti
 

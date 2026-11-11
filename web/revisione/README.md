@@ -107,7 +107,7 @@ Chat (attiamministrativi, archiviogreenlees) e revisione scaricano i documenti d
 - **Archivio riservato** (`FALSE`, il default per i nuovi archivi): solo un utente autenticato con il permesso `documenti.lettura` e l'archivio assegnato. Al login l'API imposta un cookie di sessione (`rag_session`, HttpOnly), che il browser invia da solo anche aprendo il documento in una nuova scheda; chi apre il link senza essere autenticato vede una pagina con il link al login. Il cookie vale solo per scaricare documenti e per `/auth/me` e `/auth/logout`: le rotte `/review` richiedono comunque l'header `Authorization`.
 - **Login dalla chat**: in alto nella chat c'è "Accedi" (stessi utenti della revisione). Cliccando una fonte, la chat controlla prima se il documento è consultabile: se è riservato spiega perché e propone l'accesso, poi lo apre; se l'utente non è abilitato a quell'archivio lo dice. La chat usa le rotte `/auth/login`, `/auth/me`, `/auth/logout` e non conserva il token: resta nel cookie HttpOnly.
 - Si servono solo i file originali dei documenti indicizzati: testi estratti (`.md`), manifest (`.json`) e il resto di `processed/` non sono raggiungibili.
-- L'API decide e basta: risponde con `X-Accel-Redirect` e il file lo invia nginx dalla location `internal` `/_protected_files/` (`k8s/nginx.yaml`), che il browser non può aprire direttamente.
+- L'API decide e basta: risponde con `X-Accel-Redirect` e il file lo invia nginx dalla location `internal` `/_protected_files/` (`deploy/k8s/nginx.yaml`), che il browser non può aprire direttamente.
 - I vecchi link `/downloads/...` sono rimandati a `/api/files/...` (301).
 
 ```bash
@@ -127,7 +127,7 @@ docker build -t rag-revisione web/revisione
 docker run -e BASE_HREF=/amministrazione/ -e REVIEW_API_URL=/api/review -e PROJECT_NAME="Amministrazione" -p 8080:80 rag-revisione
 ```
 
-- `BASE_HREF` è il percorso sotto cui il reverse proxy pubblica l'app (es. `/amministrazione/`, come in `k8s/nginx.yaml`; predefinito `/`, la radice del sito). Si imposta all'avvio del container, non nella build: la stessa immagine funziona sotto qualunque percorso. Deve coincidere con la `location` del proxy: se è sbagliato il browser carica i file dell'app dalla radice del sito e si apre l'applicazione sbagliata.
+- `BASE_HREF` è il percorso sotto cui il reverse proxy pubblica l'app (es. `/amministrazione/`, come in `deploy/k8s/nginx.yaml`; predefinito `/`, la radice del sito). Si imposta all'avvio del container, non nella build: la stessa immagine funziona sotto qualunque percorso. Deve coincidere con la `location` del proxy: se è sbagliato il browser carica i file dell'app dalla radice del sito e si apre l'applicazione sbagliata.
 - `FILES_URL` (facoltativa): indirizzo di `/files` dell'API; se assente si ricava da `REVIEW_API_URL` (`/api/review` → `/api/files`).
 - `REVIEW_API_URL` può essere assoluto (`https://ia.ente.it/api/review`) o relativo al sito (`/api/review`): relativo, la stessa immagine funziona su più domini senza richieste CORS. Deve terminare con `/review`, il prefisso delle rotte di revisione.
 

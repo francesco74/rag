@@ -1,0 +1,43 @@
+# Pod di servizio per migrazioni e manutenzione: stessa immagine e configurazione
+# dell'API, ma con più memoria e senza servire richieste. Gli script (align_dates,
+# manage_sites, migrate_embeddings...) girano qui invece che nel pod dell'API.
+#
+#   kubectl apply -f deploy/k8s/strumenti.yaml
+#   kubectl -n rag exec strumenti -- python -m utils.migrate_embeddings stato
+#   kubectl -n rag delete pod strumenti       # finito
+apiVersion: v1
+kind: Pod
+metadata:
+  name: strumenti
+  namespace: rag
+spec:
+  imagePullSecrets:
+  - name: provincia-regcreds
+  securityContext:
+    runAsUser: 1000
+    fsGroup: 1000
+  restartPolicy: Never
+  containers:
+  - name: strumenti
+    image: registry.intranet.provincia.lucca/rag/rest:v4.0.0
+    imagePullPolicy: Always
+    command: ["sleep", "infinity"]
+    envFrom:
+    - configMapRef:
+        name: rag-config
+    - secretRef:
+        name: rag-secrets
+    resources:
+      requests:
+        memory: "1Gi"
+        cpu: "500m"
+      limits:
+        memory: "2Gi"
+        cpu: "2"
+    volumeMounts:
+    - name: rag-storage
+      mountPath: /data
+  volumes:
+  - name: rag-storage
+    persistentVolumeClaim:
+      claimName: rag-storage

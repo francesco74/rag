@@ -1,0 +1,63 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: saga-decreto-deliberativo-cronjob
+  namespace: rag
+spec:
+  # Esecuzione ogni giorno a mezzanotte (00:00)
+  schedule: "0 1 * * *"
+  
+  # Gestione dei Job completati o falliti nella cronologia
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  
+  # Evita che una nuova esecuzione parta se quella precedente è ancora in corso
+  concurrencyPolicy: Forbid
+  
+  jobTemplate:
+    spec:
+      backoffLimit: 3
+      template:
+        spec:
+          restartPolicy: Never
+          imagePullSecrets:
+            - name: provincia-regcreds
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            fsGroup: 1000
+          volumes:
+          - name: rag-storage
+            persistentVolumeClaim:
+              claimName: rag-storage
+              readOnly: false
+          containers:
+          - name: saga-job
+            image: registry.intranet.provincia.lucca/rag/saga_extract:v4.0.0
+            imagePullPolicy: Always
+            envFrom:
+            - configMapRef:
+                name: rag-config
+            - secretRef:
+                name: rag-secrets
+            volumeMounts:
+              - name: rag-storage
+                mountPath: "/data"
+            resources:
+              requests:
+                cpu: "250m"
+                memory: "512Mi"
+            command: ["/bin/sh", "-c"]
+            args:
+              - |
+                DATA_A=$(date +'%d/%m/%Y')
+                DATA_DA=$(date -d "10 days ago" +'%d/%m/%Y' 2>/dev/null || date -v-10d +'%d/%m/%Y')
+                
+                JSON_FILTERS=$(printf '{"tipo_atto": "decreto_deliberativo", "data_da": "%s", "data_a": "%s"}' "$DATA_DA" "$DATA_A")
+                
+                echo "Esecuzione filtro: $JSON_FILTERS"
+                
+                exec python verifica.py \
+                  --json-filters "$JSON_FILTERS" \
+                  --recover
+                  --sicraweb-delay 5

@@ -1,14 +1,20 @@
-# Riporta i file .md/.txt e il manifesto .json dalla cartella di errore alla cartella watch, 
-# ripulendo il JSON dal tracciato d'errore iniettato originariamente.
+"""
+Rimette in indicizzazione i documenti finiti nella DLQ dell'ingestione (da-indicizzare.dlq):
+riporta testo (.md/.txt) e manifest da ingestion/error/ a watch/, toglie dal manifest
+l'errore registrato (_ingestion_error) e ripubblica il messaggio su da-indicizzare. I file
+caricati dall'amministrazione tornano "in coda". Un singolo file caricato si rilancia
+anche dal sito di amministrazione.
 
-import os
+    python -m utils.recovery.dlq_ingestion
+"""
 import json
 import logging
 import pika
 import shutil
 from pathlib import Path
 from common.config import settings
-from common.db_logger import MySQLLogHandler, get_db_connection, init_db_pool
+from common.db_logger import init_db_pool
+from common.upload_status import QUEUED, mark_upload
 
 
 logging.basicConfig(level=settings.log_level, format='%(asctime)s - DLQ INGESTION - %(levelname)s - %(message)s')
@@ -39,6 +45,7 @@ def main():
         logging.error(f"Connessione fallita: {e}")
         return
 
+    init_db_pool()
     success_count = 0
 
     while True:
@@ -72,6 +79,8 @@ def main():
                                       properties=pika.BasicProperties(delivery_mode=pika.DeliveryMode.Persistent))
                 success_count += 1
                 logging.info(f"✓ Ripristinato e accodato in watch: {rel_path.name}")
+                if manifest_data.get("source"):
+                    mark_upload(manifest_data["source"], QUEUED)
             else:
                 logging.warning(f"✗ Manifesto JSON {err_json_path.name} non trovato in error. Scartato.")
 

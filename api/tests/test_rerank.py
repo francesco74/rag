@@ -51,5 +51,24 @@ for label, status, body in [("errore HTTP", 500, {"error": "x"}), ("risultati ma
     except Exception:
         check(label + " propagato", True)
 
+# --- Reranking locale (onnx) in un'immagine senza modelli locali: errore che dice cosa fare
+import os, tempfile
+os.environ.update({k: "u" for k in ("DOCWS_RICERCA_ENDPOINT", "DOCWS_ATTI_ENDPOINT", "DOCWS_CODICE_AMMINISTRAZIONE",
+                                    "DOCWS_CODICE_AOO", "RUOLO_DOCWS")}, DATA_FOLDER=tempfile.mkdtemp(), LOG_LEVEL="CRITICAL",
+                  RERANKER_MODEL_PATH="/non/esiste")
+sys.path.insert(0, str(ROOT))
+import reranker as reranker_module
+from rag import retrieval
+
+for label, deps, attesa in (("senza librerie", False, "mancano onnxruntime e transformers"),
+                            ("senza modello", True, "manca il modello in /non/esiste")):
+    reranker_module.DEPENDENCIES_AVAILABLE = deps
+    try:
+        retrieval._check_local_reranker()
+        check(f"onnx {label}: errore", False)
+    except RuntimeError as e:
+        check(f"onnx {label}: errore chiaro", (attesa in str(e), "MODELLI_LOCALI=1" in str(e), "RERANK_PROVIDER=vllm" in str(e)),
+              (True, True, True))
+
 print("\nRISULTATO:", "TUTTO OK" if not failures else f"{failures} FALLITI")
 sys.exit(1 if failures else 0)

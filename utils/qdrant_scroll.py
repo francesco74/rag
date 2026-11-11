@@ -1,14 +1,16 @@
-import os
+"""
+Mostra id e payload dei punti di una collection di Qdrant, eventualmente di un solo file.
+
+    python -m utils.qdrant_scroll -c document_chunks -l 5
+    python -m utils.qdrant_scroll -c document_chunks -f "delibera_12.pdf"
+"""
 import asyncio
 import json
 import argparse
 from typing import Optional
-from dotenv import load_dotenv
 from qdrant_client import AsyncQdrantClient, models
 from common.config import settings
-from common.db_logger import MySQLLogHandler, get_db_connection, init_db_pool
 
-load_dotenv()
 
 async def inspect_collection_payloads(collection_name: str, limit: int = 5, file_name: Optional[str] = None):
     """
@@ -74,13 +76,13 @@ Ispetta i metadati (payload) e gli ID dei record salvati in una collection di Qd
 
 Esempi di utilizzo:
   1. Base:
-     python qdrant_scroll.py --collection document_chunks
+     python -m utils.qdrant_scroll --collection document_chunks
 
   2. Limita il numero di risultati (es. 5 record):
-     python qdrant_scroll.py --collection document_chunks --limit 5
+     python -m utils.qdrant_scroll --collection document_chunks --limit 5
 
   3. Filtra per nome di un file specifico:
-     python qdrant_scroll.py --collection document_chunks --file_name "report_2023.pdf"
+     python -m utils.qdrant_scroll --collection document_chunks --file_name "report_2023.pdf"
 """
 
     parser = argparse.ArgumentParser(

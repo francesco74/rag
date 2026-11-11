@@ -1,0 +1,30 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: attiamministrativi
+  namespace: rag
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: 512m
+    nginx.ingress.kubernetes.io/ssl-redirect: "false"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "false"
+
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "180"  # Time to establish connection
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "180"     # Time to send the request
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+spec:
+  tls:
+    - hosts:
+      - attiamministrativi.provincia.lucca.it 
+      secretName: attiamministrativi-tls-secret
+  ingressClassName: ingress-nginx-internet
+  rules:
+  - host: attiamministrativi.provincia.lucca.it 
+    http:
+        paths:
+        - pathType: Prefix
+          path: "/"
+          backend:
+            service:
+              name: nginx
+              port:
+                number: 8080

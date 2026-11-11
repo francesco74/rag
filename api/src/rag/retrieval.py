@@ -3,6 +3,7 @@
 import hashlib
 import logging
 import math
+import os
 import time
 from concurrent.futures import as_completed, ThreadPoolExecutor
 
@@ -868,6 +869,7 @@ def get_reranker_pool():
             timeout=settings.rerank_timeout_seconds,
         ))
     if not _RERANKER_POOL:
+        _check_local_reranker()
         total_cores = settings.cpu_limit
         cores_per_process = max(1, total_cores // max(1, settings.celery_concurrency))
         num_threads = max(1, cores_per_process // max(1, _POOL_SIZE))
@@ -885,6 +887,19 @@ def get_reranker_pool():
             )
             _RERANKER_POOL.append(instance)
     return _RERANKER_POOL
+
+
+def _check_local_reranker():
+    """RERANK_PROVIDER=onnx in un'immagine senza modelli locali: errore che dice cosa fare,
+    invece di un import fallito o di un file del modello mancante."""
+    from reranker import DEPENDENCIES_AVAILABLE
+    if DEPENDENCIES_AVAILABLE and os.path.isdir(settings.onnx_model_cache_path):
+        return
+    raise RuntimeError(
+        f"RERANK_PROVIDER='onnx' (reranking locale) ma "
+        f"{'mancano onnxruntime e transformers' if not DEPENDENCIES_AVAILABLE else 'manca il modello in ' + settings.onnx_model_cache_path}: "
+        "usare il reranking su server (RERANK_PROVIDER=vllm, RERANK_MODEL_NAME, LOCAL_VLLM_RERANK_BASE_URL) "
+        "oppure un'immagine con i modelli locali (MODELLI_LOCALI=1 deploy/immagini.sh VERSIONE).")
 
 
 def get_all_sub_topics(topic_id):

@@ -364,7 +364,9 @@ class LocalEmbeddingProvider(EmbeddingProvider):
         try:
             from sentence_transformers import SentenceTransformer
         except ImportError:
-            raise RuntimeError("sentence-transformers package not installed.")
+            raise RuntimeError(
+                "EMBEDDING_PROVIDER='local' richiede sentence-transformers, che c'è solo nelle immagini "
+                "costruite con i modelli locali: MODELLI_LOCALI=1 deploy/immagini.sh VERSIONE.")
 
         # Campi definiti in config.py: LOCAL_EMBEDDING_MODEL (default "BAAI/bge-m3")
         # e LOCAL_EMBEDDING_DEVICE ("cpu"|"cuda"|"mps", default None = auto-rilevato).

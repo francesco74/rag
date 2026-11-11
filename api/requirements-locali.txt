@@ -1,0 +1,16 @@
+# Modelli locali, solo nelle immagini costruite con MODELLI_LOCALI=1 (deploy/immagini.sh):
+# reranking ONNX su CPU (RERANK_PROVIDER=onnx, modello in api/model_cache) ed embedding
+# sentence-transformers (EMBEDDING_PROVIDER=local, porta con sé PyTorch).
+# Con il reranking e gli embedding serviti da vLLM non servono.
+coloredlogs==15.0.1
+flatbuffers==25.12.19
+hf-xet==1.2.0
+huggingface_hub==1.4.1
+humanfriendly==10.0
+mpmath==1.3.0
+onnxruntime==1.23.2
+safetensors==0.6.2
+sympy==1.14.0
+tokenizers==0.22.1
+transformers==5.1.0
+sentence-transformers

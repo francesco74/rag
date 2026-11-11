@@ -307,7 +307,7 @@ rebuild._save = lambda key, ocr_pages, total_pages: saved.__setitem__(key[0], (o
 keys = {(s, "arc", "ser") for s in docs.values()} | {("sicraweb://1::a.jpg", "arc", "ser"), ("direct://senza_manifest", "arc", "ser")}
 known = {(docs["noto.pdf"], "arc", "ser")}
 done, problems = rebuild.rebuild(archive, keys, known, False, 30)
-check("ricostruzione: senza --apply non scrive", (saved, done), ({}, 4))
+check("ricostruzione: con --dry-run non scrive", (saved, done), ({}, 4))
 done, problems = rebuild.rebuild(archive, keys, known, True, 30)
 check("ricostruzione: conteggi", saved, {docs["misto.pdf"]: (1, 2), docs["foto.jpg"]: (1, 1), docs["nota.txt"]: (0, 0),
                                          "sicraweb://1::a.jpg": (1, 1)})

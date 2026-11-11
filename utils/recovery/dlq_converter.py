@@ -1,13 +1,20 @@
-# Questo script sposta i JSON dalla cartella error alla cartella staging e li riaccoda. Se il JSON è andato perduto, 
-# segnala la situazione per ulteriori approfiondimenti.
-import os
+"""
+Rimette in lavorazione i documenti finiti nella DLQ del converter (da-convertire.dlq):
+riporta il manifest da converter/error/ a staging/ e ripubblica il messaggio su
+da-convertire. Se il manifest non c'è più lo segnala (messaggio "fantasma") e scarta il
+messaggio senza toccare i file. I file caricati dall'amministrazione tornano "in coda".
+Un singolo file caricato si rilancia anche dal sito di amministrazione.
+
+    python -m utils.recovery.dlq_converter
+"""
 import json
 import logging
 import pika
 import shutil
 from pathlib import Path
 from common.config import settings
-from common.db_logger import MySQLLogHandler, get_db_connection, init_db_pool
+from common.db_logger import init_db_pool
+from common.upload_status import QUEUED, mark_upload
 
 logging.basicConfig(level=settings.log_level, format='%(asctime)s - DLQ CONVERTER - %(levelname)s - %(message)s')
 
@@ -25,6 +32,16 @@ def safe_move(src: Path, dest: Path):
     shutil.move(str(src), str(dest))
     return True
 
+def _mark_queued(manifest_path: Path):
+    """I file caricati dall'amministrazione tornano "in coda" (per gli altri non cambia nulla)."""
+    try:
+        source = json.loads(manifest_path.read_text(encoding="utf-8")).get("source")
+    except (OSError, ValueError):
+        return
+    if source:
+        mark_upload(source, QUEUED)
+
+
 def main():
     logging.info(f"Avvio elaborazione DLQ: {DLQ_NAME}")
     try:
@@ -35,6 +52,7 @@ def main():
         logging.error(f"Connessione fallita: {e}")
         return
 
+    init_db_pool()
     success_count, ghost_count = 0, 0
 
     while True:
@@ -58,6 +76,7 @@ def main():
                 )
                 success_count += 1
                 logging.info(f"✓ JSON ripristinato in staging e accodato: {rel_path.name}")
+                _mark_queued(staging_json_path)
             else:
                 # JSON Inesistente -> Alert CRITICAL, ma NESSUNA MODIFICA al filesystem
                 ghost_count += 1

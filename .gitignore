@@ -59,7 +59,8 @@
 !README-TECH.MD
 !docker-compose.yml
 
-api/model_cache/
+api/model_cache/*
+!api/model_cache/.gitkeep
 ingestion/src/error/
 ingestion/src/watch/
 ingestion/src/processed/
@@ -69,3 +70,11 @@ saga_extract/documentazione/
 **/.DS_Store
 **/Thumbs.db
 **/*.json
+# Manifest Kubernetes di produzione: versionati, tranne i segreti veri
+# (si usano rag-secrets.example.yaml e regcreds.example.yaml).
+!deploy/
+!deploy/k8s/
+!deploy/immagini.sh
+!deploy/k8s/**
+deploy/k8s/**/rag-secrets.yaml
+deploy/k8s/**/regcreds.yaml

@@ -1,0 +1,29 @@
+apiVersion: rabbitmq.com/v1beta1
+kind: RabbitmqCluster
+metadata:
+  name: rabbitmq
+  namespace: rag
+spec:
+  replicas: 3
+  
+  resources:
+    requests:
+      cpu: "500m"
+      memory: "1Gi"
+    limits:
+      cpu: "1"
+      memory: "2Gi"
+      
+  persistence:
+    storageClassName: rook-ceph-block
+    storage: "10Gi"
+    
+  rabbitmq:
+    additionalPlugins:
+      - rabbitmq_management
+      - rabbitmq_peer_discovery_k8s
+      - rabbitmq_shovel 
+      - rabbitmq_shovel_management
+    additionalConfig: |
+      consumer_timeout = 86400000
+      heartbeat = 120

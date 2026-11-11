@@ -1,0 +1,50 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: converter
+  namespace: rag 
+  labels:
+    app: converter
+spec:
+  replicas: 3 
+  selector:
+    matchLabels:
+      app: converter
+  template:
+    metadata:
+      labels:
+        app: converter
+    spec:
+      imagePullSecrets:
+        - name: provincia-regcreds
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+      - name: converter
+        image: registry.intranet.provincia.lucca/rag/converter:v4.0.0
+        imagePullPolicy: Always
+        volumeMounts:
+        - name: google-vision-key
+          mountPath: /var/secrets/google
+          readOnly: true
+        - name: rag-storage
+          mountPath: /data
+        envFrom:
+        - configMapRef:
+            name: rag-config
+        - secretRef:
+            name: rag-secrets
+        env:
+        - name: GOOGLE_APPLICATION_CREDENTIALS
+          value: "/var/secrets/google/key.json"
+        - name: DATA_FOLDER
+          value: "/data"
+      volumes:
+      - name: google-vision-key
+        secret:
+          secretName: google-vision-key # Deve corrispondere al nome del Secret su K8s
+      - name: rag-storage
+        persistentVolumeClaim:
+          claimName: rag-storage

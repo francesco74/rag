@@ -1,67 +1,36 @@
-import os
+"""
+Archivi e sottocategorie presenti nei chunk di Qdrant, con il numero di chunk:
+utile per confrontarli con la configurazione del sito di amministrazione.
+
+    python -m utils.qdrant_sub_topic_list
+"""
+
+from collections import Counter
+
 from qdrant_client import QdrantClient
+
 from common.config import settings
-from common.db_logger import MySQLLogHandler, get_db_connection, init_db_pool
 
-def list_topics_from_qdrant():
-    # Connessione a Qdrant usando le variabili d'ambiente o i default
-    client = QdrantClient(
-        host=settings.qdrant_host,
-        port=settings.qdrant_port
-    )
-    
-    collection_name = "document_chunks"
-    
-    try:
-        collections = client.get_collections().collections
-        if not any(c.name == collection_name for c in collections):
-            print(f"❌ La collection '{collection_name}' non esiste in Qdrant.")
-            return
 
-        print("🔍 Scansione dei payload in Qdrant in corso...\n")
-        unique_pairs = set()
-        offset = None
-        
-        # Usiamo 'scroll' per scorrere tutti i vettori in lotti da 100
-        while True:
-            records, offset = client.scroll(
-                collection_name=collection_name,
-                limit=100,
-                with_payload=["topic_id", "sub_topic_id"], # Chiediamo solo i campi necessari
-                with_vectors=False,                        # Risparmiamo banda
-                offset=offset
-            )
-            
-            for record in records:
-                topic = record.payload.get("topic_id", "SCONOSCIUTO")
-                sub_topic = record.payload.get("sub_topic_id", "NON_ASSEGNATO")
-                unique_pairs.add((topic, sub_topic))
-            
-            if offset is None:
-                break
+def main():
+    client = QdrantClient(host=settings.qdrant_host, port=settings.qdrant_port, timeout=120)
+    if not client.collection_exists("document_chunks"):
+        raise SystemExit("La collection 'document_chunks' non esiste.")
+    pairs, offset = Counter(), None
+    while True:
+        points, offset = client.scroll("document_chunks", limit=1000, offset=offset,
+                                       with_payload=["topic_id", "sub_topic_id"], with_vectors=False)
+        pairs.update((p.payload.get("topic_id", "(senza archivio)"),
+                      p.payload.get("sub_topic_id", "(senza sottocategoria)")) for p in points)
+        if offset is None:
+            break
+    current = None
+    for (topic, sub), n in sorted(pairs.items()):
+        if topic != current:
+            print(topic)
+            current = topic
+        print(f"  {sub:40} {n:>8} chunk")
 
-        if not unique_pairs:
-            print("⚠️ Nessun dato trovato nella collection.")
-            return
-
-        # Raggruppamento per una visualizzazione ad albero
-        tree = {}
-        for topic, sub_topic in unique_pairs:
-            if topic not in tree:
-                tree[topic] = set()
-            tree[topic].add(sub_topic)
-            
-        # Stampa ad albero
-        print("📊 STRUTTURA ATTUALE IN QDRANT:")
-        print("===============================")
-        for topic, sub_topics in sorted(tree.items()):
-            print(f"📁 Macroarea (topic_id): {topic}")
-            for st in sorted(sub_topics):
-                print(f"   ↳ 📂 Sottocategoria: {st}")
-        print("===============================\n")
-
-    except Exception as e:
-        print(f"🔥 Errore durante l'accesso a Qdrant: {e}")
 
 if __name__ == "__main__":
-    list_topics_from_qdrant()
+    main()

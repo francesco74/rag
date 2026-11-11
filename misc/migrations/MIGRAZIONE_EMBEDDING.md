@@ -20,9 +20,14 @@ a 768 tutto in RAM): la ricerca scorre la copia compressa e riordina i migliori
 del volume di Qdrant durante la migrazione: vecchie + nuove + copia delle vecchie, circa
 10 KB × chunk per le nuove più 2 × 3 KB × chunk per le vecchie.
 
+I comandi si lanciano dalla radice del repository; gli script girano nel pod `strumenti`
+(`deploy/k8s/strumenti.yaml`: immagine e configurazione dell'API, con più memoria).
+
 ```bash
 alias k='kubectl -n rag'
-mkdir -p ~/migrazione-embedding && cd ~/migrazione-embedding
+export BK=~/migrazione-embedding && mkdir -p $BK
+SAGA="saga-determina-cronjob saga-decreto-deliberativo-cronjob saga-decreto-presidenziale-cronjob"
+k get pod strumenti || { k apply -f deploy/k8s/strumenti.yaml && k wait --for=condition=Ready pod/strumenti --timeout=5m; }
 ```
 
 ## Configurazione nuova
@@ -32,7 +37,7 @@ EMBEDDING_PROVIDER=vllm
 LOCAL_VLLM_EMBEDDING_MODEL=Qwen3-Embedding-4B
 LOCAL_VLLM_EMBEDDING_BASE_URL=http://10.1.1.132:8002/v1
 EMBEDDING_DIMENSION=2560
-EMBEDDING_QUERY_INSTRUCTION=Given a question about administrative documents, retrieve the passages that answer it
+EMBEDDING_QUERY_INSTRUCTION=Given a question, retrieve the passages from the archived documents that answer it
 ```
 
 - `LOCAL_VLLM_EMBEDDING_MODEL` è il nome con cui vLLM espone il modello (`--served-model-name`).
@@ -52,7 +57,7 @@ essere già in produzione: immagini `rest`, `ingestion` e, se usata, `detect_boi
 **Il modello risponde dal cluster**, con la dimensione attesa:
 
 ```bash
-k exec deploy/api -- python -c "
+k exec strumenti -- python -c "
 import json, urllib.request
 r = urllib.request.urlopen(urllib.request.Request('http://10.1.1.132:8002/v1/embeddings',
     data=json.dumps({'model': 'Qwen3-Embedding-4B', 'input': ['prova']}).encode(),
@@ -66,7 +71,7 @@ rete che blocchi il traffico dai pod verso il DGX.
 **Situazione di partenza:**
 
 ```bash
-k exec deploy/api -- python -m utils.migrate_embeddings stato | tee stato-prima.txt
+k exec strumenti -- python -m utils.migrate_embeddings stato | tee $BK/stato-prima.txt
 ```
 
 Dal numero di punti di `document_chunks` si stima la durata: una prova del ritmo si ha al
@@ -75,16 +80,16 @@ passo 4 (un messaggio ogni 5000 punti).
 ## 2. Fermo
 
 Come nel passo 3 della migrazione v4: si ferma ciò che porta documenti nuovi, si aspetta che le
-code si svuotino, poi si fermano i servizi. L'API resta accesa (serve per lanciare gli script),
-ma nessuno la raggiunge perché si ferma nginx:
+code si svuotino, poi si fermano i servizi (gli script girano nel pod strumenti):
 
 ```bash
-k patch cronjob saga-cron -p '{"spec":{"suspend":true}}'
-# eventuale CronJob di detect_boilerplate: sospenderlo allo stesso modo
+for c in $SAGA; do k patch cronjob $c -p '{"spec":{"suspend":true}}'; done
+k get jobs                                                            # nessun job di saga in corso
 k exec rabbitmq-server-0 -- rabbitmqctl list_queues name messages    # attendere 0
-k scale deploy/ingestion deploy/converter deploy/celery-beat deploy/NOME-WORKER-CELERY --replicas=0
-k scale deploy/nginx --replicas=0        # i siti rispondono con errore finché non si riaccende
+k scale deploy/nginx deploy/ingestion deploy/converter deploy/celery-beat deploy/worker deploy/api --replicas=0
 ```
+
+Da qui i siti rispondono con un errore dell'ingress fino al passo 7.
 
 ## 3. Backup di Qdrant
 
@@ -96,9 +101,9 @@ k port-forward svc/qdrant 6333:6333 &
 for c in document_chunks semantic_cache conceptual_dictionary boilerplate_phrases; do
   nome=$(curl -s -X POST "http://localhost:6333/collections/$c/snapshots?wait=true" \
          | python3 -c 'import sys,json; print(json.load(sys.stdin)["result"]["name"])')
-  curl -s -o "qdrant-$c.snapshot" "http://localhost:6333/collections/$c/snapshots/$nome"
+  curl -s -o "$BK/qdrant-$c.snapshot" "http://localhost:6333/collections/$c/snapshots/$nome"
 done
-ls -lh *.snapshot; kill %1
+ls -lh $BK/*.snapshot; kill %1
 ```
 
 ## 4. Ricalcolo
@@ -108,12 +113,12 @@ fino al passo 5). Il ricalcolo può durare ore: gira in background dentro il pod
 log sul volume, così non dipende dalla connessione di `kubectl`.
 
 ```bash
-k exec deploy/api -- sh -c 'nohup env EMBEDDING_PROVIDER=vllm \
+k exec strumenti -- sh -c 'nohup env EMBEDDING_PROVIDER=vllm \
     LOCAL_VLLM_EMBEDDING_MODEL=Qwen3-Embedding-4B \
     LOCAL_VLLM_EMBEDDING_BASE_URL=http://10.1.1.132:8002/v1 \
     EMBEDDING_DIMENSION=2560 \
     python -m utils.migrate_embeddings ricalcola > /data/migrate_embeddings.log 2>&1 &'
-k exec deploy/api -- tail -f /data/migrate_embeddings.log
+k exec strumenti -- tail -f /data/migrate_embeddings.log
 ```
 
 Alla fine: `Ricalcolo completato`. Per ogni collection il log riporta i punti ricalcolati su
@@ -123,7 +128,7 @@ interrompe, si rilancia: riparte da capo sulle collection `__nuovo`, le original
 toccate.
 
 ```bash
-k exec deploy/api -- python -m utils.migrate_embeddings stato | tee stato-ricalcolo.txt
+k exec strumenti -- python -m utils.migrate_embeddings stato | tee $BK/stato-ricalcolo.txt
 ```
 
 Le collection `__nuovo` devono avere dimensione 2560 e `document_chunks__nuovo` vettori su
@@ -131,13 +136,14 @@ disco e quantizzazione int8.
 
 ## 5. Configurazione e sostituzione
 
-In `k8s/rag-config.yaml` le variabili della configurazione nuova (sopra), poi:
+In `deploy/k8s/rag-config.yaml` le variabili della configurazione nuova (sopra), poi, ricreando
+il pod strumenti perché la legga:
 
 ```bash
-k apply -f k8s/rag-config.yaml
-k rollout restart deploy/api && k rollout status deploy/api
-k exec deploy/api -- python -m utils.migrate_embeddings sostituisci
-k exec deploy/api -- python -m utils.migrate_embeddings stato | tee stato-dopo.txt
+k apply -f deploy/k8s/rag-config.yaml
+k delete pod strumenti && k apply -f deploy/k8s/strumenti.yaml && k wait --for=condition=Ready pod/strumenti --timeout=5m
+k exec strumenti -- python -m utils.migrate_embeddings sostituisci
+k exec strumenti -- python -m utils.migrate_embeddings stato | tee $BK/stato-dopo.txt
 ```
 
 `sostituisci` copia le collection attuali in `<nome>__vecchio`, mette le ricalcolate al loro
@@ -151,7 +157,7 @@ Le soglie di similarità sono tarate sui valori di Gemini; con Qwen3 la distribu
 di cui si conosce la risposta, si guardano i punteggi della ricerca vettoriale:
 
 ```bash
-k exec -i deploy/api -- python - <<'EOF'
+k exec -i strumenti -- python - <<'EOF'
 from qdrant_client import QdrantClient
 from common.config import settings
 from common.embedding import init_embedding, embed_query
@@ -176,15 +182,18 @@ EOF
 La soglia della cache semantica (0.97, in `api/src/rag/cache.py`) riconosce solo domande
 praticamente identiche ed è di norma adeguata anche con Qwen3.
 
-Le soglie si cambiano nella ConfigMap (`k apply` + `k rollout restart deploy/api`), senza
-ricalcolare nulla.
+Le soglie si cambiano nella ConfigMap (`deploy/k8s/rag-config.yaml`, `k apply`), senza
+ricalcolare nulla; i servizi le leggono quando ripartono al passo 7 (il pod strumenti va
+ricreato per vederle).
 
 ## 7. Ripartenza
 
+Le repliche tornano quelle dei manifest; i pod nuovi leggono la configurazione nuova:
+
 ```bash
-k scale deploy/NOME-WORKER-CELERY deploy/celery-beat deploy/converter deploy/ingestion --replicas=1
-k scale deploy/nginx --replicas=1
-k patch cronjob saga-cron -p '{"spec":{"suspend":false}}'
+for f in api worker celery-beat converter ingestion nginx; do k apply -f deploy/k8s/$f.yaml; done
+for c in $SAGA; do k patch cronjob $c -p '{"spec":{"suspend":false}}'; done
+k get pods
 ```
 
 Controlli: domande sui due siti, con fonti pertinenti; una ricerca con il filtro per data;
@@ -194,7 +203,7 @@ log di API e ingestione nessun errore di embedding o di dimensione.
 **Dopo qualche giorno**, a migrazione confermata, si eliminano le copie:
 
 ```bash
-k exec deploy/api -- python -m utils.migrate_embeddings pulisci --conferma
+k exec strumenti -- python -m utils.migrate_embeddings pulisci --conferma
 ```
 
 ## Ritorno a Gemini
@@ -203,9 +212,9 @@ Finché esistono le copie `__vecchio` (prima di `pulisci`):
 
 1. Fermo come al passo 2.
 2. ConfigMap con la configurazione precedente (`EMBEDDING_PROVIDER=gemini`,
-   `EMBEDDING_DIMENSION=768`, senza `EMBEDDING_QUERY_INSTRUCTION`), `k apply` e
-   `k rollout restart deploy/api`.
-3. `k exec deploy/api -- python -m utils.migrate_embeddings ripristina`: rimette le collection
+   `EMBEDDING_DIMENSION=768`, senza `EMBEDDING_QUERY_INSTRUCTION`), `k apply`, e pod strumenti
+   ricreato.
+3. `k exec strumenti -- python -m utils.migrate_embeddings ripristina`: rimette le collection
    precedenti (con i parametri di allora) e ricrea vuota la cache a 768.
 4. Ripartenza come al passo 7.
 

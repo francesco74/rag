@@ -1,59 +1,37 @@
-import os
+"""
+Chunk e documenti indicizzati in Qdrant (document_chunks), in totale e per archivio.
+
+    python -m utils.qdrant_document_count
+"""
+
+from collections import Counter
+
 from qdrant_client import QdrantClient
+
 from common.config import settings
-from common.db_logger import MySQLLogHandler, get_db_connection, init_db_pool
 
-def count_qdrant_metrics():
-    client = QdrantClient(
-        host=settings.qdrant_host,
-        port=settings.qdrant_port
-    )
-    
-    collection_name = "document_chunks"
-    
-    try:
-        # Verifica se la collection esiste
-        collections = client.get_collections().collections
-        if not any(c.name == collection_name for c in collections):
-            print(f"❌ La collection '{collection_name}' non esiste.")
-            return
+COLLECTION = "document_chunks"
 
-        print("📊 CALCOLO METRICHE QDRANT IN CORSO...\n")
 
-        # 1. Conteggio Vettori (Chunks) - Chiamata nativa ultraveloce
-        total_chunks = client.count(collection_name=collection_name).count
-        
-        # 2. Conteggio Documenti Univoci (Sources) - Scroll del payload
-        unique_sources = set()
-        offset = None
-        
-        while True:
-            records, offset = client.scroll(
-                collection_name=collection_name,
-                limit=500,               # Batch più grande per scorrere in fretta
-                with_payload=["source"], # Chiediamo SOLO il campo source per minimizzare la RAM
-                with_vectors=False,
-                offset=offset
-            )
-            
-            for record in records:
-                source = record.payload.get("source")
-                if source:
-                    unique_sources.add(source)
-            
-            if offset is None:
-                break
+def main():
+    client = QdrantClient(host=settings.qdrant_host, port=settings.qdrant_port, timeout=120)
+    if not client.collection_exists(COLLECTION):
+        raise SystemExit(f"La collection '{COLLECTION}' non esiste.")
+    chunks, sources, offset = Counter(), {}, None
+    while True:
+        points, offset = client.scroll(COLLECTION, limit=1000, offset=offset,
+                                       with_payload=["topic_id", "source"], with_vectors=False)
+        for p in points:
+            topic = p.payload.get("topic_id", "?")
+            chunks[topic] += 1
+            sources.setdefault(topic, set()).add(p.payload.get("source"))
+        if offset is None:
+            break
+    print(f"{'archivio':30} {'documenti':>10} {'chunk':>10}")
+    for topic in sorted(chunks):
+        print(f"{topic:30} {len(sources[topic]):>10} {chunks[topic]:>10}")
+    print(f"{'totale':30} {sum(len(s) for s in sources.values()):>10} {sum(chunks.values()):>10}")
 
-        print(f"🔹 Totale frammenti vettoriali (Chunks): {total_chunks}")
-        print(f"📄 Totale documenti fisici (Sorgenti Uniche): {len(unique_sources)}")
-        
-        # Opzionale: decommenta per vedere i nomi dei file
-        # print("\nLista Documenti:")
-        # for doc in sorted(unique_sources):
-        #     print(f" - {doc}")
-
-    except Exception as e:
-        print(f"🔥 Errore durante l'accesso a Qdrant: {e}")
 
 if __name__ == "__main__":
-    count_qdrant_metrics()
+    main()

@@ -22,10 +22,10 @@ NOTE:
   disco intatto, se ti serve ispezionarlo per intero.
 
 Uso:
-    python debug_leggi_atto_plus_raw.py <uid>
+    python -m utils.leggiattoplus <uid>
 
 Esempio (il caso decreto presidenziale 1/2024):
-    python debug_leggi_atto_plus_raw.py 2119188
+    python -m utils.leggiattoplus 2119188
 """
 import sys
 import re
@@ -48,7 +48,7 @@ def redact_images(inner_tree: ET.Element) -> ET.Element:
 
 def main():
     if len(sys.argv) != 2:
-        print("Uso: python debug_leggi_atto_plus_raw.py <uid>")
+        print("Uso: python -m utils.leggiattoplus <uid>")
         sys.exit(1)
 
     uid = sys.argv[1]

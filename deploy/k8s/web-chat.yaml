@@ -1,0 +1,38 @@
+# Frontend unico della chat: il sito lo decide il dominio (tabella chat_sites,
+# gestita dal sito di amministrazione). Un nuovo sito non richiede un nuovo deploy:
+# basta che il suo dominio arrivi a nginx (DNS, ingress e certificato) e che sia
+# creato con python -m utils.manage_sites add.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-chat
+  namespace: rag
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: web-chat
+  template:
+    metadata:
+      labels:
+        app: web-chat
+    spec:
+      imagePullSecrets:
+      - name: provincia-regcreds
+      containers:
+      - image: registry.intranet.provincia.lucca/rag/web-chat:v4.0.0
+        imagePullPolicy: Always
+        name: web-chat
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-chat
+  namespace: rag
+spec:
+  ports:
+  - port: 80
+    protocol: TCP
+    targetPort: 80
+  selector:
+    app: web-chat
