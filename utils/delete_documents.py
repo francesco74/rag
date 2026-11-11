@@ -12,14 +12,14 @@ Elimina i documenti di una sottocategoria, o un solo documento, da tutto il sist
 
 La sottocategoria resta (si elimina, vuota, dal sito di amministrazione), come l'archivio.
 
-Senza --yes mostra solo cosa eliminerebbe. Dentro il pod dell'API o il pod strumenti:
+Con --dry-run mostra solo cosa eliminerebbe. Dentro il pod dell'API o il pod strumenti:
 
-    python -m utils.delete_documents greenlees carteggio                  # cosa eliminerebbe
-    python -m utils.delete_documents greenlees carteggio --yes            # elimina
-    python -m utils.delete_documents greenlees carteggio --source "SOURCE" --yes   # un solo documento
+    python -m utils.delete_documents greenlees carteggio --dry-run        # cosa eliminerebbe
+    python -m utils.delete_documents greenlees carteggio                  # elimina
+    python -m utils.delete_documents greenlees carteggio --source "SOURCE"   # un solo documento
 
 SOURCE è il campo "source" del documento (lo mostra l'elenco documenti della revisione e
-il comando senza --yes).
+il comando con --dry-run).
 """
 
 import argparse
@@ -78,7 +78,7 @@ def main():
     ap.add_argument("topic_id")
     ap.add_argument("sub_topic_id")
     ap.add_argument("--source", help="un solo documento (il suo campo source)")
-    ap.add_argument("--yes", action="store_true", help="elimina davvero (senza: mostra solo cosa eliminerebbe)")
+    ap.add_argument("--dry-run", action="store_true", help="mostra solo cosa eliminerebbe, senza eliminare")
     args = ap.parse_args()
     topic, sub, source = args.topic_id, args.sub_topic_id, args.source
 
@@ -110,8 +110,8 @@ def main():
     if not (chunks or any(rows.values()) or files):
         print("Niente da eliminare.")
         return
-    if not args.yes:
-        print("\nNessuna modifica. Per eliminare: aggiungere --yes.")
+    if args.dry_run:
+        print("\nNessuna modifica (--dry-run). Per eliminare: rilanciare senza --dry-run.")
         return
 
     # 1. Qdrant: senza i chunk il documento sparisce subito dalle risposte.

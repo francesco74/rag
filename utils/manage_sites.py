@@ -7,6 +7,7 @@ successive si fanno dal sito di amministrazione.
         --name "Archivio Ian Greenlees" --dir /tmp/sites/greenlees
     python -m utils.manage_sites add attiamministrativi.provincia.lucca.it --topic attiprovincia \
         --name "Atti amministrativi" --date-filter --dir /tmp/sites/attiamministrativi
+    python -m utils.manage_sites delete archiviogreenlees.provincia.lucca.it --dry-run
     python -m utils.manage_sites delete archiviogreenlees.provincia.lucca.it
     python -m utils.manage_sites list
 
@@ -92,8 +93,9 @@ def cmd_delete(args):
         row = cur.fetchone()
         if not row:
             sys.exit(f"Sito '{hostname}' inesistente.")
-        if not args.yes and input(f"Riscrivi '{hostname}' per confermare: ").strip() != hostname:
-            sys.exit("Annullato: nessuna modifica.")
+        if args.dry_run:
+            print(f"Verrebbe eliminato il sito '{hostname}' (archivio '{row[0]}'): nessuna modifica (--dry-run).")
+            return
         cur.execute("DELETE FROM chat_sites WHERE hostname = %s", (hostname,))
         conn.commit()
         print(f"Sito '{hostname}' eliminato: l'archivio '{row[0]}' e i documenti restano.")
@@ -124,7 +126,7 @@ def main():
     add.set_defaults(fn=cmd_add)
     delete = sub.add_parser("delete")
     delete.add_argument("hostname")
-    delete.add_argument("--yes", action="store_true")
+    delete.add_argument("--dry-run", action="store_true", help="mostra cosa eliminerebbe, senza eliminare")
     delete.set_defaults(fn=cmd_delete)
     sub.add_parser("list").set_defaults(fn=cmd_list)
     args = parser.parse_args()

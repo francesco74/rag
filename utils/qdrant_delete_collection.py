@@ -1,7 +1,8 @@
 """
-Elimina una collection di Qdrant (chiede conferma; --force no). Per svuotare la cache
-delle risposte c'è utils/qdrant_semantic_cache_reset, che la ricrea.
+Elimina una collection di Qdrant, irreversibilmente. Per svuotare la cache delle
+risposte c'è utils/qdrant_semantic_cache_reset, che la ricrea.
 
+    python -m utils.qdrant_delete_collection document_chunks__vecchio --dry-run   # cosa eliminerebbe
     python -m utils.qdrant_delete_collection document_chunks__vecchio
 """
 import argparse
@@ -9,7 +10,7 @@ from qdrant_client import QdrantClient
 from qdrant_client.http.exceptions import UnexpectedResponse
 from common.config import settings
 
-def delete_qdrant_collection(collection_name, force=False):
+def delete_qdrant_collection(collection_name, dry_run=False):
     print(f"Connessione a Qdrant ({settings.qdrant_host}:{settings.qdrant_port}) in corso...\n")
     try:
         qdrant = QdrantClient(host=settings.qdrant_host, port=settings.qdrant_port)
@@ -24,14 +25,12 @@ def delete_qdrant_collection(collection_name, force=False):
             else:
                 raise e # Rilancia l'errore se è un problema diverso (es. auth o timeout)
 
-        # 2. Conferma manuale (salvo se c'è il flag --force)
-        if not force:
-            print(f"⚠️  ATTENZIONE: Stai per eliminare IRREVERSIBILMENTE la collection '{collection_name}'.")
-            confirm = input("Tutti i vettori e i payload andranno persi. Vuoi procedere? (y/n): ")
-            if confirm.lower() != 'y':
-                print("Operazione annullata dall'utente.")
-                return
-                
+        # 2. Con --dry-run si ferma qui
+        if dry_run:
+            punti = qdrant.count(collection_name, exact=True).count
+            print(f"Verrebbe eliminata la collection '{collection_name}' ({punti} punti): nessuna modifica (--dry-run).")
+            return
+
         # 3. Eliminazione
         print(f"Eliminazione di '{collection_name}' in corso...")
         qdrant.delete_collection(collection_name=collection_name)
@@ -49,11 +48,11 @@ if __name__ == "__main__":
         help="Il nome esatto della collection da eliminare"
     )
     parser.add_argument(
-        "-f", "--force", 
-        action="store_true", 
-        help="Salta la richiesta di conferma (utile negli script CI/CD)"
+        "--dry-run",
+        action="store_true",
+        help="mostra cosa eliminerebbe, senza eliminare"
     )
     
     args = parser.parse_args()
     
-    delete_qdrant_collection(args.collection, args.force)
+    delete_qdrant_collection(args.collection, args.dry_run)

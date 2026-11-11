@@ -30,8 +30,8 @@ sommersi e l'avanzamento si vede.
 
 Esempi (dentro il pod/container dell'API, che ha DATA_FOLDER, MySQL e RabbitMQ):
     python -m utils.reindex_topic greenlees --dry-run           # cosa verrebbe re-indicizzato
-    python -m utils.reindex_topic greenlees                     # avvio, chiede conferma
-    python -m utils.reindex_topic greenlees --sub-topic lettere --limit 20 --yes   # prova su pochi
+    python -m utils.reindex_topic greenlees                     # avvio
+    python -m utils.reindex_topic greenlees --sub-topic lettere --limit 20   # prova su pochi
     python -m utils.reindex_topic attiprovincia --all --batch 100 --max-pending 20
 
 Dopo la re-indicizzazione conviene svuotare la cache semantica
@@ -139,7 +139,6 @@ def main():
     ap.add_argument("--max-pending", type=int, default=50,
                     help="messaggi in coda oltre i quali si aspetta prima del lotto successivo (default 50)")
     ap.add_argument("--dry-run", action="store_true", help="elenca senza copiare né pubblicare")
-    ap.add_argument("--yes", action="store_true", help="non chiedere conferma")
     args = ap.parse_args()
 
     init_db_pool()
@@ -190,9 +189,6 @@ def main():
         if len(todo) > 20:
             print(f"    ... e altri {len(todo) - 20}")
         print("Prova a vuoto: nulla copiato né pubblicato.")
-        return
-    if not args.yes and input(f"Avvio la re-indicizzazione di {len(todo)} documenti? [s/N] ").strip().lower() != "s":
-        print("Annullato.")
         return
 
     connection, channel = rabbit_channel()

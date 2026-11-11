@@ -18,7 +18,8 @@ Comandi, da lanciare in ordine con la NUOVA configurazione di embedding
     python -m utils.migrate_embeddings ricalcola     # -> <nome>__nuovo, le originali non si toccano
     python -m utils.migrate_embeddings sostituisci   # originali -> <nome>__vecchio, __nuovo -> originali
     python -m utils.migrate_embeddings ripristina    # per tornare indietro: __vecchio -> originali
-    python -m utils.migrate_embeddings pulisci --conferma   # a migrazione confermata: elimina le copie
+    python -m utils.migrate_embeddings pulisci --dry-run    # quali copie eliminerebbe
+    python -m utils.migrate_embeddings pulisci              # a migrazione confermata: elimina le copie
 
 Qdrant non sa rinominare una collection: "sostituisci" e "ripristina" copiano i
 punti (vettori e payload, stessi id) senza ricalcolare nulla e ricreano gli
@@ -210,7 +211,7 @@ def cmd_sostituisci(client, args):
         client.delete_collection(name + NEW)
         log.info(f"✓ '{name}' sostituita (la precedente è in '{name + OLD}').")
     _reset_cache(client, settings.embedding_dimension)
-    log.info("Sostituzione completata. Dopo le verifiche: pulisci --conferma.")
+    log.info("Sostituzione completata. Dopo le verifiche: pulisci.")
 
 
 def cmd_ripristina(client, args):
@@ -230,11 +231,12 @@ def cmd_ripristina(client, args):
 
 
 def cmd_pulisci(client, args):
-    if not args.conferma:
-        sys.exit("Elimina le copie __vecchio e le __nuovo rimaste: aggiungere --conferma.")
     for name in args.collections:
         for full in (name + OLD, name + NEW):
             if _exists(client, full):
+                if args.dry_run:
+                    log.info(f"Verrebbe eliminata '{full}' (--dry-run).")
+                    continue
                 client.delete_collection(full)
                 log.info(f"Eliminata '{full}'.")
 
@@ -247,7 +249,7 @@ def main():
         p.add_argument("--collections", default=",".join(SOURCES),
                        help=f"separate da virgola, tra {list(SOURCES)} (default: tutte)")
         if name == "pulisci":
-            p.add_argument("--conferma", action="store_true")
+            p.add_argument("--dry-run", action="store_true", help="mostra le copie che eliminerebbe")
     args = parser.parse_args()
     args.collections = [c.strip() for c in args.collections.split(",") if c.strip()]
     unknown = [c for c in args.collections if c not in SOURCES]

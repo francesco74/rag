@@ -4,11 +4,12 @@ il container dell'API. Il resto della configurazione e le sottocategorie si
 gestiscono dal sito di amministrazione.
 
     python -m utils.manage_topics add mio_archivio --description "Descrizione" --prompt general
+    python -m utils.manage_topics delete mio_archivio --dry-run
     python -m utils.manage_topics delete mio_archivio
     python -m utils.manage_topics list
 
-L'eliminazione è rifiutata se l'archivio ha documenti o un sito, e chiede di
-riscrivere l'identificativo (--yes per saltare la domanda).
+L'eliminazione è rifiutata se l'archivio ha documenti o un sito; con --dry-run fa
+solo i controlli e dice se l'archivio verrebbe eliminato.
 """
 
 import argparse
@@ -65,8 +66,9 @@ def cmd_delete(args):
         row = cur.fetchone()
         if row:
             sys.exit(f"L'archivio '{args.topic_id}' ha il sito '{row[0]}': va eliminato prima, con utils.manage_sites delete.")
-        if not args.yes and input(f"Riscrivi '{args.topic_id}' per confermare: ").strip() != args.topic_id:
-            sys.exit("Annullato: nessuna modifica.")
+        if args.dry_run:
+            print(f"L'archivio '{args.topic_id}' verrebbe eliminato: nessuna modifica (--dry-run).")
+            return
         cur.execute("DELETE FROM review_user_topics WHERE topic_id = %s", (args.topic_id,))
         cur.execute("DELETE FROM topics WHERE topic_id = %s", (args.topic_id,))
         conn.commit()
@@ -97,7 +99,7 @@ def main():
     add.set_defaults(fn=cmd_add)
     delete = sub.add_parser("delete")
     delete.add_argument("topic_id")
-    delete.add_argument("--yes", action="store_true")
+    delete.add_argument("--dry-run", action="store_true", help="fa solo i controlli, senza eliminare")
     delete.set_defaults(fn=cmd_delete)
     sub.add_parser("list").set_defaults(fn=cmd_list)
     args = parser.parse_args()

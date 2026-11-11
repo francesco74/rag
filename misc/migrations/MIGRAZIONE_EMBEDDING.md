@@ -203,7 +203,8 @@ log di API e ingestione nessun errore di embedding o di dimensione.
 **Dopo qualche giorno**, a migrazione confermata, si eliminano le copie:
 
 ```bash
-k exec strumenti -- python -m utils.migrate_embeddings pulisci --conferma
+k exec strumenti -- python -m utils.migrate_embeddings pulisci --dry-run   # quali copie
+k exec strumenti -- python -m utils.migrate_embeddings pulisci
 ```
 
 ## Ritorno a Gemini

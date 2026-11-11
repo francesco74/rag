@@ -320,7 +320,7 @@ def main():
 
     parser = argparse.ArgumentParser(description="Estrattore Massivo")
     parser.add_argument("--debug", action="store_true", help="Abilita log di livello DEBUG.")
-    parser.add_argument("--dry", action="store_true", help="Simula la ricerca.")
+    parser.add_argument("--dry-run", action="store_true", help="Simula la ricerca.")
     parser.add_argument("--json-filters", type=str, required=True, help="Filtri in JSON.")
     parser.add_argument(
         "--sicraweb-delay",
@@ -379,7 +379,7 @@ def main():
         str_uid = str(raw_json["uid"])
         meta_atto = raw_json.get("metadati") or {}
 
-        if args.dry:
+        if args.dry_run:
             log.info("DRY-RUN: elaborazione saltata per UID %s (modalità diretta).", str_uid)
             return
 
@@ -409,9 +409,9 @@ def main():
         sys.exit(1)
 
     log.info("Esecuzione ricerca documenti su Sicr@Web (Destinazione: %s)...", tipo_cartella_statica)
-    risultato_ricerca = run_search(filtri_dinamici, dry_run=args.dry)
+    risultato_ricerca = run_search(filtri_dinamici, dry_run=args.dry_run)
 
-    if args.dry:
+    if args.dry_run:
         log.info("Esecuzione DRY-RUN terminata.")
         return
 
