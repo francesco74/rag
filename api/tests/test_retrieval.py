@@ -255,12 +255,13 @@ set_qdrant(q)
 reranker.words = ("cappellini",)
 
 
-def run(**over):
+def run(chiamata=None, **over):
     base = dict(extra_parents=True, extra_parents_min_prob=0.5, max_sub_queries=5, parents_per_query=4,
                 context_score_source="rerank")
     set_setting(**{**base, **over})
     ctx, _, st = retrieve_chunks(["affidamenti a Valentina Cappellini"], [[1.0, 0.05, 0.0]], [],
-                                        "attiprovincia", [], {}, task_id="t", semantic_size=40, semantic_threshold=0.0)
+                                        "attiprovincia", [], {}, task_id="t",
+                                        **(chiamata or {"semantic_size": 40, "semantic_threshold": 0.0}))
     return sorted(it["source"].split("//")[1] for it in ctx), st
 
 
@@ -274,6 +275,17 @@ nm, _ = run(max_sub_queries=1)
 check(len(nm) == 4, "posti extra: tetto MAX_SUB_QUERIES × PARENTS_PER_QUERY")
 nm, _ = run(extra_parents_min_prob=0.99)
 check(len(nm) == 4, "posti extra: soglia di probabilità rispettata")
+
+# Ricerca approfondita: più candidati e più sezioni per sotto-domanda.
+from rag.retrieval import profile_kwargs  # noqa: E402
+set_setting(qdrant_semantic_size=20, qdrant_semantic_threshold=0.0, deep_search_size_mult=2.0,
+            deep_search_parents_per_query=6, parents_per_query=4)
+normale, profonda = profile_kwargs(0), profile_kwargs(0, deep_search=True)
+check(normale["semantic_size"] == 20 and "parents_per_query" not in normale, "ricerca normale: parametri invariati")
+check(profonda["semantic_size"] == 40 and profonda["parents_per_query"] == 6, "ricerca approfondita: candidati x2, 6 sezioni")
+check(profile_kwargs(2, deep_search=True)["semantic_size"] == 80, "ricerca approfondita: si somma al profilo del tentativo")
+nm, st = run(chiamata={**profonda, "semantic_threshold": 0.0}, extra_parents=False)
+check(len(nm) == 6 and st["parents_per_query"] == 6, f"ricerca approfondita: 6 sezioni in quota ({len(nm)})")
 
 # ---------------------------------------------------------------------------
 # Punteggi già normalizzati dal server (vLLM): niente seconda sigmoide. Con 0.4

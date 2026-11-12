@@ -179,6 +179,10 @@ class Settings:
     # chat): passaggi tenuti dopo il rerank per ogni sotto-domanda al posto
     # di rerank_size. Più fonti, risposta più lenta e più costosa.
     rerank_max_size: int
+    # Ricerca approfondita (deep_search della chat): candidati della ricerca vettoriale
+    # moltiplicati per deep_search_size_mult e sezioni garantite per sotto-domanda.
+    deep_search_size_mult: float
+    deep_search_parents_per_query: int
     rerank_truncate: int
     rerank_batch_size: int
     rerank_max_length: int
@@ -560,6 +564,8 @@ def load_settings() -> Settings:
 
         rerank_size = int(os.environ.get("RERANK_SIZE") or 25),
         rerank_max_size = int(os.environ.get("RERANK_MAX_SIZE") or 30),
+        deep_search_size_mult = max(1.0, float(os.environ.get("DEEP_SEARCH_SIZE_MULT") or 2.0)),
+        deep_search_parents_per_query = max(1, int(os.environ.get("DEEP_SEARCH_PARENTS_PER_QUERY") or 6)),
         rerank_truncate = int(os.environ.get("RERANK_TRUNCATE") or 1200),
         rerank_batch_size = int(os.environ.get("RERANK_BATCH_SIZE") or  4),
         rerank_max_length = int(os.environ.get("RERANK_MAX_LENGTH") or 512),

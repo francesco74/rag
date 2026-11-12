@@ -247,13 +247,17 @@ def _run_rag_query(task_id, query, history, topic_id, selected_sub_topics, metad
     start_time = time.time()
     log.info(f"[{task_id}] Task started: '{query[:50]}...' su topic: {topic_id}")
 
-    # Ricerca approfondita (opzione della chat): più passaggi per sotto-domanda.
+    # Ricerca approfondita (opzione della chat): più candidati dalla ricerca
+    # vettoriale e più sezioni per sotto-domanda (profile_kwargs), più passaggi
+    # tenuti dopo il rerank.
     # max(): se RERANK_SIZE fosse configurata più alta, l'opzione non deve ridurla.
     rerank_size = (max(settings.rerank_size, settings.rerank_max_size)
                    if deep_search else settings.rerank_size)
     if deep_search:
         log.info(f"[{task_id}] Ricerca approfondita: rerank_size={rerank_size} "
-                 f"(normale: {settings.rerank_size})")
+                 f"(normale: {settings.rerank_size}), candidati x{settings.deep_search_size_mult}, "
+                 f"sezioni per sotto-domanda {max(settings.parents_per_query, settings.deep_search_parents_per_query)} "
+                 f"(normale: {settings.parents_per_query})")
 
     # Accumula, per ciascun tentativo di retrieval, i parametri usati e le stats
     # ritornate da retrieve_chunks. Alla fine viene salvato in rag_metrics
@@ -417,7 +421,7 @@ def _run_rag_query(task_id, query, history, topic_id, selected_sub_topics, metad
             rerank_size=rerank_size,
             concepts=active_concepts,
             task_id=task_id,
-            **profile_kwargs(0, task_id=task_id)
+            **profile_kwargs(0, task_id=task_id, deep_search=deep_search)
         )
         attempts_metrics.append({"attempt": 0, "standalone_query": standalone_query, **retrieval_stats})
         phases.note_retrieval(retrieval_stats)
@@ -573,7 +577,7 @@ def _run_rag_query(task_id, query, history, topic_id, selected_sub_topics, metad
                         rerank_size=rerank_size,
                         concepts=active_concepts,
                         task_id=task_id,
-                        **profile_kwargs(attempt, task_id=task_id)
+                        **profile_kwargs(attempt, task_id=task_id, deep_search=deep_search)
                     )
                     attempts_metrics.append({"attempt": attempt, "standalone_query": standalone_query, **retrieval_stats})
                     phases.note_retrieval(retrieval_stats)
@@ -598,7 +602,7 @@ def _run_rag_query(task_id, query, history, topic_id, selected_sub_topics, metad
                         rerank_size=rerank_size,
                         concepts=active_concepts,
                         task_id=f"{task_id}-FALLBACK",
-                        **profile_kwargs(settings.max_model_retries - 1, task_id=task_id)
+                        **profile_kwargs(settings.max_model_retries - 1, task_id=task_id, deep_search=deep_search)
                     )
                     attempts_metrics.append({"attempt": "fallback", "standalone_query": standalone_query, **final_stats})
                     phases.note_retrieval(final_stats)

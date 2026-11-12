@@ -55,14 +55,22 @@ RETRY_PROFILES = {
 }
 
 
-def profile_kwargs(attempt, task_id="UNKNOWN"):
-    """Traduce il numero di tentativo in parametri concreti per retrieve_chunks."""
+def profile_kwargs(attempt, task_id="UNKNOWN", deep_search=False):
+    """Traduce il numero di tentativo in parametri concreti per retrieve_chunks.
+
+    Con la ricerca approfondita i candidati della ricerca vettoriale si moltiplicano
+    anche per DEEP_SEARCH_SIZE_MULT (sopra i moltiplicatori del tentativo) e le
+    sezioni garantite per sotto-domanda diventano DEEP_SEARCH_PARENTS_PER_QUERY.
+    """
     profile = RETRY_PROFILES.get(attempt, RETRY_PROFILES[max(RETRY_PROFILES)])
+    deep_mult = settings.deep_search_size_mult if deep_search else 1.0
     kwargs = {
-        "semantic_size": int(settings.qdrant_semantic_size * profile["size_mult"]),
+        "semantic_size": int(settings.qdrant_semantic_size * profile["size_mult"] * deep_mult),
         "semantic_threshold": settings.qdrant_semantic_threshold * profile["threshold_mult"],
         "mmr_lambda": profile["mmr_lambda"],
     }
+    if deep_search:
+        kwargs["parents_per_query"] = max(settings.parents_per_query, settings.deep_search_parents_per_query)
     log.info(
         f"[{task_id}] [RETRY_PROFILE] Tentativo {attempt} -> "
         f"semantic_size={kwargs['semantic_size']} "
@@ -78,6 +86,7 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
                      exclude_parent_ids=None,
                      query_semantic_vector=None,
                      rerank_size=None,
+                     parents_per_query=None,
                      concepts=None,
                      task_id="UNKNOWN"):
     """
@@ -90,6 +99,8 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
         dai profili di retry per allargare progressivamente la recall.
     rerank_size: passaggi tenuti dopo il rerank per ogni sotto-domanda; default
         settings.rerank_size, settings.rerank_max_size con la ricerca approfondita.
+    parents_per_query: sezioni garantite per sotto-domanda; default
+        settings.parents_per_query, di più con la ricerca approfondita (profile_kwargs).
     mmr_lambda: peso rilevanza/diversità nella redistribuzione degli slot liberi.
         1.0 = comportamento identico a prima dell'introduzione di MMR.
     exclude_parent_ids: set di parent_id da escludere del tutto dalla selezione
@@ -113,6 +124,7 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
 
     semantic_size = semantic_size or settings.qdrant_semantic_size
     rerank_size = rerank_size or settings.rerank_size
+    parents_per_query = parents_per_query or settings.parents_per_query
     semantic_threshold = semantic_threshold if semantic_threshold is not None else settings.qdrant_semantic_threshold
 
     # I vettori dei chunk servono SOLO a costruire i centroid-per-parent usati
@@ -127,7 +139,7 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
     log.info(f"=== Inizio Retrieval per topic '{topic_id}' ===")
     log.info(
         f"[{task_id}] [RETRIEVAL_PARAMS] semantic_size={semantic_size}, "
-        f"rerank_size={rerank_size}, "
+        f"rerank_size={rerank_size}, parents_per_query={parents_per_query}, "
         f"semantic_threshold={semantic_threshold:.3f}, mmr_lambda={mmr_lambda}, "
         f"with_vectors={needs_vectors}."
     )
@@ -523,7 +535,7 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
                 if pid not in already_selected:
                     already_selected.add(pid)
                     selected_for_query.append(pid)
-                    if len(selected_for_query) >= settings.parents_per_query:
+                    if len(selected_for_query) >= parents_per_query:
                         break
  
             quota_per_query.append(selected_for_query)
@@ -541,7 +553,7 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
         # Questo evita di sprecare budget quando, ad esempio, 4 comuni
         # su 5 non hanno documenti e uno solo ha molti risultati.
         # ==========================================================
-        total_budget = settings.parents_per_query * n_queries
+        total_budget = parents_per_query * n_queries
         slots_free = total_budget - len(already_selected)
 
         # Inizializzati qui così restano definiti (a 0/vuoto) anche se non
@@ -660,7 +672,7 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
         # alla sottoquery che lo ha giudicato meglio (quote di contesto).
         # ==========================================================
         n_extra_parents = 0
-        max_total_parents = settings.max_sub_queries * settings.parents_per_query
+        max_total_parents = settings.max_sub_queries * parents_per_query
         if settings.extra_parents and len(already_selected) < max_total_parents:
             extra_candidates = sorted(
                 ((prob, pid, q) for pid, (prob, q) in parent_rerank_best.items()
@@ -686,6 +698,7 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
         retrieval_stats = {
             "semantic_size": semantic_size,
             "rerank_size": rerank_size,
+            "parents_per_query": parents_per_query,
             "semantic_threshold": round(semantic_threshold, 4),
             "mmr_lambda": mmr_lambda,
             "n_parent_candidates": len(parent_best_score),
@@ -738,7 +751,7 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
  
         log.info(
             f"Pool finale: {len(final_parent_ids_ordered)} parent distinti "
-            f"(budget={settings.parents_per_query}×{n_queries}={total_budget}"
+            f"(budget={parents_per_query}×{n_queries}={total_budget}"
             f"{f', +{n_extra_parents} per pertinenza' if n_extra_parents else ''})."
         )
  
