@@ -158,7 +158,7 @@ def generate_answer(query, rich_context, topic_id, search_queries=None,
             causa = (
                 f"il thinking ha prodotto più token dell'output visibile "
                 f"({thinking_tokens} vs {output_tokens}): abbassare ANSWER_THINKING_LEVEL "
-                f"(attuale: {settings.answer_thinking_level})"
+                f"(attuale: {settings.answer_thinking_level or 'off'})"
             )
         else:
             causa = (

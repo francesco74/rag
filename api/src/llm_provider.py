@@ -780,7 +780,7 @@ def init_llm_provider() -> LLMProvider:
     if cls is None:
         raise ValueError(
             f"Unknown LLM_PROVIDER='{settings.llm_provider}'. "
-            f"Valid options: {list(providers.keys()) + ['local']}"
+            f"Valid options: {list(providers.keys()) + ['local', 'vllm', 'ollama']}"
         )
 
     _PROVIDER_INSTANCE = cls()

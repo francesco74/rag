@@ -132,5 +132,44 @@ for label, call in (("query", lambda: embedding.embed_query("x")),
         check(f"dimensione errata: {label}", ("2 dimensioni" in str(e), is_permanent_error(e)), (True, True))
 object.__setattr__(settings, "embedding_dimension", 2)
 
+# --- configurazione: LLM_PROVIDER=vllm/ollama e ragionamento spento
+from common.config import load_settings  # noqa: E402
+
+
+def with_env(**env):
+    saved = {k: os.environ.get(k) for k in env}
+    os.environ.update({k: v for k, v in env.items() if v is not None})
+    for k, v in env.items():
+        if v is None:
+            os.environ.pop(k, None)
+    try:
+        return load_settings()
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+s = with_env(LLM_PROVIDER="vllm", LOCAL_LLM_BACKEND=None)
+check("LLM_PROVIDER=vllm: local + vllm", (s.llm_provider, s.local_llm_backend), ("local", "vllm"))
+s = with_env(LLM_PROVIDER="Ollama", LOCAL_LLM_BACKEND="ollama")
+check("LLM_PROVIDER=ollama: local + ollama", (s.llm_provider, s.local_llm_backend), ("local", "ollama"))
+s = with_env(LLM_PROVIDER="local", LOCAL_LLM_BACKEND=None)
+check("LLM_PROVIDER=local senza backend: ollama", s.local_llm_backend, "ollama")
+try:
+    with_env(LLM_PROVIDER="vllm", LOCAL_LLM_BACKEND="ollama")
+    check("backend in conflitto: errore", False)
+except ValueError as e:
+    check("backend in conflitto: errore", "un solo backend" in str(e))
+
+s = with_env(ANSWER_THINKING_LEVEL="off", GRADER_THINKING_LEVEL="None")
+check("thinking off: None", (s.answer_thinking_level, s.grader_thinking_level), (None, None))
+s = with_env(ANSWER_THINKING_LEVEL="", GRADER_THINKING_LEVEL=None)
+check("thinking vuoto: default", (s.answer_thinking_level, s.grader_thinking_level), ("LOW", "MINIMAL"))
+s = with_env(ANSWER_THINKING_LEVEL="HIGH", GRADER_THINKING_LEVEL="false")
+check("thinking: livello e spento", (s.answer_thinking_level, s.grader_thinking_level), ("HIGH", None))
+
 print(f"\n{'TUTTO OK' if not failures else f'{failures} FALLITI'}")
 sys.exit(1 if failures else 0)

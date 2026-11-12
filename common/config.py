@@ -22,6 +22,22 @@ def _parse_bool(value: str | None, default: bool = False) -> bool:
         return default
     return str(value).strip().lower() in {"true", "1", "yes", "y", "on"}
 
+# Valori che spengono il ragionamento del modello (ANSWER_/GRADER_THINKING_LEVEL).
+THINKING_OFF = {"off", "none", "0", "false", "no"}
+
+
+def _thinking_level(value: str | None, default: str) -> str | None:
+    """Livello di ragionamento: vuoto = default, off/none/0/false/no = spento (None).
+
+    Con vLLM e Ollama conta solo acceso o spento (enable_thinking del template del
+    modello); il livello (MINIMAL, LOW, MEDIUM, HIGH) lo usa Gemini, che senza
+    livello lascia decidere al modello."""
+    value = (value or "").strip()
+    if not value:
+        return default
+    return None if value.lower() in THINKING_OFF else value
+
+
 def _parse_set(value: str | None, default: set[str]) -> set[str]:
     """Helper DRY per il parsing di liste comma-separated dalle variabili d'ambiente in set di stringhe."""
     if not value:
@@ -345,8 +361,8 @@ class Settings:
 
     id_tipo_iter_atteso: dict[str, set[str]]
 
-    answer_thinking_level: str
-    grader_thinking_level: str
+    answer_thinking_level: str | None   # None = ragionamento spento
+    grader_thinking_level: str | None
 
 
 def load_settings() -> Settings:
@@ -438,6 +454,17 @@ def load_settings() -> Settings:
     # problema per cui il pool era stato introdotto.
     max_reranker_thread = int(os.environ.get("MAX_RERANKER_THREAD") or 2)
     reranker_pool_size = int(os.environ.get("RERANKER_POOL_SIZE") or 1)
+
+    # LLM_PROVIDER=vllm o ollama vale come local con quel backend: si scrive come
+    # EMBEDDING_PROVIDER e RERANK_PROVIDER. Un LOCAL_LLM_BACKEND diverso è un errore.
+    llm_provider = (os.environ.get("LLM_PROVIDER") or "gemini").strip().lower()
+    local_llm_backend = (os.environ.get("LOCAL_LLM_BACKEND") or "").strip().lower()
+    if llm_provider in ("vllm", "ollama"):
+        if local_llm_backend and local_llm_backend != llm_provider:
+            raise ValueError(f"LLM_PROVIDER='{llm_provider}' ma LOCAL_LLM_BACKEND='{local_llm_backend}': "
+                             "indicare un solo backend.")
+        llm_provider, local_llm_backend = "local", llm_provider
+    local_llm_backend = local_llm_backend or "ollama"
 
     if rerank_provider == "onnx" and reranker_pool_size < max_reranker_thread:
         _log.warning(
@@ -586,7 +613,7 @@ def load_settings() -> Settings:
 
         onnx_model_cache_path = os.environ.get("RERANKER_MODEL_PATH", "./model_cache/mmarco-mMiniLMv2-L12-H384-v1"),
 
-        llm_provider = os.environ.get("LLM_PROVIDER", "gemini").lower(),
+        llm_provider = llm_provider,
 
         # Default "gemini" per compatibilità con le collection Qdrant già
         # esistenti: chi non imposta la variabile continua a produrre vettori
@@ -603,7 +630,7 @@ def load_settings() -> Settings:
 
         local_llm_host = os.environ.get("LOCAL_LLM_HOST", "").strip() or "http://localhost:11434",
 
-        local_llm_backend = os.environ.get("LOCAL_LLM_BACKEND", "ollama").strip().lower() or "ollama",
+        local_llm_backend = local_llm_backend,
 
         local_vllm_embedding_model = os.environ.get("LOCAL_VLLM_EMBEDDING_MODEL", "").strip() or None,
         local_vllm_embedding_base_url = os.environ.get("LOCAL_VLLM_EMBEDDING_BASE_URL", "").strip() or None,
@@ -621,8 +648,8 @@ def load_settings() -> Settings:
                   "parent_index", "child_index", "file_name", "_ingestion_error", "_ingestion_id", "content_hash"},
 
         max_reranker_thread = max_reranker_thread,
-        answer_thinking_level = os.environ.get("ANSWER_THINKING_LEVEL") or 'LOW',
-        grader_thinking_level = os.environ.get("GRADER_THINKING_LEVEL") or 'MINIMAL',
+        answer_thinking_level = _thinking_level(os.environ.get("ANSWER_THINKING_LEVEL"), "LOW"),
+        grader_thinking_level = _thinking_level(os.environ.get("GRADER_THINKING_LEVEL"), "MINIMAL"),
 
         reranker_pool_size = reranker_pool_size,
 
