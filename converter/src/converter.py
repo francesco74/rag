@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 from common.config import settings
 from common.upload_status import FAILED, PROCESSING, mark_upload, record_ocr
 from common.utility import CONVERSION_QUEUE, CONVERSION_QUEUE_ARGS, EXTERNAL_OCR_MARKER
+from common import document_sessions as ds
 
 # Conversione, OCR e controlli sui file: libreria condivisa con atti-pa
 # (https://github.com/francesco74/pa-common)
@@ -434,10 +435,63 @@ async def process_conversion_job(job_id: str):
         input_path.unlink(missing_ok=True)
 
 
-async def on_conversion_message(message: aio_pika.IncomingMessage):
-    """Gli errori del lavoro finiscono in status.json: il messaggio si conferma comunque."""
+async def process_session_document(session_id: str, doc_id: str, channel: aio_pika.Channel):
+    """
+    Documento di una sessione (common/document_sessions.py): il file lo scrive l'API
+    in sessions/<sid>/<did>/ con request.json. Qui si converte in text.md e si passa
+    all'ingestione sulla sua coda. Errori: stato failed e cartella cancellata.
+    """
+    if not (ds.ID_RE.match(session_id) and ds.ID_RE.match(doc_id)):
+        log.error(f"Documento di sessione con id non valido: {session_id!r}/{doc_id!r}")
+        return
+    folder = ds.document_folder(session_id, doc_id)
+    if not (folder / "request.json").is_file():
+        log.warning(f"Sessione {session_id}: documento {doc_id} non trovato (già tolto?). Ignorato.")
+        return
+    request_data = json.loads((folder / "request.json").read_text(encoding="utf-8"))
+    input_path = folder / request_data["input_file"]
+    try:
+        if not await asyncio.to_thread(ds.set_status, doc_id, ds.CONVERTING):
+            shutil.rmtree(folder, ignore_errors=True)
+            return
+        md_content = await convert_file_to_markdown(input_path, request_data["file_name"])
+        if not md_content or not md_content.strip():
+            await asyncio.to_thread(ds.set_status, doc_id, ds.FAILED, "Nessun testo estratto dal documento.")
+            shutil.rmtree(folder, ignore_errors=True)
+            return
+        tmp = folder / "text.md.tmp"
+        tmp.write_text(md_content, encoding="utf-8")
+        tmp.replace(folder / "text.md")
+        input_path.unlink(missing_ok=True)
+        if not await asyncio.to_thread(ds.set_status, doc_id, ds.INDEXING):
+            shutil.rmtree(folder, ignore_errors=True)
+            return
+        await channel.default_exchange.publish(
+            aio_pika.Message(body=json.dumps({"session_id": session_id, "doc_id": doc_id}).encode(),
+                             delivery_mode=aio_pika.DeliveryMode.PERSISTENT),
+            routing_key=ds.SESSION_INDEX_QUEUE)
+        log.info(f"Sessione {session_id}: documento {doc_id} convertito ({len(md_content)} caratteri).")
+    except Exception as e:
+        log.error(f"Sessione {session_id}: conversione del documento {doc_id} fallita: {e}", exc_info=True)
+        shutil.rmtree(folder, ignore_errors=True)
+        try:
+            await asyncio.to_thread(ds.set_status, doc_id, ds.FAILED, "Conversione del documento non riuscita.")
+        except Exception as e2:
+            log.error(f"Sessione {session_id}: stato del documento {doc_id} non aggiornato: {e2}")
+
+
+async def on_conversion_message(message: aio_pika.IncomingMessage, channel: aio_pika.Channel):
+    """
+    Lavori delle API esterne: conversioni ({job_id}) e documenti di sessione
+    ({session_id, doc_id}). Gli errori finiscono nello stato del lavoro o del
+    documento: il messaggio si conferma comunque.
+    """
     async with message.process(requeue=False):
-        await process_conversion_job(json.loads(message.body.decode()).get("job_id"))
+        payload = json.loads(message.body.decode())
+        if payload.get("session_id"):
+            await process_session_document(str(payload["session_id"]), str(payload.get("doc_id")), channel)
+        else:
+            await process_conversion_job(payload.get("job_id"))
 
 
 async def on_message_received(message: aio_pika.IncomingMessage, channel: aio_pika.Channel):
@@ -483,7 +537,9 @@ async def main_worker():
             # Conversioni delle API esterne: stesso limite di concorrenza dei documenti.
             queue_conversions = await channel.declare_queue(
                 CONVERSION_QUEUE, durable=True, arguments=CONVERSION_QUEUE_ARGS)
-            await queue_conversions.consume(on_conversion_message)
+            await queue_conversions.consume(lambda m: on_conversion_message(m, channel))
+            # Coda verso l'ingestione dei documenti di sessione (la consuma ingest.py).
+            await channel.declare_queue(ds.SESSION_INDEX_QUEUE, durable=True, arguments=ds.SESSION_INDEX_QUEUE_ARGS)
 
             log.info(f"✓ Connessione stabilita. In ascolto sulla coda 'da-convertire' (concorrenza: {CONCURRENCY_LIMIT} file in parallelo).")
 

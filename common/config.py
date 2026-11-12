@@ -111,6 +111,16 @@ class Settings:
     # client_max_body_size di nginx sulla location /api/.
     upload_max_mb: int
     convert_retention_hours: int
+    # Sessioni di documenti delle API esterne (external_sessions.py): scadenza
+    # dall'ultimo uso, durata massima dalla creazione, limiti per sessione e
+    # dimensioni di sezioni (parent) e pezzi (child) in token.
+    session_ttl_minutes: int
+    session_max_hours: int
+    session_max_documents: int
+    session_max_tokens: int
+    session_parent_chunk_size: int
+    session_chunk_size: int
+    session_chunk_overlap: int
     login_max_failures: int
     login_lockout_seconds: int
     login_ip_max_failures: int
@@ -490,6 +500,13 @@ def load_settings() -> Settings:
         convert_max_upload_mb = max(1, int(os.environ.get("CONVERT_MAX_UPLOAD_MB") or 50)),
         upload_max_mb = max(1, int(os.environ.get("UPLOAD_MAX_MB") or 100)),
         convert_retention_hours = max(1, int(os.environ.get("CONVERT_RETENTION_HOURS") or 48)),
+        session_ttl_minutes = max(5, int(os.environ.get("SESSION_TTL_MINUTES") or 120)),
+        session_max_hours = max(1, int(os.environ.get("SESSION_MAX_HOURS") or 12)),
+        session_max_documents = max(1, int(os.environ.get("SESSION_MAX_DOCUMENTS") or 10)),
+        session_max_tokens = max(1000, int(os.environ.get("SESSION_MAX_TOKENS") or 500_000)),
+        session_parent_chunk_size = max(200, int(os.environ.get("SESSION_PARENT_CHUNK_SIZE") or 1500)),
+        session_chunk_size = max(100, int(os.environ.get("SESSION_CHUNK_SIZE") or 500)),
+        session_chunk_overlap = max(0, int(os.environ.get("SESSION_CHUNK_OVERLAP") or 100)),
         login_max_failures = max(1, int(os.environ.get("LOGIN_MAX_FAILURES") or 5)),
         login_lockout_seconds = max(60, int(os.environ.get("LOGIN_LOCKOUT_SECONDS") or 900)),
         login_ip_max_failures = max(1, int(os.environ.get("LOGIN_IP_MAX_FAILURES") or 20)),

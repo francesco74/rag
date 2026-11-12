@@ -44,6 +44,7 @@ from common.embedding import (
 from common.config import settings
 from common.db_logger import init_db_pool
 from common.utility import quiet_http_loggers
+from common.document_sessions import prune_expired
 
 from rag import state
 from rag.state import CACHE_COLLECTION
@@ -179,6 +180,20 @@ def prune_semantic_cache():
         log.error(f"Cache pruning failed: {e}")
 
 
+@celery_app.task(name="prune_document_sessions")
+def prune_document_sessions():
+    """Sessioni di documenti scadute (API esterne): punti Qdrant, righe MySQL, cartelle."""
+    if not state.qdrant_client:
+        log.warning("Qdrant client not available for session pruning.")
+        return
+    try:
+        n = prune_expired(state.qdrant_client)
+        if n:
+            log.info(f"✓ Sessioni di documenti scadute cancellate: {n}.")
+    except Exception as e:
+        log.error(f"Pulizia delle sessioni di documenti fallita: {e}")
+
+
 @celery_app.on_after_configure.connect
 def setup_periodic_tasks(sender, **kwargs):
     """Setup scheduled tasks."""
@@ -187,7 +202,12 @@ def setup_periodic_tasks(sender, **kwargs):
         prune_semantic_cache.s(),
         name='hourly-cache-cleanup'
     )
-    log.info("✓ Scheduled task: Cache cleanup every hour")
+    sender.add_periodic_task(
+        crontab(minute="*/10"),
+        prune_document_sessions.s(),
+        name='document-sessions-cleanup'
+    )
+    log.info("✓ Scheduled tasks: cache cleanup every hour, document sessions every 10 minutes")
 
 
 # ==============================================================================

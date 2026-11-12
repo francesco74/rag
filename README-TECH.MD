@@ -409,6 +409,27 @@ Un topic non abilitato risponde `403`. I metadati esposti escludono chiavi di si
 
 La conversione è asincrona: l'API salva il file in `/data/conversions/<job_id>/` e accoda il lavoro su `da-convertire-api`; il converter usa la stessa pipeline dei documenti (testo nativo e OCR) e scrive `status.json` e `result.md`. Il file ricevuto si cancella a fine lavoro, il risultato appena consegnato; quelli mai ritirati dopo `CONVERT_RETENTION_HOURS`. I documenti d'ufficio (`converter/src/office.py`) non passano dall'OCR: docx e odt con pandoc, xlsx e ods con pandas, un foglio per sezione `##` con la prima riga piena come intestazione; le immagini incorporate si ignorano. Le conversioni usano solo il modello OCR configurato: se una pagina non riesce, il lavoro fallisce con `code: conversion_failed`. Le API esterne non hanno ancora un limite di richieste per chiave.
 
+#### Sessioni di documenti (`external_sessions.py`)
+
+Contenitori temporanei di documenti per le conversazioni di un sistema esterno (l'assistente di atti-pa): il sistema esterno carica i documenti, il rag li indicizza a parte e ci cerca i passaggi o li restituisce in ordine. **Il rag non genera**: la risposta la scrive l'LLM del sistema esterno. I documenti di sessione non entrano negli archivi, nella revisione o nella cache semantica. Proposta e decisioni: `misc/SESSIONI_DOCUMENTI.md`.
+
+| Rotta | Funzione |
+| --- | --- |
+| `POST /sessions` | `{owner}` (testo opaco del sistema esterno, al massimo 128 caratteri). Risponde `201` con `session_id`, `expires_at` e i limiti. |
+| `GET /sessions/<sid>` | Documenti con stato, token e sezioni, token usati, scadenza, limiti. |
+| `DELETE /sessions/<sid>` | Chiude la sessione e cancella subito pezzi, sezioni e file. |
+| `POST /sessions/<sid>/documents` | `multipart/form-data`, campo `file`, stessi formati e dimensione di `/convert`. Risponde `202` con `doc_id`. `409` con `code: max_documents` o `max_tokens` oltre i limiti. |
+| `GET /sessions/<sid>/documents/<did>` | Stato: `queued`, `converting`, `indexing`, `ready` (con `tokens` e `sections`) o `failed` (con `error`). |
+| `DELETE /sessions/<sid>/documents/<did>` | Toglie il documento. |
+| `POST /sessions/<sid>/search` | `{query, doc_ids?, top_k?}` (default tutti i documenti pronti, `top_k` 8, massimo 20). Restituisce `passages`: `doc_id`, `file_name`, `parent_index`, testo della **sezione** intera, intestazioni, `score` 0..1; `reranker` usato e `not_ready`. `409` se nessuno dei documenti scelti è pronto. |
+| `GET /sessions/<sid>/documents/<did>/sections` | Sezioni in ordine, `from` e `limit` (massimo 50): per riassumere o confrontare un blocco alla volta. |
+
+- **Proprietà.** Una sessione appartiene alla chiave che l'ha creata: con un'altra chiave, scaduta o inesistente risponde `404`. In Qdrant ogni ricerca filtra sempre su `session_id` e `key_id`, dal server.
+- **Percorso di un documento.** L'API salva il file in `/data/sessions/<sid>/<did>/` e pubblica `{session_id, doc_id}` su `da-convertire-api`; il converter scrive `text.md` e pubblica su `da-indicizzare-sessione`; l'ingestione (canale proprio, concorrenza 2, per non togliere vLLM agli archivi) conta i token, suddivide con `common/splitting.py` (lo stesso codice degli archivi, dimensioni `SESSION_*_SIZE`), scrive le sezioni in `session_parents` e i pezzi in `session_chunks`, poi cancella la cartella. Ogni errore finisce nello stato del documento.
+- **Ricerca.** Gira nell'API, non nel worker (`session_search.py`): vettori e parole della domanda, poi il cross-encoder vLLM con `RERANK_PROVIDER=vllm`, altrimenti il riordino lessicale (anche come ripiego). Una voce per sezione.
+- **Scadenza.** `sessions.expires_at` si rinnova a ogni chiamata (`SESSION_TTL_MINUTES`) fino al tetto `SESSION_MAX_HOURS` dalla creazione. In Qdrant `expires_at` è fisso al tetto e serve solo a togliere i punti rimasti senza sessione. Il task Celery `prune_document_sessions` gira ogni 10 minuti.
+- **Dati personali.** I testi restano sul server fino alla scadenza o alla chiusura: va scritto nell'informativa del sistema esterno. Tabelle e collection di sessione restano fuori dai backup. I log non contengono il testo.
+
 ### J. Siti della chat (`site_routes.py`)
 
 Il frontend della chat è unico (`web/chat`, immagine `rag/web-chat`, nessuna variabile d'ambiente): all'avvio chiama `GET /api/site` sullo stesso indirizzo e il backend, dal dominio, risponde con nome, archivio, testo della home, pulsanti e filtro per data (tabella `chat_sites`). Il frontend compone la home: testo, statistiche da `/config`, pulsanti, limiti del sistema. Testo e pulsanti passano da `common/site_home.py`, che tiene solo i tag ammessi e i link http/https; `POST /review/admin/translate` traduce con l'LLM di sistema senza salvare. Il favicon è in `GET /api/site/icon`. Un dominio sconosciuto riceve 404 e la pagina "sito non configurato".
@@ -674,6 +695,9 @@ I default puntano a modelli Gemini, ma sono appunto default: il codice del motor
 | `files_login_url` | `FILES_LOGIN_URL` | `str` | `"/amministrazione/"` | Pagina di login proposta da `/files` a chi apre un documento riservato senza sessione. |
 | `convert_max_upload_mb` | `CONVERT_MAX_UPLOAD_MB` | `int` | `50` | Dimensione massima dei documenti da convertire. Va tenuta sotto `client_max_body_size` di nginx (`/api/`: 60 MB). |
 | `convert_retention_hours` | `CONVERT_RETENTION_HOURS` | `int` | `48` | Ore di conservazione dei lavori di conversione mai ritirati e delle trascrizioni esterne non usate. |
+| `session_ttl_minutes` / `session_max_hours` | `SESSION_TTL_MINUTES` / `SESSION_MAX_HOURS` | `int` | `120` / `12` | Sessioni di documenti: scadenza dall'ultimo uso e durata massima dalla creazione. |
+| `session_max_documents` / `session_max_tokens` | `SESSION_MAX_DOCUMENTS` / `SESSION_MAX_TOKENS` | `int` | `10` / `500000` | Limiti per sessione (i documenti falliti non contano). |
+| `session_parent_chunk_size` / `session_chunk_size` / `session_chunk_overlap` | `SESSION_PARENT_CHUNK_SIZE` / `SESSION_CHUNK_SIZE` / `SESSION_CHUNK_OVERLAP` | `int` | `1500` / `500` / `100` | Token di sezioni e pezzi dei documenti di sessione, come i default degli archivi. |
 | `login_max_failures` | `LOGIN_MAX_FAILURES` | `int` | `5` (min `1`) | Tentativi di login falliti di fila dopo cui un nome utente è bloccato. |
 | `login_lockout_seconds` | `LOGIN_LOCKOUT_SECONDS` | `int` | `900` (min `60`) | Durata del blocco; un fallimento più vecchio non conta più. |
 | `login_ip_max_failures` | `LOGIN_IP_MAX_FAILURES` | `int` | `20` (min `1`) | Come sopra, per indirizzo IP (su nomi diversi). Attivo solo con `TRUSTED_PROXY_HOPS > 0`. |

@@ -15,6 +15,7 @@ from common.utility import quiet_http_loggers
 from review_routes import auth_bp, bp as review_bp
 from files_routes import bp as files_bp
 from external_routes import bp as external_bp
+import external_sessions  # noqa: F401  (rotte /external/v1/sessions sullo stesso blueprint)
 from admin_routes import bp as admin_bp
 from upload_routes import bp as upload_bp
 from external_ocr_routes import bp as external_ocr_bp

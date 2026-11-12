@@ -14,11 +14,8 @@ from common.embedding import init_embedding, embed_documents_batch
 from qdrant_client import models
 from qdrant_client import AsyncQdrantClient
 
-# --- TEXT SPLITTING ---
-from langchain_text_splitters import (
-    MarkdownHeaderTextSplitter,
-    RecursiveCharacterTextSplitter
-)
+# --- TEXT SPLITTING (comune con i documenti di sessione) ---
+from common.splitting import make_splitters, split_children, split_parents
 
 # --- ASYNC, RESILIENCE & MESSAGING ---
 import aio_pika
@@ -36,6 +33,7 @@ from common.db_logger import MySQLLogHandler, get_db_connection, init_db_pool
 from common.config import settings
 from common.upload_status import FAILED, INDEXED, mark_upload
 from common.utility import clean_ocr_text, is_permanent_error, split_protected_metadata
+from common import document_sessions as ds
 
 # ==============================================================================
 # 1. CONFIGURATION & LOGGING SETUP
@@ -91,8 +89,6 @@ CONCURRENCY_LIMIT = asyncio.Semaphore(5)
 # ragionevole in tutti i casi, quindi non condizionato al provider attivo.
 EMBEDDING_RATE_LIMITER = AsyncLimiter(max_rate=1000, time_period=60)
 
-headers_to_split_on = [("#", "Header 1"), ("##", "Header 2"), ("###", "Header 3"), ("####", "Header 4")]
-markdown_splitter = MarkdownHeaderTextSplitter(headers_to_split_on=headers_to_split_on, strip_headers=False)
 
 # ==============================================================================
 # 2. CORE HELPER FUNCTIONS
@@ -271,9 +267,9 @@ def sync_upsert_parents_mysql(source_name, topic_id, sub_topic_id, parents_data)
     stop=stop_after_attempt(5),
     reraise=True
 )
-async def _qdrant_upsert_with_retry(points_batch):
+async def _qdrant_upsert_with_retry(points_batch, collection_name=QDRANT_COLLECTION):
     await qdrant_client.upsert(
-        collection_name=QDRANT_COLLECTION,
+        collection_name=collection_name,
         points=points_batch
     )
 
@@ -354,24 +350,11 @@ async def process_single_file_async(topic_id, sub_topic_id, json_path, root_fold
                 await finalize_file_move(text_file_path, root_folder, topic_id, sub_topic_id, error_msg="Contenuto file vuoto.")
                 return False
 
-            parent_text_splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
-                encoding_name="cl100k_base", chunk_size=parent_chunk_size, chunk_overlap=0,
-                separators=["\n\n", "\n", ". ", " "]
-            )
-            child_text_splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
-                encoding_name="cl100k_base", chunk_size=chunk_size, chunk_overlap=chunk_overlap,
-                separators=["\n\n", "\n", ". ", " ", ""]
-            )
-
-            if is_markdown and use_markdown_splitter:
+            parent_text_splitter, child_text_splitter = make_splitters(parent_chunk_size, chunk_size, chunk_overlap)
+            by_headers = is_markdown and use_markdown_splitter
+            if by_headers:
                 log.info("Applico MarkdownHeaderTextSplitter come da configurazione DB.")
-                md_header_splits = await asyncio.to_thread(markdown_splitter.split_text, full_text)
-                parent_docs = await asyncio.to_thread(parent_text_splitter.split_documents, md_header_splits)
-                del md_header_splits
-            elif is_markdown:
-                parent_docs = await asyncio.to_thread(parent_text_splitter.create_documents, [full_text])
-            else:
-                parent_docs = await asyncio.to_thread(parent_text_splitter.create_documents, [full_text])
+            parent_docs = await asyncio.to_thread(split_parents, full_text, parent_text_splitter, by_headers)
 
             # Libera subito la stringa originale: non serve più
             del full_text
@@ -415,7 +398,7 @@ async def process_single_file_async(topic_id, sub_topic_id, json_path, root_fold
                         p_idx, p_doc.page_content, json.dumps(merged_metadata)
                     ))
 
-                    child_docs = await asyncio.to_thread(child_text_splitter.create_documents, [p_doc.page_content])
+                    child_docs = await asyncio.to_thread(split_children, p_doc.page_content, child_text_splitter)
                     for c_idx, c_doc in enumerate(child_docs):
                         content_norm = " ".join(c_doc.page_content.lower().split())
                         content_hash = hashlib.md5(content_norm.encode()).hexdigest()
@@ -624,6 +607,136 @@ async def on_message_received(message: aio_pika.IncomingMessage):
             # Invio in Dead Letter Queue per ispezione
             await message.reject(requeue=False)
 
+# ==============================================================================
+# 5. DOCUMENTI DI SESSIONE (API esterne, common/document_sessions.py)
+# ==============================================================================
+
+# Concorrenza bassa: i documenti delle chat non devono togliere vLLM agli archivi.
+SESSION_CONCURRENCY = 2
+_session_semaphore = asyncio.Semaphore(SESSION_CONCURRENCY)
+_token_encoder = None
+
+
+def _count_tokens(text: str) -> int:
+    global _token_encoder
+    if _token_encoder is None:
+        import tiktoken
+        _token_encoder = tiktoken.get_encoding("cl100k_base")
+    return len(_token_encoder.encode(text, disallowed_special=()))
+
+
+async def _delete_session_doc_points(session_id: str, doc_id: str):
+    try:
+        await qdrant_client.delete(
+            collection_name=ds.SESSION_COLLECTION, wait=True,
+            points_selector=models.FilterSelector(filter=models.Filter(must=[
+                models.FieldCondition(key="session_id", match=models.MatchValue(value=session_id)),
+                models.FieldCondition(key="doc_id", match=models.MatchValue(value=doc_id)),
+            ])))
+    except Exception as e:
+        log.warning(f"Sessione {session_id}: punti del documento {doc_id} non cancellati: {e}")
+
+
+async def index_session_document(session_id: str, doc_id: str):
+    """
+    Testo convertito (text.md, scritto dal converter) -> sezioni in session_parents
+    e pezzi in session_chunks, poi stato ready. Gli errori finiscono nello stato
+    del documento; la cartella si cancella comunque.
+    """
+    folder = ds.document_folder(session_id, doc_id)
+    doc = await asyncio.to_thread(ds.get_document, doc_id)
+    if not doc or doc["session_id"] != session_id:
+        log.info(f"Sessione {session_id}: documento {doc_id} non più presente, ignorato.")
+        shutil.rmtree(folder, ignore_errors=True)
+        return
+    written = False
+    try:
+        text_path = folder / "text.md"
+        if not text_path.is_file():
+            raise FileNotFoundError("testo convertito mancante")
+        text = clean_ocr_text(await asyncio.to_thread(text_path.read_text, encoding="utf-8"))
+        if not text.strip():
+            await asyncio.to_thread(ds.set_status, doc_id, ds.FAILED, "Nessun testo estratto dal documento.")
+            return
+        tokens = await asyncio.to_thread(_count_tokens, text)
+        used = await asyncio.to_thread(ds.session_tokens, session_id, doc_id)
+        if used + tokens > settings.session_max_tokens:
+            await asyncio.to_thread(
+                ds.set_status, doc_id, ds.FAILED,
+                f"Il documento ({tokens} token) supera lo spazio della sessione: "
+                f"usati {used} su {settings.session_max_tokens}.", tokens)
+            log.info(f"Sessione {session_id}: documento {doc_id} oltre il limite di token ({used}+{tokens}).")
+            return
+        if not await asyncio.to_thread(ds.set_status, doc_id, ds.INDEXING, None, tokens):
+            return
+
+        parent_splitter, child_splitter = make_splitters(
+            settings.session_parent_chunk_size, settings.session_chunk_size, settings.session_chunk_overlap)
+        parents = await asyncio.to_thread(split_parents, text, parent_splitter, True)
+        del text
+        expires_at = ds.epoch(ds.max_expiry(doc["created_at"]))
+        base = {"session_id": session_id, "key_id": doc["key_id"], "doc_id": doc_id,
+                "file_name": doc["file_name"], "expires_at": expires_at}
+
+        parent_rows, pending = [], []
+        for start in range(0, len(parents), 50):
+            texts, payloads = [], []
+            for p_idx in range(start, min(start + 50, len(parents))):
+                p_doc = parents[p_idx]
+                parent_rows.append((session_id, doc_id, p_idx, p_doc.page_content,
+                                    json.dumps(p_doc.metadata, ensure_ascii=False)))
+                children = await asyncio.to_thread(split_children, p_doc.page_content, child_splitter)
+                for c_idx, c_doc in enumerate(children):
+                    texts.append(c_doc.page_content)
+                    payloads.append({**base, "parent_index": p_idx, "chunk_index": c_idx,
+                                     "content": c_doc.page_content})
+            vectors = []
+            for i in range(0, len(texts), 100):
+                vectors.extend(await async_embed_batch(texts[i:i + 100]))
+            pending.extend(models.PointStruct(id=str(uuid.uuid4()), vector=v, payload=pl)
+                           for v, pl in zip(vectors, payloads))
+            if len(pending) >= 500 or start + 50 >= len(parents):
+                written = True
+                for i in range(0, len(pending), 100):
+                    await _qdrant_upsert_with_retry(pending[i:i + 100], ds.SESSION_COLLECTION)
+                pending.clear()
+
+        await asyncio.to_thread(ds.insert_parents, parent_rows)
+        if not await asyncio.to_thread(ds.set_status, doc_id, ds.READY, None, tokens, len(parents)):
+            # Tolto (o sessione chiusa) mentre si indicizzava: niente deve restare.
+            await _delete_session_doc_points(session_id, doc_id)
+            await asyncio.to_thread(ds.delete_parents, doc_id)
+            return
+        log.info(f"Sessione {session_id}: documento {doc_id} pronto, {len(parents)} sezioni, {tokens} token.")
+    except Exception as e:
+        log.error(f"Sessione {session_id}: indicizzazione del documento {doc_id} fallita: {e}", exc_info=True)
+        if written:
+            await _delete_session_doc_points(session_id, doc_id)
+        try:
+            await asyncio.to_thread(ds.delete_parents, doc_id)
+            await asyncio.to_thread(ds.set_status, doc_id, ds.FAILED, "Indicizzazione del documento non riuscita.")
+        except Exception as e2:
+            log.error(f"Sessione {session_id}: stato del documento {doc_id} non aggiornato: {e2}")
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+
+
+async def on_session_message(message: aio_pika.IncomingMessage):
+    """Gli errori finiscono nello stato del documento: il messaggio si conferma comunque."""
+    async with message.process(requeue=False):
+        try:
+            payload = json.loads(message.body.decode())
+            session_id, doc_id = str(payload.get("session_id")), str(payload.get("doc_id"))
+            if not (ds.ID_RE.match(session_id) and ds.ID_RE.match(doc_id)):
+                log.error(f"Messaggio di sessione non valido: {payload!r}")
+                return
+        except (ValueError, AttributeError) as e:
+            log.error(f"Messaggio di sessione illeggibile: {e}")
+            return
+        async with _session_semaphore:
+            await index_session_document(session_id, doc_id)
+
+
 async def main_worker():
     """Worker principale per RabbitMQ."""
     log.info(f"Tentativo di connessione a RabbitMQ su {settings.broker_host}...")
@@ -641,8 +754,16 @@ async def main_worker():
             await channel.set_qos(prefetch_count=20)
 
             queue_in = await channel.get_queue("da-indicizzare") 
-            
-            log.info("✓ Worker Ingestione attivo. In ascolto su 'da-indicizzare'.")
+
+            # Documenti di sessione: canale e prefetch propri, così non aspettano
+            # dietro gli archivi e non li rallentano.
+            session_channel = await connection.channel()
+            await session_channel.set_qos(prefetch_count=SESSION_CONCURRENCY)
+            session_queue = await session_channel.declare_queue(
+                ds.SESSION_INDEX_QUEUE, durable=True, arguments=ds.SESSION_INDEX_QUEUE_ARGS)
+            await session_queue.consume(on_session_message)
+
+            log.info(f"✓ Worker Ingestione attivo. In ascolto su 'da-indicizzare' e '{ds.SESSION_INDEX_QUEUE}'.")
             
             async with queue_in.iterator() as queue_iter:
                 async for message in queue_iter:

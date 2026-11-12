@@ -1,6 +1,6 @@
 """
 Crea le collection di Qdrant che mancano (document_chunks, semantic_cache,
-conceptual_dictionary) e i loro indici sul payload. Non tocca le collection esistenti:
+conceptual_dictionary, session_chunks) e i loro indici sul payload. Non tocca le collection esistenti:
 si può rilanciare quando si vuole. Esce con errore se Qdrant non risponde.
 
     python -m utils.setup_qdrant
@@ -19,6 +19,7 @@ log = logging.getLogger("qdrant_setup")
 QDRANT_COLLECTION = "document_chunks"
 CACHE_COLLECTION = "semantic_cache"
 CONCEPT_COLLECTION = "conceptual_dictionary"  
+SESSION_COLLECTION = "session_chunks"   # common/document_sessions.py
 
 def collection_params(name, dimension):
     """Parametri di creazione di una collection, condivisi con utils/migrate_embeddings.py.
@@ -71,6 +72,7 @@ async def setup_infrastructure():
         await create_collection_if_missing(client, QDRANT_COLLECTION)
         await create_collection_if_missing(client, CACHE_COLLECTION)
         await create_collection_if_missing(client, CONCEPT_COLLECTION) # <-- Creazione della nuova collection
+        await create_collection_if_missing(client, SESSION_COLLECTION)
 
         log.info("Inizio configurazione indici (Payload Indexes)...")
 
@@ -114,6 +116,21 @@ async def setup_infrastructure():
         }
         for field, schema in indexes_concept.items():
             await safe_create_payload_index(client, CONCEPT_COLLECTION, field, schema)
+
+        # 5. INDICI PER I DOCUMENTI DI SESSIONE. session_id è il tenant: Qdrant tiene
+        # vicini i punti di una sessione e ogni ricerca filtra su di essa.
+        indexes_session = {
+            "session_id": models.KeywordIndexParams(type=models.KeywordIndexType.KEYWORD, is_tenant=True),
+            "key_id": models.PayloadSchemaType.INTEGER,
+            "doc_id": models.PayloadSchemaType.KEYWORD,
+            "parent_index": models.PayloadSchemaType.INTEGER,
+            "expires_at": models.PayloadSchemaType.INTEGER,
+            "content": models.TextIndexParams(
+                type="text", tokenizer=models.TokenizerType.WORD, min_token_len=2, max_token_len=20, lowercase=True
+            ),
+        }
+        for field, schema in indexes_session.items():
+            await safe_create_payload_index(client, SESSION_COLLECTION, field, schema)
 
         log.info("Configurazione architettura Vector DB completata con successo.")
         

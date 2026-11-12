@@ -13,6 +13,7 @@ alla sostituzione, e dopo la sostituzione se ne tiene una copia per tornare indi
 | `document_chunks` | vettori ricalcolati; nuova collection con i vettori **su disco e una copia int8 in RAM** (`QDRANT_CHUNKS_QUANTIZATION`) |
 | `conceptual_dictionary`, `boilerplate_phrases` | vettori ricalcolati (piccole, restano in RAM) |
 | `semantic_cache` | ricreata vuota: contiene domande vettorializzate con Gemini |
+| `session_chunks` | ricreata vuota (documenti temporanei delle sessioni); le sessioni aperte si chiudono anche in MySQL |
 
 Con la copia int8 la RAM di `document_chunks` è circa 2,5 KB per chunk (contro i ~3 KB di oggi
 a 768 tutto in RAM): la ricerca scorre la copia compressa e riordina i migliori

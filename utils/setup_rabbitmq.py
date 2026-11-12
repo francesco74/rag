@@ -6,6 +6,7 @@ import requests
 from requests.auth import HTTPBasicAuth
 from common.config import settings
 from common.utility import CONVERSION_QUEUE, CONVERSION_QUEUE_ARGS
+from common.document_sessions import SESSION_INDEX_QUEUE, SESSION_INDEX_QUEUE_ARGS
 from common.db_logger import MySQLLogHandler, get_db_connection, init_db_pool
 
 # ==============================================================================
@@ -84,6 +85,13 @@ TOPOLOGY = {
             "auto_delete": False,
             "arguments": CONVERSION_QUEUE_ARGS,
             "description": "Lavori di conversione delle API esterne: gli errori finiscono nello stato del lavoro"
+        },
+        {
+            "name": SESSION_INDEX_QUEUE,
+            "durable": True,
+            "auto_delete": False,
+            "arguments": SESSION_INDEX_QUEUE_ARGS,
+            "description": "Documenti di sessione da indicizzare: gli errori finiscono nello stato del documento"
         },
     ],
     "bindings": [

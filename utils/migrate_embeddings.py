@@ -10,6 +10,8 @@ Collection coinvolte (tutte nello stesso spazio vettoriale):
     conceptual_dictionary   "concept: alias, alias" come in populate_concepts.py
     boilerplate_phrases     payload "phrase" come in detect_boilerplate.py
     semantic_cache          cache di risposte: non si ricalcola, si ricrea vuota
+    session_chunks          documenti delle sessioni (temporanei): si ricrea vuota e le
+                            sessioni aperte si chiudono (tabelle sessions*)
 
 Comandi, da lanciare in ordine con la NUOVA configurazione di embedding
 (EMBEDDING_PROVIDER, EMBEDDING_DIMENSION...) e i servizi fermi:
@@ -50,6 +52,8 @@ EMBED_SUBBATCH = 64      # testi per ogni chiamata di embedding
 LOG_EVERY = 5000         # punti tra un messaggio di avanzamento e l'altro
 NEW, OLD = "__nuovo", "__vecchio"
 CACHE = "semantic_cache"
+SESSIONS = "session_chunks"
+EMPTY = (CACHE, SESSIONS)       # non si ricalcolano: si ricreano vuote
 
 
 def _content(payload):
@@ -163,18 +167,39 @@ async def _recompute(client, name, dimension):
         sys.exit(f"'{name}': nessun punto con testo nel payload, controllare il campo atteso.")
 
 
+def _close_sessions():
+    """Le sessioni aperte perdono i loro pezzi: si chiudono anche in MySQL."""
+    try:
+        from common.db_logger import get_db_connection, init_db_pool
+        init_db_pool()
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        for table in ("session_parents", "session_documents", "sessions"):
+            cursor.execute(f"DELETE FROM {table}")
+        conn.commit()
+        conn.close()
+        log.info("Sessioni di documenti aperte chiuse (tabelle sessions*).")
+    except Exception as e:
+        log.warning(f"Sessioni di documenti non chiuse in MySQL ({e}): scadranno da sole.")
+
+
 def _reset_cache(client, dimension):
-    """La cache contiene vettori di domande del modello precedente: si ricrea vuota."""
-    schema = client.get_collection(CACHE).payload_schema if _exists(client, CACHE) else {}
-    if _exists(client, CACHE):
-        client.delete_collection(CACHE)
-    client.create_collection(collection_name=CACHE, **collection_params(CACHE, dimension))
-    _copy_indexes(client, schema, CACHE)
-    log.info(f"'{CACHE}' ricreata vuota (dimensione {dimension}).")
+    """La cache e i documenti di sessione hanno vettori del modello precedente: si ricreano vuote."""
+    for name in EMPTY:
+        if name == SESSIONS and not _exists(client, name):
+            continue   # installazione senza sessioni di documenti
+        schema = client.get_collection(name).payload_schema if _exists(client, name) else {}
+        if _exists(client, name):
+            client.delete_collection(name)
+        client.create_collection(collection_name=name, **collection_params(name, dimension))
+        _copy_indexes(client, schema, name)
+        log.info(f"'{name}' ricreata vuota (dimensione {dimension}).")
+        if name == SESSIONS:
+            _close_sessions()
 
 
 def cmd_stato(client, _args):
-    for name in [*SOURCES, CACHE]:
+    for name in [*SOURCES, *EMPTY]:
         for full in (name, name + NEW, name + OLD):
             if not _exists(client, full):
                 continue
