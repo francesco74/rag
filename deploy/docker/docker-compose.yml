@@ -1,0 +1,240 @@
+# Installazione di produzione del rag su un server con solo Docker (senza Kubernetes), a
+# supporto di atti-pa: API esterne (conversione, sessioni di documenti dell'assistente,
+# consultazione degli archivi), ingestione dei documenti, amministrazione. I siti della chat
+# NON sono installati. Guida: deploy/docker/README.md
+#
+#   cp .env.example .env    # poi compilare i valori
+#   docker compose up -d
+#
+# Aggiornamento: VERSIONE nel .env, poi docker compose pull && docker compose up -d
+#
+# Il gateway è l'unico punto di accesso:
+# - rete Docker "rag", per atti-pa sullo stesso server: http://rag-gateway:8080/api
+# - porta RAG_PORTA sull'indirizzo RAG_INDIRIZZO (predefinito solo 127.0.0.1): amministrazione
+#   e atti-pa su un altro server.
+# Strumenti solo quando servono:
+#   docker compose --profile strumenti up -d phpmyadmin     (127.0.0.1:8082)
+#   docker compose --profile strumenti run --rm direct      (documenti in /data/direct)
+#   docker compose --profile estrazione run --rm estrazione ...   (Sicr@Web, vedi la guida)
+
+name: rag
+
+x-log: &log
+  logging:
+    driver: json-file
+    options: { max-size: "20m", max-file: "5" }
+
+x-backend: &backend
+  <<: *log
+  env_file: .env
+  environment: &backend-env
+    MYSQL_SERVICE_HOST: mysql
+    MYSQL_SERVICE_PORT: "3306"
+    MYSQL_DATABASE: rag
+    MYSQL_USER: raguser
+    REDIS_HOST: redis
+    REDIS_PORT: "6379"
+    BROKER_HOST: rabbitmq
+    BROKER_PORT: "5672"
+    QDRANT_HOST: qdrant
+    QDRANT_PORT: "6333"
+    DATA_FOLDER: /data
+    FILES_X_ACCEL_PREFIX: /_protected_files/
+    TRUSTED_PROXY_HOPS: "1"    # solo il gateway davanti all'API
+  volumes:
+    - rag_data:/data
+  restart: unless-stopped
+
+x-dipendenze: &dipendenze
+  mysql: { condition: service_healthy }
+  redis: { condition: service_healthy }
+  rabbitmq: { condition: service_healthy }
+  setup: { condition: service_completed_successfully }
+
+services:
+  # ---------------------------------------------------------------- infrastruttura
+  mysql:
+    <<: *log
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?manca MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: rag
+      MYSQL_USER: raguser
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?manca MYSQL_PASSWORD}
+    volumes:
+      - mysql_data:/var/lib/mysql
+      # Solo alla prima creazione del volume. Poi le modifiche allo schema si applicano con
+      # le migrazioni di misc/migrations/ (guida, "Aggiornamento").
+      - ../../misc/mysql_schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uraguser -p$$MYSQL_PASSWORD --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+
+  redis:
+    <<: *log
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  rabbitmq:
+    <<: *log
+    image: rabbitmq:3-management-alpine
+    hostname: rabbitmq   # il nome del nodo resta lo stesso tra un riavvio e l'altro (dati nel volume)
+    environment:
+      RABBITMQ_DEFAULT_USER: ${BROKER_USERNAME:?manca BROKER_USERNAME}
+      RABBITMQ_DEFAULT_PASS: ${BROKER_PASSWORD:?manca BROKER_PASSWORD}
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_running"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+    restart: unless-stopped
+
+  qdrant:
+    <<: *log
+    # Allineata alla versione di qdrant-client delle immagini (requirements): vedi la guida
+    image: qdrant/qdrant:${QDRANT_VERSIONE:-v1.18.2}
+    volumes:
+      - qdrant_data:/qdrant/storage
+      - qdrant_snapshots:/qdrant/snapshots
+    restart: unless-stopped
+
+  # Collection e indici di Qdrant, code di RabbitMQ. Idempotente: gira a ogni avvio e termina.
+  setup:
+    <<: *backend
+    image: ${REGISTRY:?manca REGISTRY}/${PREFISSO:-}rest:${VERSIONE:?manca VERSIONE}
+    command: sh -c "python -m utils.setup_qdrant && python -m utils.setup_rabbitmq"
+    environment:
+      <<: *backend-env
+      BROKER_PORT: "15672"   # setup_rabbitmq usa l'API di gestione HTTP, non AMQP
+    restart: "no"
+    depends_on:
+      rabbitmq: { condition: service_healthy }
+      qdrant: { condition: service_started }
+
+  # ---------------------------------------------------------------- backend
+  api:
+    <<: *backend
+    image: ${REGISTRY}/${PREFISSO:-}rest:${VERSIONE}
+    networks:
+      default:
+        aliases: [rag-api]   # nome unico: il gateway sta anche sulla rete condivisa con atti-pa
+    depends_on: *dipendenze
+
+  # Celery: risposte della chat (non usate senza siti) e pulizie periodiche programmate da
+  # celery-beat (cache semantica, sessioni di documenti scadute): serve comunque.
+  worker:
+    <<: *backend
+    image: ${REGISTRY}/${PREFISSO:-}rest:${VERSIONE}
+    command: python -m celery -A worker.celery_app worker --loglevel=info --concurrency=${CELERY_CONCURRENCY:-1}
+    depends_on: *dipendenze
+
+  celery-beat:
+    <<: *backend
+    image: ${REGISTRY}/${PREFISSO:-}rest:${VERSIONE}
+    command: python -m celery -A worker.celery_app beat --loglevel=info --schedule=/tmp/celerybeat-schedule
+    depends_on: *dipendenze
+
+  converter:
+    <<: *backend
+    image: ${REGISTRY}/${PREFISSO:-}converter:${VERSIONE}
+    environment:
+      <<: *backend-env
+      GOOGLE_APPLICATION_CREDENTIALS: /var/secrets/google/credentials.json
+    volumes:
+      - rag_data:/data
+      # Facoltativo: ripiego su Google Cloud Vision (cartella con credentials.json)
+      - ${GOOGLE_CREDENTIALS_DIR:-../../misc/local/no-google}:/var/secrets/google:ro
+    depends_on: *dipendenze
+
+  ingestion:
+    <<: *backend
+    image: ${REGISTRY}/${PREFISSO:-}ingestion:${VERSIONE}
+    depends_on: *dipendenze
+
+  # ---------------------------------------------------------------- web
+  # Sito di amministrazione (archivi, utenti, revisione, credenziali dei sistemi esterni)
+  revisione:
+    <<: *log
+    image: ${REGISTRY}/${PREFISSO:-}web-revisione:${VERSIONE}
+    environment:
+      BASE_HREF: /amministrazione/
+      REVIEW_API_URL: /api/review
+    networks:
+      default:
+        aliases: [rag-revisione]
+    restart: unless-stopped
+
+  gateway:
+    <<: *log
+    image: nginx:1.27-alpine
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - rag_data:/data:ro
+    ports:
+      - "${RAG_INDIRIZZO:-127.0.0.1}:${RAG_PORTA:-8090}:8080"
+    networks:
+      default: {}
+      rag:
+        aliases: [rag-gateway]
+    depends_on: [api, revisione]
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------- strumenti
+  # Documenti caricati a mano: si copiano in /data/direct/<topic>/<sub_topic>/, poi
+  #   docker compose --profile strumenti run --rm direct
+  direct:
+    <<: *backend
+    image: ${REGISTRY}/${PREFISSO:-}direct:${VERSIONE}
+    profiles: [strumenti]
+    restart: "no"
+    depends_on: *dipendenze
+
+  # Estrazione da Sicr@Web (saga_extract/verifica.py): argomenti dopo il nome del servizio
+  estrazione:
+    <<: *backend
+    image: ${REGISTRY}/${PREFISSO:-}saga_extract:${VERSIONE}
+    profiles: [estrazione]
+    entrypoint: ["python", "verifica.py"]
+    command: ["--help"]
+    restart: "no"
+    depends_on: *dipendenze
+
+  phpmyadmin:
+    <<: *log
+    image: phpmyadmin:5.2.3
+    profiles: [strumenti]
+    environment:
+      PMA_HOST: mysql
+      UPLOAD_LIMIT: 256M
+    ports:
+      - "127.0.0.1:8082:80"
+    depends_on:
+      mysql: { condition: service_healthy }
+    restart: "no"
+
+networks:
+  default: {}
+  # Rete condivisa con atti-pa sullo stesso server (vedi la guida): ci sta solo il gateway
+  rag:
+    name: rag
+
+volumes:
+  mysql_data:
+  redis_data:
+  rabbitmq_data:
+  qdrant_data:
+  qdrant_snapshots:
+  rag_data:

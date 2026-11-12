@@ -78,3 +78,6 @@ saga_extract/documentazione/
 !deploy/k8s/**
 deploy/k8s/**/rag-secrets.yaml
 deploy/k8s/**/regcreds.yaml
+!deploy/docker/
+!deploy/docker/**
+deploy/docker/.env
