@@ -372,8 +372,8 @@ def load_settings() -> Settings:
     # era stato appena assegnato del budget — di nuovo il bug che questa
     # modifica elimina, solo per un'altra strada.
     rerank_provider = (os.environ.get("RERANK_PROVIDER") or "onnx").strip().lower()
-    if rerank_provider not in ("onnx", "vllm"):
-        raise ValueError(f"RERANK_PROVIDER='{rerank_provider}' non valido (ammessi: onnx, vllm).")
+    if rerank_provider not in ("onnx", "vllm", "lessicale"):
+        raise ValueError(f"RERANK_PROVIDER='{rerank_provider}' non valido (ammessi: onnx, vllm, lessicale).")
 
     context_score_source = (os.environ.get("CONTEXT_SCORE_SOURCE") or "rerank").strip().lower()
     if context_score_source not in ("rerank", "vector"):

@@ -292,6 +292,24 @@ patch("get_reranker_pool", lambda: [NormalizedReranker()])
 nm, st = run()
 check(len(nm) == 4, "punteggi 0..1 del server: usati come probabilità, senza seconda sigmoide")
 
+# ---------------------------------------------------------------------------
+# Reranker in errore (server giù, timeout): la sottoquery si riordina in modo
+# lessicale invece di fermarsi o di usare la sola similarità vettoriale.
+class BrokenReranker:
+    def rerank(self, query, docs):
+        raise TimeoutError("reranker non raggiungibile")
+
+
+patch("get_reranker_pool", lambda: [BrokenReranker()])
+nm, st = run()
+check(len(nm) >= 4 and st["n_rerank_fallbacks"] == 1, "reranker in errore: ripiego lessicale, risultati presenti")
+
+# RERANK_PROVIDER=lessicale: nessun modello, stessa catena di selezione.
+from lexical_reranker import LexicalReranker  # noqa: E402
+patch("get_reranker_pool", lambda: [LexicalReranker()])
+nm, st = run()
+check(len(nm) >= 4 and st["n_rerank_fallbacks"] == 0, "riordino lessicale scelto: risultati presenti, nessun ripiego")
+
 if "--snapshot" in sys.argv:
     pathlib.Path(sys.argv[sys.argv.index("--snapshot") + 1]).write_text(
         json.dumps(SNAPSHOT, ensure_ascii=False, indent=1, sort_keys=True))

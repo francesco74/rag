@@ -19,12 +19,15 @@ from rag.context import document_context_metadata, SNIPPETS_PER_PARENT
 from rag.keywords import keyword_search
 from rag.mmr import MMR_LOG_TAG, select_with_mmr
 from rag.state import QDRANT_COLLECTION
+from lexical_reranker import LexicalReranker
 from reranker import ONNXReranker, VLLMReranker
 
 log = logging.getLogger("WORKER")
 
 
 _RERANKER_POOL: list = []
+# Ripiego sempre disponibile: senza stato, condiviso fra i thread.
+_LEXICAL = LexicalReranker()
 
 
 _POOL_SIZE = settings.reranker_pool_size
@@ -283,6 +286,8 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
         # ordine dei core) al posto della similarità vettoriale di Qdrant,
         # che varia poco tra un chunk e l'altro e non coglie la pertinenza.
         rerank_probs: dict[tuple[int, str], float] = {}
+        # Sottoquery riordinate con il ripiego lessicale (reranker in errore).
+        rerank_fallbacks: list[int] = []
 
         def process_single_rerank(q_idx, query_str, candidates):
             if not candidates:
@@ -338,8 +343,20 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
                     rx = removal_by_subtopic.get(st) if st else None
                     txt = rx.sub(" ", raw) if rx else raw
                     docs_content.append(txt[:settings.rerank_truncate])
+                vector_scores = [getattr(c, "score", None) for c in unique_candidates]
                 try:
-                    reranked = reranker_instance.rerank(query_str, docs_content)
+                    if isinstance(reranker_instance, LexicalReranker):
+                        reranked = reranker_instance.rerank(query_str, docs_content, vector_scores)
+                    else:
+                        try:
+                            reranked = reranker_instance.rerank(query_str, docs_content)
+                        except Exception as e:
+                            # Reranker con modello fuori uso (server giù, timeout, ONNX):
+                            # la ricerca prosegue con l'ordine lessicale.
+                            log.warning(f"[{task_id}] [RERANK_FALLBACK] Reranker '{settings.rerank_provider}' "
+                                        f"in errore sulla sottoquery #{q_idx}: {e}. Uso il riordino lessicale.")
+                            rerank_fallbacks.append(q_idx)
+                            reranked = _LEXICAL.rerank(query_str, docs_content, vector_scores)
                     reranked.sort(key=lambda x: x.score, reverse=True)
                     top_chunks = []
                     for res in reranked[:rerank_size]:
@@ -360,7 +377,7 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
             return unique_candidates[:rerank_size]
         
         # Il limite serve a non contendersi i core del pod; vLLM lavora altrove.
-        max_workers = n_queries if settings.rerank_provider == "vllm" else min(n_queries, settings.max_reranker_thread)
+        max_workers = n_queries if settings.rerank_provider in ("vllm", "lessicale") else min(n_queries, settings.max_reranker_thread)
         rerank_started = time.perf_counter()
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -680,6 +697,8 @@ def retrieve_chunks(search_queries, vectors_list, keywords, topic_id, selected_s
             # vettoriale + testuale in parallelo, poi rerank di tutte le sotto-query.
             "t_search_s": round(t_search, 3),
             "t_rerank_s": round(t_rerank, 3),
+            # Sottoquery riordinate con il ripiego lessicale: il reranker era in errore.
+            "n_rerank_fallbacks": len(rerank_fallbacks),
             "n_candidates": sum(len(h) for h in hits_per_query),
         }
 
@@ -858,6 +877,8 @@ def get_reranker_pool():
     fanno reranking nello stesso momento.
     """
     global _RERANKER_POOL
+    if not _RERANKER_POOL and settings.rerank_provider == "lessicale":
+        _RERANKER_POOL.append(_LEXICAL)
     if not _RERANKER_POOL and settings.rerank_provider == "vllm":
         if not settings.rerank_model_name:
             raise ValueError("RERANK_PROVIDER='vllm' richiede RERANK_MODEL_NAME.")
@@ -898,7 +919,8 @@ def _check_local_reranker():
     raise RuntimeError(
         f"RERANK_PROVIDER='onnx' (reranking locale) ma "
         f"{'mancano onnxruntime e transformers' if not DEPENDENCIES_AVAILABLE else 'manca il modello in ' + settings.onnx_model_cache_path}: "
-        "usare il reranking su server (RERANK_PROVIDER=vllm, RERANK_MODEL_NAME, LOCAL_VLLM_RERANK_BASE_URL) "
+        "usare il reranking su server (RERANK_PROVIDER=vllm, RERANK_MODEL_NAME, LOCAL_VLLM_RERANK_BASE_URL), "
+        "quello senza modelli (RERANK_PROVIDER=lessicale) "
         "oppure un'immagine con i modelli locali (MODELLI_LOCALI=1 deploy/immagini.sh VERSIONE).")
 
 

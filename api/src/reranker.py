@@ -252,7 +252,7 @@ class VLLMReranker:
     logit grezzi e la conversione la fa il chiamante, come per ONNX.
 
     Thread-safe: i thread delle sotto-query condividono lo stesso client. Un errore
-    si propaga e retrieve_chunks ripiega sulla similarità vettoriale.
+    si propaga e retrieve_chunks ripiega sul riordino lessicale (lexical_reranker.py).
     """
 
     def __init__(self, base_url: str, model: str, api_key: Optional[str] = None,
