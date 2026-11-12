@@ -665,6 +665,7 @@ I default puntano a modelli Gemini, ma sono appunto default: il codice del motor
 | `extra_parents`             | `EXTRA_PARENTS`             | `bool`     | `true`                                         | Posti extra per pertinenza: oltre alla quota, parent giudicati pertinenti dal reranker, fino a `MAX_SUB_QUERIES × PARENTS_PER_QUERY` parent in tutto.|
 | `extra_parents_min_prob`    | `EXTRA_PARENTS_MIN_PROB`    | `float`    | `0.5`                                          | Probabilità minima del reranker perché un parent entri tra i posti extra.                           |
 | `mmr_similarity_threshold`  | `MMR_SIMILARITY_THRESHOLD`  | `float`    | `0.92`                                         | Similarità oltre la quale MMR penalizza un candidato ridondante (attivo solo con `mmr_lambda < 1`). |
+| `boilerplate_similarity_threshold` | `BOILERPLATE_SIMILARITY_THRESHOLD` | `float` | `0.55` | Una frase ripetuta (boilerplate) resta nel testo dato al reranker se la sua similarità con la domanda raggiunge questa soglia: è pertinente, non rumore. Più alta = si tolgono più frasi. |
 | `protected_keys`            | _N/A_                       | `set[str]` | costante                                       | Metadati riservati (`parent_id`, `topic_id`, …) protetti da sovrascrittura in ingestion.            |
 
 ### E. Budget di Contesto
