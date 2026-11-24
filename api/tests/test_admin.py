@@ -7,7 +7,7 @@ import base64, os, pathlib, re, sqlite3, sys, tempfile
 TMP = pathlib.Path(tempfile.mkdtemp())
 os.environ.update(AUTH_SECRET_KEY="x" * 40, API_SECRET_KEY="chiave-chat", DATA_FOLDER=str(TMP), DOCWS_RICERCA_ENDPOINT="u",
                   DOCWS_ATTI_ENDPOINT="u", DOCWS_CODICE_AMMINISTRAZIONE="u", DOCWS_CODICE_AOO="u", RUOLO_DOCWS="u",
-                  LOG_LEVEL="CRITICAL", SITE_CACHE_SECONDS="0")
+                  LOG_LEVEL="CRITICAL", SITE_CACHE_SECONDS="0", STATS_CACHE_SECONDS="0")
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path[:0] = [str(ROOT / "api" / "src"), str(ROOT)]
 DB_PATH = str(TMP / "db.sqlite")
@@ -20,6 +20,7 @@ def translate(sql):
     sql = sql.replace("TIMESTAMPDIFF(SECOND, NOW(), locked_until)",
                       "CAST(ROUND((julianday(locked_until) - julianday(CURRENT_TIMESTAMP)) * 86400) AS INTEGER)")
     sql = re.sub(r"\bIF\(", "iif(", sql).replace("NOW()", "CURRENT_TIMESTAMP")
+    sql = sql.replace("JSON_UNQUOTE(JSON_EXTRACT(", "(json_extract(").replace("AS UNSIGNED", "AS INTEGER")
     if "INSERT INTO review_login_failures" in sql:
         sql = sql.replace("ON DUPLICATE KEY UPDATE", "ON CONFLICT(lkey) DO UPDATE SET")
     return re.sub(r"\b(active) = TRUE", r"\1 = 1", sql)
@@ -116,6 +117,20 @@ check(cl.post("/chat", json={"topic_id": "lettere", "query": "x"}, headers=SITE)
 check(cl.post("/config", json={"topic_id": "atti"}, headers={"Host": "altro.example.it"}).status_code == 401, "dominio sconosciuto -> 401")
 check(cl.post("/config", json={"topic_id": "atti"}, headers={"Host": "spento.example.it"}).status_code == 401, "sito disattivato -> 401")
 check(cl.post("/config", json={"topic_id": "lettere"}, headers={"Authorization": "Bearer chiave-chat"}).status_code != 401, "la chiave continua a valere per qualunque archivio")
+
+# --- configurazione e statistiche della home, in due chiamate
+r = cl.post("/config", json={"topic_id": "atti"}, headers=SITE)
+check(r.status_code == 200 and [s["id"] for s in r.json["sub_topics"]] == ["determine"]
+      and "doc_count" not in r.json["sub_topics"][0], "/config: solo le serie, senza statistiche")
+_c = sqlite3.connect(DB_PATH)
+_c.executemany("INSERT INTO parent_documents VALUES (?, 'atti', 'determine', 's', ?, ?, 'c', ?)",
+               [("p1", "g", 0, '{"anno": "2016"}'), ("p2", "g", 1, '{"anno": "2016"}'), ("p3", "g", 2, '{"anno": "2016"}')])
+_c.commit(); _c.close()
+r = cl.post("/config/stats", json={"topic_id": "atti"}, headers=SITE)
+check(r.status_code == 200 and r.json["stats"] == {"determine": {"doc_count": 2, "since_year": 2016}},
+      "/config/stats: documenti contati una volta (non per parti) e anno più vecchio")
+check(cl.post("/config/stats", json={"topic_id": "lettere"}, headers=SITE).status_code == 403, "/config/stats: non un altro archivio")
+check(cl.post("/config/stats", json={}, headers=SITE).status_code == 400, "/config/stats: topic_id obbligatorio")
 
 # --- permessi
 for method, path in [("get", "/topics"), ("get", "/sites"), ("get", "/keys"), ("get", "/roles")]:

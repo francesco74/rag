@@ -155,6 +155,9 @@ class Settings:
     # Per quanti secondi un processo dell'API tiene in memoria un sito della chat
     # (dominio -> archivio): le modifiche arrivano a tutti entro questo tempo.
     site_cache_seconds: int
+    # Per quanti secondi l'API tiene in Redis le statistiche della home della chat
+    # (documenti per serie, /config/stats); 0 = nessuna cache.
+    stats_cache_seconds: int
 
     # Metadati del documento nel contesto del generatore (worker.build_context):
     # oggetto, numero, ufficio... sul primo passaggio di ogni documento, un
@@ -550,6 +553,7 @@ def load_settings() -> Settings:
 
         allowed_origins=allowed_origins,
         site_cache_seconds = int(os.environ.get("SITE_CACHE_SECONDS") or 10),
+        stats_cache_seconds = max(0, int(os.environ.get("STATS_CACHE_SECONDS") or 600)),
         context_metadata=os.environ.get("CONTEXT_METADATA", "true").strip().lower()
                          not in ("0", "false", "no", "off"),
         context_metadata_exclude=frozenset(

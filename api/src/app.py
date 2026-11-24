@@ -83,6 +83,7 @@ UNPROTECTED_ROUTES = {"/health", "/site", "/site/icon"}
 # Rotte che la chat chiama senza credenziali: le autorizza il sito (dominio) da
 # cui arriva la richiesta, limitato al suo archivio. La vecchia chiave resta
 # valida per chi chiama l'API da un programma; ai frontend non serve più.
+# "/config" copre anche "/config/stats" (confronto per prefisso).
 SITE_ROUTES = ("/config", "/chat", "/status/", "/feedback")
 
 # Le rotte di revisione non usano API_SECRET_KEY: ogni revisore si autentica
@@ -146,68 +147,36 @@ def health_check():
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 503
     
+def _topic_dalla_richiesta():
+    """topic_id dal body JSON, oppure (None, risposta di errore)."""
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return None, (jsonify({"error": "Bad Request", "message": "Invalid JSON"}), 400)
+    topic_id = data.get("topic_id")
+    if not topic_id:
+        return None, (jsonify({"error": "Bad Request", "message": "topic_id is required"}), 400)
+    return topic_id, None
+
+
 @app.route("/config", methods=["POST"])
 def get_config():
-    """Invia al frontend i subtopic relativi al topic richiesto."""
-    data = request.json # <--- Leggi il body JSON
-    if not data:
-        return jsonify({"error": "Bad Request", "message": "Invalid JSON"}), 400
-        
-    topic_id = data.get("topic_id") # <--- Recupera topic_id dal JSON
-    if not topic_id:
-        return jsonify({"error": "Bad Request", "message": "topic_id is required"}), 400
+    """Invia al frontend i subtopic relativi al topic richiesto. Le statistiche della
+    home (documenti per serie) sono a parte, in /config/stats: qui servono solo le
+    serie, perché il filtro si possa usare subito."""
+    topic_id, errore = _topic_dalla_richiesta()
+    if errore:
+        return errore
 
     conn = None
-    cursor = None
-
     try:
-        conn = get_db_connection()  # <-- Modificato qui
+        conn = get_db_connection()
         if not conn:
             return jsonify({"error": "Service Unavailable"}), 503
         cursor = conn.cursor(dictionary=True)
-        
         cursor.execute("SELECT sub_topic_id, description, description_long FROM sub_topics WHERE topic_id = %s", (topic_id,))
-        rows = cursor.fetchall()
-
-        # Conteggio documenti e anno più vecchio per sub_topic, per mostrare
-        # nel frontend qualcosa tipo "Determine presenti nel sistema: 1834
-        # a partire dal 2015".
-        # Usiamo il campo "anno" del JSON di metadata (es. "2025") invece di
-        # "data": quest'ultimo è salvato in formato italiano "DD/MM/YYYY"
-        # (es. "26/11/2025"), non ISO, quindi né un MIN() lessicografico né
-        # un'estrazione di sottostringa darebbero un anno corretto. "anno"
-        # è già la stringa numerica dell'anno, quindi basta un CAST.
-        cursor.execute(
-            """
-            SELECT sub_topic_id,
-                   COUNT(*) AS doc_count,
-                   MIN(
-                       CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.anno')), '') AS UNSIGNED)
-                   ) AS since_year
-            FROM parent_documents
-            WHERE topic_id = %s
-            GROUP BY sub_topic_id
-            """,
-            (topic_id,)
-        )
-        stats_rows = cursor.fetchall()
-        stats_by_subtopic = {
-            row['sub_topic_id']: {
-                "doc_count": row['doc_count'],
-                "since_year": row['since_year']
-            }
-            for row in stats_rows
-        }
-
         sub_topics_data = [
-            {
-                "id": row['sub_topic_id'],
-                "desc": row['description'],
-                "desc_long": row['description_long'],
-                "doc_count": stats_by_subtopic.get(row['sub_topic_id'], {}).get("doc_count", 0),
-                "since_year": stats_by_subtopic.get(row['sub_topic_id'], {}).get("since_year"),
-            }
-            for row in rows
+            {"id": row['sub_topic_id'], "desc": row['description'], "desc_long": row['description_long']}
+            for row in cursor.fetchall()
         ]
 
         # Si configura sul sito dell'archivio; senza sito (accesso con chiave) le serie si vedono.
@@ -216,11 +185,84 @@ def get_config():
 
         return jsonify({
             "allow_subtopic_selection": bool(site["allow_subtopic_selection"]) if site else True,
-            "sub_topics": sub_topics_data 
+            "sub_topics": sub_topics_data
         }), 200
     finally:
         if conn and conn.is_connected():
             conn.close()
+
+
+_redis_stats = None
+
+
+def _cache_stats():
+    """Client Redis per la cache delle statistiche (lo stesso Redis di Celery)."""
+    global _redis_stats
+    if _redis_stats is None:
+        import redis
+        _redis_stats = redis.Redis.from_url(redis_conn_string, socket_timeout=0.5, socket_connect_timeout=0.5)
+    return _redis_stats
+
+
+def _calcola_stats(topic_id):
+    """Documenti e anno più vecchio per sub_topic, per la home della chat ("Determine
+    presenti nel sistema: 1834 a partire dal 2015").
+    In parent_documents c'è una riga per ogni parte (parent) di un documento: si conta
+    solo la prima (parent_index = 0), una per documento, che porta anche i metadati.
+    Si usa il campo "anno" del JSON (es. "2025") e non "data", che è in formato
+    italiano "DD/MM/YYYY": né un MIN() lessicografico né una sottostringa darebbero
+    l'anno giusto."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        if not conn:
+            return None
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute(
+            """
+            SELECT sub_topic_id,
+                   COUNT(*) AS doc_count,
+                   MIN(
+                       CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.anno')), '') AS UNSIGNED)
+                   ) AS since_year
+            FROM parent_documents
+            WHERE topic_id = %s AND parent_index = 0
+            GROUP BY sub_topic_id
+            """,
+            (topic_id,)
+        )
+        return {row['sub_topic_id']: {"doc_count": row['doc_count'], "since_year": row['since_year']}
+                for row in cursor.fetchall()}
+    finally:
+        if conn and conn.is_connected():
+            conn.close()
+
+
+@app.route("/config/stats", methods=["POST"])
+def get_config_stats():
+    """Statistiche della home per serie: {"stats": {sub_topic_id: {doc_count, since_year}}}.
+    Cambiano solo con i caricamenti: si tengono in Redis per STATS_CACHE_SECONDS. Se
+    Redis non risponde si calcolano comunque."""
+    topic_id, errore = _topic_dalla_richiesta()
+    if errore:
+        return errore
+    chiave = f"rag:config_stats:{topic_id}"
+    if settings.stats_cache_seconds > 0:
+        try:
+            salvato = _cache_stats().get(chiave)
+            if salvato:
+                return jsonify({"stats": json.loads(salvato)}), 200
+        except Exception as e:
+            log.warning(f"Cache delle statistiche non disponibile: {e}")
+    stats = _calcola_stats(topic_id)
+    if stats is None:
+        return jsonify({"error": "Service Unavailable"}), 503
+    if settings.stats_cache_seconds > 0:
+        try:
+            _cache_stats().set(chiave, json.dumps(stats), ex=settings.stats_cache_seconds)
+        except Exception as e:
+            log.warning(f"Cache delle statistiche non disponibile: {e}")
+    return jsonify({"stats": stats}), 200
 
 
 @app.route("/chat", methods=["POST"])

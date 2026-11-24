@@ -379,6 +379,33 @@ class _ChatScreenState extends State<ChatScreen> {
     )..show(context: context);
   }
 
+  // Statistiche della home (documenti per serie): chiamata a parte, che non
+  // ritarda il filtro per serie. Se non arrivano, la home resta senza numeri.
+  Future<void> _fetchStats() async {
+    try {
+      final response = await http.post(
+        Uri.parse("${AppSettings.apiUrl}/config/stats"),
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: jsonEncode({"topic_id": AppSettings.getTopicId}),
+      );
+      if (response.statusCode != 200 || !mounted) return;
+      final Map stats = jsonDecode(response.body)['stats'] ?? {};
+      setState(() {
+        _subTopicStats = {
+          for (final e in stats.entries)
+            e.key.toString(): {
+              "doc_count": e.value['doc_count'] ?? 0,
+              "since_year": e.value['since_year'],
+            },
+        };
+      });
+    } catch (e) {
+      debugPrint("Statistiche non disponibili: $e");
+    }
+  }
+
   Future<void> _fetchConfig() async {
     try {
       final response = await http.post(
@@ -407,17 +434,11 @@ class _ChatScreenState extends State<ChatScreen> {
             for (var item in rawSubTopics)
               item['id'].toString(): (item['desc_long'] ?? '').toString(),
           };
-          _subTopicStats = {
-            for (var item in rawSubTopics)
-              item['id'].toString(): {
-                "doc_count": item['doc_count'] ?? 0,
-                "since_year": item['since_year'],
-              },
-          };
 
           _selectedSubTopics = _availableSubTopicIds.toSet();
           _isMaintenanceMode = false;
         });
+        _fetchStats();
       } else {
         setState(() {
           _isMaintenanceMode = true;
