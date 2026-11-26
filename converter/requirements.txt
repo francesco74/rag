@@ -1,7 +1,7 @@
 # Conversione in Markdown (PDF con PyMuPDF4LLM e OCR, documenti d'ufficio con LibreOffice,
 # fogli di calcolo), OCR con tutti i fornitori, buste .p7m: libreria condivisa con atti-pa
 # (https://github.com/francesco74/pa-common), versione fissata dal tag
-pa-common[tutto] @ https://github.com/francesco74/pa-common/archive/refs/tags/v0.1.0.tar.gz
+pa-common[tutto] @ https://github.com/francesco74/pa-common/archive/refs/tags/v0.1.1.tar.gz
 
 # Comando del revisore: ripiego su Google Cloud Vision
 google-cloud-vision>=3.4.0
