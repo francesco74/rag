@@ -156,13 +156,17 @@ d = TMP / "conversions" / job
 (d / "status.json").write_text(json.dumps({"status": "completed"}))
 check(cl.get(f"{BASE}/convert/{job}", headers=H("chiave-atti")).status_code == 404 and d.exists(),
       "un'altra chiave non lo ritira né lo cancella")
-check(cl.get(f"{BASE}/convert/{job}", headers=H("chiave-nessun-topic")).json["content"] == "# Titolo\n\n**testo**", "risultato in Markdown")
+r = cl.get(f"{BASE}/convert/{job}", headers=H("chiave-nessun-topic"))
+check(r.json["content"] == "# Titolo\n\n**testo**" and "pages" not in r.json, "risultato in Markdown (lavoro senza pagine: solo content)")
 check(not d.exists(), "consegnato il risultato, il lavoro è cancellato")
 check(cl.get(f"{BASE}/convert/{job}", headers=H("chiave-nessun-topic")).status_code == 404, "si ritira una volta sola")
 d2 = TMP / "conversions" / r2.json["job_id"]
 (d2 / "result.md").write_text("# Titolo\n\n**testo**")
 (d2 / "status.json").write_text(json.dumps({"status": "completed"}))
-check(cl.get(f"{BASE}/convert/{r2.json['job_id']}", headers=H("chiave-nessun-topic")).json["content"] == "Titolo\n\ntesto", "risultato in testo semplice")
+(d2 / "pages.json").write_text(json.dumps(["# Titolo", "**testo**"]))
+r = cl.get(f"{BASE}/convert/{r2.json['job_id']}", headers=H("chiave-nessun-topic"))
+check(r.json["content"] == "Titolo\n\ntesto", "risultato in testo semplice")
+check(r.json["pages"] == ["Titolo", "testo"], "anche pagina per pagina, nello stesso formato")
 r3 = upload()
 d3 = TMP / "conversions" / r3.json["job_id"]
 (d3 / "status.json").write_text(json.dumps({"status": "running"}))

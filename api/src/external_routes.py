@@ -6,7 +6,7 @@ con utils/manage_api_keys.py) inviate come `Authorization: Bearer <chiave>`.
     GET  /external/v1/topics/<topic>/documents        documenti del topic, a pagine, con i metadati
     GET  /external/v1/topics/<topic>/documents/<id>   testo del documento presente nel database
     POST /external/v1/convert                         converte un documento in Markdown o testo
-    GET  /external/v1/convert/<job_id>                stato e risultato della conversione (una volta sola)
+    GET  /external/v1/convert/<job_id>                stato e risultato della conversione, anche pagina per pagina (una volta sola)
 
 I topic limitano la consultazione; per la conversione basta una chiave valida,
 perché non legge nulla dell'archivio. La conversione è asincrona (una scansione
@@ -250,7 +250,11 @@ def get_conversion(job_id):
     response = {"job_id": job_id, "file_name": job["file_name"], "format": job["format"], **status}
     if status["status"] == "completed":
         markdown = (job_dir / "result.md").read_text(encoding="utf-8")
-        response["content"] = markdown_to_text(markdown) if job["format"] == "text" else markdown
+        as_text = job["format"] == "text"
+        response["content"] = markdown_to_text(markdown) if as_text else markdown
+        if (job_dir / "pages.json").is_file():
+            pages = json.loads((job_dir / "pages.json").read_text(encoding="utf-8"))
+            response["pages"] = [markdown_to_text(p) if as_text else p for p in pages]
     if status["status"] in ("completed", "failed"):
         # Consegnato l'esito, sul server non resta nulla del documento.
         shutil.rmtree(job_dir, ignore_errors=True)

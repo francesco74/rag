@@ -198,7 +198,24 @@ pdf.save(job_dir / "input.pdf")
 asyncio.run(converter.process_conversion_job(job_id))
 check("lavoro esterno: esito", json.loads((job_dir / "status.json").read_text())["status"], "completed")
 check("lavoro esterno: ogni pagina", (job_dir / "result.md").read_text(), "pagina 1\n\n---\n\npagina 2")
+check("lavoro esterno: pagina per pagina", json.loads((job_dir / "pages.json").read_text()), ["pagina 1", "pagina 2"])
 converter._external_transcribe_page = real_page
+
+# --- Lavoro delle API esterne: il testo anche pagina per pagina, al suo posto
+job_id = "b" * 32
+job_dir = converter.settings.data_folder / "conversions" / job_id
+job_dir.mkdir(parents=True)
+pdf = pymupdf.open()
+for testo in ("Prima pagina della determinazione, con il testo nativo del documento.",
+              "Seconda pagina: --- una riga che sembra un separatore --- e altro testo nativo."):
+    pdf.new_page().insert_text((50, 80), testo, fontsize=10)
+pdf.save(job_dir / "input.pdf")
+(job_dir / "request.json").write_text(json.dumps({"input_file": "input.pdf", "file_name": "b.pdf"}))
+asyncio.run(converter.process_conversion_job(job_id))
+pages = json.loads((job_dir / "pages.json").read_text())
+check("pagina per pagina: quante", len(pages), 2)
+check("pagina per pagina: al loro posto", ("Prima pagina" in pages[0], "Seconda pagina" in pages[1]), (True, True))
+check("pagina per pagina: testo intero come prima", (job_dir / "result.md").read_text(), "\n\n---\n\n".join(pages))
 
 # --- Documenti d'ufficio: testo e tabelle senza OCR (DOCX e ODT con LibreOffice)
 import datetime, openpyxl

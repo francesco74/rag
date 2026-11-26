@@ -201,10 +201,11 @@ async def _external_transcribe_page(png: bytes) -> str:
     return (await asyncio.to_thread(_cloud_vision_transcribe, png)).strip()
 
 
-async def transcribe_externally(file_path: Path, filename: str) -> str:
-    """Tutte le pagine all'OCR esterno, per scelta del revisore: non passa dal modello di OCR_PROVIDER."""
+async def transcribe_externally(file_path: Path, filename: str) -> list[str]:
+    """Tutte le pagine all'OCR esterno, per scelta del revisore: non passa dal modello di
+    OCR_PROVIDER. Il testo pagina per pagina."""
     if file_path.suffix.lower() in IMG_EXTENSIONS:
-        return await _external_transcribe_page(file_path.read_bytes())
+        return [await _external_transcribe_page(file_path.read_bytes())]
     pdf_bytes = ingresso.sbusta_p7m(file_path.read_bytes()) or file_path.read_bytes()
     pages = await asyncio.to_thread(processo.esegui, rasterizza, (pdf_bytes,), TEMPI_PDF.rasterizza)
     if len(pages) > settings.max_allowed_pages:
@@ -212,7 +213,7 @@ async def transcribe_externally(file_path: Path, filename: str) -> str:
     texts = []
     for png in pages:
         texts.append(await _external_transcribe_page(png))
-    return SEPARATORE_PAGINE.join(texts)
+    return texts
 
 
 # ==============================================================================
@@ -229,7 +230,8 @@ def _ocr_o_niente() -> Ocr | None:
         return None
 
 
-async def convert_file_to_markdown(attached_file_path: Path, filename: str, stats: Statistiche | None = None) -> str | None:
+async def convert_file_to_markdown(attached_file_path: Path, filename: str, stats: Statistiche | None = None,
+                                   page_separator: str = SEPARATORE_PAGINE) -> str | None:
     """Testo Markdown di un file; None se il formato non è gestito.
 
     pa-common sbusta le firme (anche un ".pdf" che è ancora una busta CAdES non sbustata a
@@ -246,10 +248,24 @@ async def convert_file_to_markdown(attached_file_path: Path, filename: str, stat
         attached_file_path.name,
         ocr=_ocr_o_niente(),
         max_pagine=settings.max_allowed_pages,
-        separatore_pagine=SEPARATORE_PAGINE,
+        separatore_pagine=page_separator,
         tempi=TEMPI_PDF,
         statistiche=stats,
     )
+
+
+# Separatore provvisorio tra le pagine: un carattere di controllo che non compare nei testi
+# (per Python è uno spazio, quindi non conta nel controllo del testo minimo di pa-common).
+_PAGE_MARK = "\x1e"
+
+
+async def convert_file_to_pages(attached_file_path: Path, filename: str) -> list[str] | None:
+    """Testo Markdown pagina per pagina (un solo elemento per i file che non sono PDF);
+    None se il formato non è gestito."""
+    md_content = await convert_file_to_markdown(attached_file_path, filename, page_separator=f"\n\n{_PAGE_MARK}\n\n")
+    if md_content is None:
+        return None
+    return [page.strip() for page in md_content.split(_PAGE_MARK)]
 
 
 async def process_single_job(payload: dict, channel: aio_pika.Channel):
@@ -395,8 +411,9 @@ async def process_single_job(payload: dict, channel: aio_pika.Channel):
 async def process_conversion_job(job_id: str):
     """
     Lavoro delle API esterne (external_routes.py). Nella cartella del lavoro:
-    request.json e il file li scrive l'API; qui si aggiornano status.json e
-    result.md. Il file ricevuto si cancella a fine lavoro, comunque vada.
+    request.json e il file li scrive l'API; qui si aggiornano status.json,
+    result.md e pages.json (il testo pagina per pagina, per chi deve rimettere ogni
+    pagina al suo posto). Il file ricevuto si cancella a fine lavoro, comunque vada.
     """
     if not re.fullmatch(r"[0-9a-f]{32}", str(job_id)):
         log.error(f"Lavoro di conversione con id non valido: {job_id!r}")
@@ -417,11 +434,15 @@ async def process_conversion_job(job_id: str):
     write_status(status="running")
     try:
         if external_ocr:
-            md_content = await transcribe_externally(input_path, request_data["file_name"])
+            pages = await transcribe_externally(input_path, request_data["file_name"])
         else:
-            md_content = await convert_file_to_markdown(input_path, request_data["file_name"])
-        if not md_content or not md_content.strip():
+            pages = await convert_file_to_pages(input_path, request_data["file_name"])
+        md_content = SEPARATORE_PAGINE.join(pages or [])
+        if not md_content.strip():
             raise ValueError("Nessun testo estratto dal documento.")
+        tmp = job_dir / "pages.json.tmp"
+        tmp.write_text(json.dumps(pages, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(job_dir / "pages.json")
         tmp = job_dir / "result.md.tmp"
         tmp.write_text(md_content, encoding="utf-8")
         tmp.replace(job_dir / "result.md")
