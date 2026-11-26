@@ -50,7 +50,7 @@ from rag import state
 from rag.state import CACHE_COLLECTION
 from rag.cache import (check_semantic_cache, generate_filters_key, generate_sub_topics_key,
                        save_to_semantic_cache)
-from rag.concepts import collect_concept_aliases, find_concepts, get_concepts_by_name
+from rag.concepts import collect_concept_aliases, concept_lookup_text, find_concepts, get_concepts_by_name
 from rag.generation import evaluate_generation, generate_answer
 from rag.metrics import log_automatic_negative_feedback, log_rag_metrics
 from rag.retrieval import get_all_sub_topics, get_reranker_pool, profile_kwargs, retrieve_chunks
@@ -300,10 +300,7 @@ def _run_rag_query(task_id, query, history, topic_id, selected_sub_topics, metad
         #    su follow-up molto impliciti ("e lì invece?") il lookup può mancare
         #    il concetto; in quel caso il rewriter ripiega sulle sue regole
         #    generali, come da prompt.
-        lookup_text = query
-        if history:
-            recent_turns = [msg.get("text", "") for msg in history[-2:]]
-            lookup_text = " ".join(recent_turns + [query])
+        lookup_text = concept_lookup_text(query, history)
 
         verified_concepts = []
         concept_vector = None 
@@ -487,6 +484,7 @@ def _run_rag_query(task_id, query, history, topic_id, selected_sub_topics, metad
         is_satisfactory, fail_reason, missing_targets = phases.run("grader", evaluate_generation,
             gen_result, standalone_query, coverage_targets=coverage_targets, task_id=task_id
         )
+        answer = gen_result.get("answer", answer)  # eventualmente ripulita con gli omissis
         if attempts_metrics:
             attempts_metrics[-1]["grader_reason"] = fail_reason
             attempts_metrics[-1]["missing_targets"] = missing_targets
@@ -509,6 +507,18 @@ def _run_rag_query(task_id, query, history, topic_id, selected_sub_topics, metad
                             f"esterna perché i documenti recuperati non coprivano tutti gli aspetti richiesti. "
                             f"Mantieni la stessa intenzione e lo stesso ambito, ma cerca documenti più specifici "
                             f"sugli aspetti rimasti scoperti."
+                        )
+                    elif fail_reason == "privacy":
+                        retry_instruction = (
+                            f"La risposta precedente per '{standalone_query}' conteneva dati personali. "
+                            f"Mantieni la stessa intenzione: nella risposta i dati personali vanno sostituiti "
+                            f"con omissis."
+                        )
+                    elif fail_reason == "constraints":
+                        retry_instruction = (
+                            f"La risposta precedente per '{standalone_query}' includeva documenti che la "
+                            f"richiesta esclude. Mantieni esattamente l'intenzione e le esclusioni della "
+                            f"richiesta: la risposta deve elencare solo i documenti della categoria richiesta."
                         )
                     elif fail_reason == "grounding":
                         retry_instruction = (
@@ -628,6 +638,7 @@ def _run_rag_query(task_id, query, history, topic_id, selected_sub_topics, metad
                             coverage_targets=coverage_targets,
                             task_id=f"{task_id}-FALLBACK",
                         )
+                        answer = gen_result.get("answer", answer)  # eventualmente ripulita con gli omissis
                         if attempts_metrics:
                             attempts_metrics[-1]["grader_reason"] = fail_reason
                             attempts_metrics[-1]["missing_targets"] = missing_targets
@@ -650,6 +661,14 @@ def _run_rag_query(task_id, query, history, topic_id, selected_sub_topics, metad
             f"sostituita con il messaggio di risposta non trovata (ALLOW_GENERAL_KNOWLEDGE=false)."
         )
         answer = "<p>Non sono riuscito a trovare la risposta nei documenti che ho analizzato.</p>"
+
+    # Dati personali: se nemmeno la pulizia con gli omissis (evaluate_generation) è bastata
+    # all'ultimo tentativo, la risposta non si mostra (né finisce nel feedback automatico
+    # qui sotto, che la salva).
+    if fail_reason == "privacy":
+        log.warning(f"[{task_id}] Tentativi esauriti con dati personali nella risposta: risposta non mostrata.")
+        answer = ("<p>Non posso mostrare la risposta perché conteneva dati personali. "
+                  "Prova a riformulare la domanda.</p>")
 
     # ==========================================================
     # FEEDBACK NEGATIVO AUTOMATICO

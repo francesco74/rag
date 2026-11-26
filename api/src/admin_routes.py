@@ -211,8 +211,11 @@ def unlock_user(user_id):
 # ==============================================================================
 
 def _available_prompts():
-    reserved = {"grader", "query_rewriter"}
-    return sorted(p.name for p in PROMPTS_DIR.iterdir() if p.is_file() and p.name not in reserved)
+    # grader (anche quelli dei singoli prompt, <nome>_grader), rewriter e pulizia con gli
+    # omissis non sono prompt di un archivio
+    reserved = {"grader", "query_rewriter", "redactor"}
+    return sorted(p.name for p in PROMPTS_DIR.iterdir()
+                  if p.is_file() and p.name not in reserved and not p.name.endswith("_grader"))
 
 
 def _topic_fields(data):

@@ -3,7 +3,12 @@ Qdrant in memoria, SQLite al posto di MySQL, embedding, reranker e LLM finti.
 
 Verifica i collegamenti fra worker.py e i moduli del pacchetto rag/: prompt
 caricati dalla cartella giusta, concetti passati al rewriter, contesto con
-metadati e testo ripulito, citazioni risolte, cache e metriche.
+metadati e testo ripulito, citazioni risolte, cache e metriche. Concetti
+cercati sulle sole domande dell'utente; risposta che non rispetta le esclusioni
+della domanda bocciata dal grader ("constraints") e rifatta. Grader del prompt del
+topic (atti_grader); dati personali: filtro su codici fiscali, IBAN ed email, poi
+pulizia con gli omissis della risposta bocciata e, solo se restano fino all'ultimo
+tentativo, risposta non mostrata; prompt inesistente: general.
 
 Uso:  python api/tests/test_task.py      (esce con 1 se qualcosa fallisce)
 """
@@ -71,11 +76,17 @@ saved = []
 patch("save_to_semantic_cache", lambda *a, **k: saved.append(a))
 metrics = []
 patch("log_rag_metrics", lambda **k: metrics.append(k))
+feedback = []   # feedback negativi automatici (risposte non soddisfacenti)
+patch("log_automatic_negative_feedback", lambda **k: feedback.append(k))
 patch("get_all_sub_topics", lambda t: ["determine"])
 for k, v in dict(query_rewriter_model_name="RW", answer_generator_model_name="GEN", grader_model_name="GR").items():
     object.__setattr__(settings, k, v)
 prompts_seen = {}
 REWRITER_DATE_RANGE = None   # periodo restituito dal rewriter finto
+GRADER_VERDICTS = []         # verdetti da restituire in ordine prima del PASS
+GEN_ANSWER = "<p>A Viareggio: lavori al liceo Carducci <i>[1]</i>.</p>"
+redazioni = []               # richieste di pulizia con gli omissis
+PULIZIA_RIESCE = True        # la pulizia finta toglie il nome (False: lo lascia)
 class FakeLLM:
     def generate_json(self, model, prompt, with_meta=False, **kw):
         prompts_seen[model] = prompt
@@ -85,7 +96,12 @@ class FakeLLM:
                               "date_range": REWRITER_DATE_RANGE})
         elif model == "GEN":
             raw = json.dumps({"is_found": True, "is_general_knowledge": False,
-                              "answer": "<p>A Viareggio: lavori al liceo Carducci <i>[1]</i>.</p>"})
+                              "answer": GEN_ANSWER})
+        elif "You remove personal data" in prompt:   # pulizia con gli omissis
+            redazioni.append(prompt)
+            raw = json.dumps({"answer": GEN_ANSWER.replace("Mario Rossi", "omissis") if PULIZIA_RIESCE else GEN_ANSWER})
+        elif GRADER_VERDICTS:
+            raw = json.dumps(GRADER_VERDICTS.pop(0))
         else:
             raw = json.dumps({"verdict": "PASS", "reason": "ok", "missing_targets": [], "note": ""})
         return (raw, {"truncated": False}) if with_meta else raw
@@ -138,6 +154,71 @@ summaries.clear()
 REWRITER_DATE_RANGE = {"from": "2025-12-31", "to": "2025-01-01"}
 res = worker.process_rag_query.apply(args=["lavori?", [], "attiprovincia"]).get()
 check(len(res.get("sources", [])) == 3 and "periodo=" not in summaries[-1], "periodo incoerente ignorato: nessun filtro")
+
+# --- regole sui vincoli della domanda nel prompt di generazione e nel grader
+check("QUERY CONSTRAINTS RULE" in prompts_seen.get("GEN", ""), "regola sui vincoli della domanda nel prompt di generazione")
+check('"constraints"' in prompts_seen.get("GR", ""), "terzo motivo di bocciatura nel grader")
+
+# --- concetti: solo le domande dell'utente, non le risposte del modello
+from rag.concepts import concept_lookup_text
+storia = [{"role": "user", "text": "revoche di incarichi?"}, {"role": "model", "text": "<p>" + "x" * 3000 + "</p>"},
+          {"role": "user", "text": "solo affidamenti"}, {"role": "model", "text": "<ul><li>...</li></ul>"},
+          {"role": "user", "text": "  "}]
+check(concept_lookup_text("escludi le forniture", storia) == "revoche di incarichi? solo affidamenti escludi le forniture",
+      "lookup dei concetti sulle ultime domande dell'utente")
+check(concept_lookup_text("in Versilia?", None) == "in Versilia?", "senza storia: solo la domanda")
+
+# --- grader "constraints": nuovo tentativo con l'istruzione di rispettare le esclusioni
+summaries.clear(); saved.clear()
+GRADER_VERDICTS.append({"verdict": "FAIL", "reason": "constraints", "missing_targets": [], "note": "forniture incluse"})
+res = worker.process_rag_query.apply(args=["lavori sulle scuole della Versilia?", [], "attiprovincia"]).get()
+check(res.get("status") == "success" and "tentativi=2" in summaries[-1], f"bocciata per i vincoli, rifatta: {summaries[-1:]}")
+check("includeva documenti che la richiesta esclude" in prompts_seen.get("RW", ""), "istruzione del nuovo tentativo sui vincoli")
+
+# --- grader del prompt del topic e prompt inesistente
+from rag.prompts import get_topic_prompt, grader_name
+check("omissis" in prompts_seen.get("GR", "") and '"privacy"' in prompts_seen.get("GR", ""),
+      "topic con prompt atti: grader atti_grader")
+check((grader_name("atti"), grader_name("greenlees"), grader_name("general"), grader_name(None))
+      == ("atti_grader", "greenlees_grader", "grader", "grader"), "grader per prompt, altrimenti quello comune")
+c = sqlite3.connect(DB); c.execute("INSERT INTO topics VALUES ('vecchio', 'protocollo')"); c.commit(); c.close()
+check((get_topic_prompt("vecchio"), get_topic_prompt("attiprovincia"), get_topic_prompt("assente"))
+      == ("general", "atti", "general"), "prompt inesistente o non indicato: general")
+
+# --- atti: dati personali sostituiti da omissis nella risposta
+from rag.generation import with_omissis
+check(with_omissis("CF RSSMRA80A01E715X, IBAN IT31 T 05034 13701 000000006237, mail mario.rossi@pec.it; CIG 88794691A0")
+      == "CF omissis, IBAN omissis, mail omissis; CIG 88794691A0", "codice fiscale, IBAN ed email in omissis, il CIG resta")
+summaries.clear()
+GEN_ANSWER = "<p>Incarico, codice fiscale RSSMRA80A01E715X <i>[1]</i>.</p>"
+res = worker.process_rag_query.apply(args=["lavori sulle scuole della Versilia?", [], "attiprovincia"]).get()
+check("RSSMRA80A01E715X" not in res.get("answer", "") and "omissis" in res.get("answer", ""), f"risposta con omissis: {res.get('answer')}")
+
+# --- dati personali: la risposta si ripulisce con gli omissis, senza rifare la ricerca
+summaries.clear(); saved.clear(); redazioni.clear()
+GEN_ANSWER = "<p>Incarico all'ing. Mario Rossi <i>[1]</i>.</p>"
+GRADER_VERDICTS.append({"verdict": "FAIL", "reason": "privacy", "missing_targets": [], "note": "nome"})
+res = worker.process_rag_query.apply(args=["lavori sulle scuole della Versilia?", [], "attiprovincia"]).get()
+check(res.get("answer", "").startswith("<p>Incarico all'ing. omissis") and "det_" in res.get("answer", ""),
+      f"risposta ripulita con gli omissis e citazione risolta: {res.get('answer')}")
+check(len(redazioni) == 1 and "Mario Rossi" in redazioni[0] and "[1]" in redazioni[0], "pulizia sulla risposta con i riferimenti numerici")
+check("tentativi=1" in summaries[-1] and saved and "Mario Rossi" not in saved[-1][2], "nessun nuovo giro di ricerca; in cache la versione ripulita")
+
+# --- dati personali anche dopo la pulizia, fino all'ultimo tentativo: la risposta non si mostra
+summaries.clear(); saved.clear()
+GEN_ANSWER = "<p>Incarico all'ing. Mario Rossi <i>[1]</i>.</p>"
+PULIZIA_RIESCE = False
+GRADER_VERDICTS.extend([{"verdict": "FAIL", "reason": "privacy", "missing_targets": [], "note": "nome"}] * 50)
+res = worker.process_rag_query.apply(args=["lavori sulle scuole della Versilia?", [], "attiprovincia"]).get()
+GRADER_VERDICTS.clear(); PULIZIA_RIESCE = True
+GEN_ANSWER = "<p>A Viareggio: lavori al liceo Carducci <i>[1]</i>.</p>"
+redazioni = []               # richieste di pulizia con gli omissis
+PULIZIA_RIESCE = True        # la pulizia finta toglie il nome (False: lo lascia)
+check("Mario Rossi" not in res.get("answer", "") and "dati personali" in res.get("answer", "") and not saved,
+      f"risposta non mostrata né salvata in cache: {res.get('answer')}")
+check(feedback and "Mario Rossi" not in feedback[-1]["answer"], "nemmeno nel feedback automatico")
+check("riformulare" not in prompts_seen.get("RW", "") and "sostituiti con omissis" in prompts_seen.get("RW", ""),
+      "istruzione del nuovo tentativo sui dati personali")
 
 # --- errore: la riga di riepilogo c'è comunque
 summaries.clear()

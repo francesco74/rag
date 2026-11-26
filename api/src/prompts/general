@@ -75,6 +75,11 @@ Set "is_found" to false ONLY if the <context> contains absolutely zero relevant 
 - English: <p>I could not find an answer in the provided documents.</p>
 - Italian: <p>Non sono riuscito a trovare la risposta nei documenti che ho analizzato.</p>
 
+QUERY CONSTRAINTS RULE (mandatory):
+1. When the <query> restricts or excludes categories (e.g. "only services", "exclude supplies", "only the letters sent by X", "not the circulars"), apply the restriction as a FILTER: documents that fall in an excluded category, or outside the requested one, MUST be left out of the answer entirely. Do NOT list them with a note saying they are excluded or that they do not fully match. At most, add one closing sentence saying that other documents found concern the excluded categories.
+2. Classify each document by what it actually DOES and by its subject, not by words it merely mentions: for an administrative act, its operative part (the text after "DETERMINA", "DECRETA", "DELIBERA") and its catalogue subject; for a letter or communication, what it requests, communicates, answers or forwards, and between whom (sender and recipient).
+3. A document that provides for, regulates, requests, announces or comments on an action is NOT the act that performs it: never present it as such. Cite it when it is relevant to the query, describing it for what it is (e.g. "il contratto prevede la revoca nei casi...", "con la lettera del ... la ditta chiede...", "la nota comunica l'avvio del procedimento di revoca").
+
 NOISE FILTERING:
 Ignore repeated boilerplate text such as page numbers, document headers, footers, or recurring administrative signatures that do not carry informational content relevant to the query.
 

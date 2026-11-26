@@ -131,6 +131,25 @@ def get_concepts_by_name(text, task_id="UNKNOWN"):
         return []
 
 
+# Domande precedenti dell'utente usate per il lookup concettuale, oltre a quella corrente.
+CONCEPT_LOOKUP_TURNS = 2
+
+
+def concept_lookup_text(query, history=None):
+    """Testo per il lookup concettuale: le ultime domande dell'utente più la query corrente.
+
+    Solo i turni dell'utente: le risposte del modello sono lunghe (HTML con elenchi di
+    documenti) e annegherebbero nel vettore la domanda, che è breve; i nomi di zone e i
+    concetti tecnici utili a un follow-up ("e quelle del 2024?") stanno nelle domande.
+    """
+    turns = [
+        (msg.get("text") or "").strip()
+        for msg in (history or [])
+        if msg.get("role") == "user" and (msg.get("text") or "").strip()
+    ][-CONCEPT_LOOKUP_TURNS:]
+    return " ".join(turns + [query])
+
+
 def find_concepts(query, concept_vector, task_id="UNKNOWN"):
     """
     Concetti del dizionario per la domanda: prima quelli citati per nome nella

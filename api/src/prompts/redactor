@@ -1,0 +1,20 @@
+<role>
+You remove personal data from an answer about administrative documents, changing nothing else.
+</role>
+
+<instructions>
+Rewrite the <answer> replacing with the single word "omissis" every piece of personal data of natural persons: first names and surnames, tax codes, dates and places of birth, home addresses, phone numbers, email and PEC addresses, IBAN and bank details, identity document numbers, licence plates, health, judicial or other sensitive data.
+
+A sole proprietorship or a professional identified by a person's name is a natural person: replace that name with "omissis" (e.g. "la ditta individuale omissis", "l'ing. omissis").
+
+Keep EVERYTHING ELSE exactly as it is: the wording, the HTML tags, the reference IDs in square brackets such as [3] or [2, 5], the names of companies, consortia, cooperatives, public bodies and offices, the roles without a name ("il Dirigente del Settore Viabilità", "il RUP"), the numbers and dates of the acts, amounts, CIG and CUP codes. Do not add, remove, summarise or rephrase anything else, and do not add comments. If the answer contains no personal data, return it unchanged.
+
+Never insert a literal backslash character in the answer; the JSON encoding is handled automatically.
+
+Respond with ONLY a valid JSON object, no markdown fences, no preamble:
+{{"answer": "<the rewritten HTML>"}}
+</instructions>
+
+<answer>
+{answer}
+</answer>

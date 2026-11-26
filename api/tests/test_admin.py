@@ -183,6 +183,7 @@ data = cl.get(f"{ADM}/topics", headers=A).json
 new = next(t for t in data["items"] if t["topic_id"] == "nuovo")
 check(new["public_access"] is True and new["sub_topics"][0]["description"] == "Serie 2", "elenco archivi aggiornato")
 check("general" in data["prompts"] and "query_rewriter" not in data["prompts"], "solo i prompt selezionabili")
+check(sorted(data["prompts"]) == ["atti", "general", "greenlees"], f"i grader dei prompt non sono selezionabili: {data['prompts']}")
 check(cl.delete(f"{ADM}/topics/atti/subtopics/determine", headers=A).status_code == 409, "sottocategoria con documenti: non si elimina")
 
 # --- siti

@@ -10,7 +10,7 @@ from common.config import settings
 from llm_provider import get_llm_provider
 from rag.context import build_context
 from rag.jsonparse import safe_json_parse
-from rag.prompts import get_topic_prompt, load_prompt_template
+from rag.prompts import get_topic_prompt, grader_name, load_prompt_template
 
 log = logging.getLogger("WORKER")
 
@@ -67,6 +67,51 @@ def resolve_citations(answer_html: str, index_to_item: dict) -> str:
     # Cattura i pattern tipo [3] o [2, 5] ovunque compaiano nella risposta
     pattern = r'\[([\d,\s]+)\]'
     return re.sub(pattern, replace_match, answer_html)
+
+
+# Prompt i cui archivi non devono mai restituire dati personali: oltre alla regola nel
+# prompt (e al motivo "privacy" del suo grader), un filtro deterministico sostituisce con
+# "omissis" i dati riconoscibili dalla forma: codice fiscale, IBAN, indirizzi email.
+OMISSIS = "omissis"
+PROMPTS_WITH_OMISSIS = {"atti"}
+_PERSONAL_DATA = (
+    re.compile(r"\b[A-Z]{6}\d{2}[ABCDEHLMPRST]\d{2}[A-Z]\d{3}[A-Z]\b", re.IGNORECASE),  # codice fiscale
+    re.compile(r"\bIT\s?\d{2}\s?[A-Z](?:\s?\d){10}(?:\s?[0-9A-Z]){12}\b", re.IGNORECASE),  # IBAN italiano
+    re.compile(r"\b[\w.+-]+@[\w-]+(?:\.[\w-]+)+\b"),  # email e PEC
+)
+
+
+def with_omissis(text):
+    """Sostituisce con "omissis" i dati personali riconoscibili dalla forma."""
+    for pattern in _PERSONAL_DATA:
+        text = pattern.sub(OMISSIS, text)
+    return text
+
+
+# Passaggi di pulizia con gli omissis prima di arrendersi (vedi evaluate_generation).
+REDACTION_PASSES = 2
+
+
+class RedactedSchema(BaseModel):
+    answer: str
+
+
+def redact_personal_data(answer, task_id="UNKNOWN"):
+    """La risposta con i dati personali sostituiti da omissis (prompts/redactor), con il
+    modello del grader: lavora sul solo testo della risposta, quindi è una chiamata breve.
+    I riferimenti [n] restano numerici. Solleva un'eccezione se il modello non risponde."""
+    prompt = load_prompt_template("redactor").format(answer=answer)
+    raw = get_llm_provider().generate_json(
+        settings.grader_model_name, prompt,
+        temperature=0.0,
+        max_tokens=settings.answer_max_tokens,
+        thinking_level=settings.grader_thinking_level,
+        response_schema=RedactedSchema,
+    )
+    text = str(safe_json_parse(raw, task_id=task_id).get("answer") or "").strip()
+    if not text:
+        raise ValueError("risposta ripulita vuota")
+    return with_omissis(text)
 
 
 def generate_answer(query, rich_context, topic_id, search_queries=None,
@@ -176,7 +221,12 @@ def generate_answer(query, rich_context, topic_id, search_queries=None,
 
     log.debug(f"[{task_id}] Raw response:\n{raw[:500]}...")
 
+    if prompt_file in PROMPTS_WITH_OMISSIS:
+        raw = with_omissis(raw)
+
     base_result = {
+        "prompt_name": prompt_file,  # sceglie il grader (prompts/<prompt>_grader)
+        "index_to_item": index_to_item,  # per risolvere le citazioni di una risposta ripulita
         "used_sources": list(used_sources.values()),
         "used_parent_ids": used_parent_ids,
         "context_str": context_str,
@@ -206,14 +256,16 @@ def generate_answer(query, rich_context, topic_id, search_queries=None,
 
 
 def grade_answer(query, context_snippet, answer, coverage_targets=None,
-                 is_general_knowledge=False, task_id="UNKNOWN"):
+                 is_general_knowledge=False, task_id="UNKNOWN", prompt_name=None):
     """
     Valuta la risposta e restituisce un dict:
         {"ok": bool, "reason": str, "missing_targets": list, "note": str}
 
-    Il grader boccia SOLO due casi: "grounding" (afferma come tratto dai
-    documenti qualcosa che il contesto non sostiene) e "no_answer" (nessuna
-    informazione utile). La copertura parziale NON è un fallimento: se per un
+    Il grader è quello del prompt del topic (prompts/<prompt>_grader, altrimenti
+    prompts/grader). Boccia: "grounding" (afferma come tratto dai documenti
+    qualcosa che il contesto non sostiene), "no_answer" (nessuna informazione
+    utile), "constraints" (include ciò che la domanda esclude) e, per atti,
+    "privacy" (dati personali al posto degli omissis). La copertura parziale NON è un fallimento: se per un
     comune non risultano documenti, dirlo è la risposta corretta, non un
     difetto. missing_targets viene raccolto per sola diagnostica e finisce in
     rag_metrics, dove sui volumi distingue un problema di ingestion (documenti
@@ -233,7 +285,9 @@ def grade_answer(query, context_snippet, answer, coverage_targets=None,
     tentativo di retry.
     """
     targets = [t for t in (coverage_targets or []) if t]
-    grader_tmpl = load_prompt_template("grader")
+    grader_file = grader_name(prompt_name)
+    log.debug(f"[{task_id}] [GRADER] Prompt '{prompt_name}': grader '{grader_file}'.")
+    grader_tmpl = load_prompt_template(grader_file)
 
     fmt_kwargs = {
         "query": query,
@@ -306,7 +360,9 @@ def evaluate_generation(gen_result, query, coverage_targets=None, task_id="UNKNO
     (is_satisfactory, reason, missing_targets). Usata sia dal loop principale
     sia dal fallback finale, che prima ne avevano due copie divergenti.
 
-    reason ∈ {"ok", "not_found", "grounding", "no_answer", "general_knowledge"}
+    reason ∈ {"ok", "not_found", "grounding", "no_answer", "constraints", "privacy", "general_knowledge"}
+    ("constraints": la risposta include documenti che la richiesta esclude; "privacy": dati
+    personali al posto degli omissis, solo per i prompt che li vietano)
     e guida il messaggio iniettato nel retry: riformulare in modo ampio ha senso
     quando la ricerca ha fallito, non quando i documenti c'erano ma erano
     insufficienti su un aspetto specifico.
@@ -328,20 +384,40 @@ def evaluate_generation(gen_result, query, coverage_targets=None, task_id="UNKNO
 
     is_gk = bool(gen_result.get("is_general_knowledge"))
 
-    try:
-        verdict = grade_answer(
-            query,
-            gen_result.get("context_str", ""),
-            # Risposta grezza: i riferimenti numerici sono verificabili contro
-            # il contesto numerato; i filename della versione risolta no.
-            gen_result.get("raw_answer") or gen_result.get("answer", ""),
-            coverage_targets=coverage_targets,
-            is_general_knowledge=is_gk,
-            task_id=task_id,
-        )
-    except Exception as e:
-        log.error(f"[{task_id}] Grader LLM failed (non-blocking): {e}. Fail-open.")
-        verdict = {"ok": True, "reason": "ok", "missing_targets": [], "note": "grader exception"}
+    def grade():
+        try:
+            return grade_answer(
+                query,
+                gen_result.get("context_str", ""),
+                # Risposta grezza: i riferimenti numerici sono verificabili contro
+                # il contesto numerato; i filename della versione risolta no.
+                gen_result.get("raw_answer") or gen_result.get("answer", ""),
+                coverage_targets=coverage_targets,
+                is_general_knowledge=is_gk,
+                task_id=task_id,
+                prompt_name=gen_result.get("prompt_name"),
+            )
+        except Exception as e:
+            log.error(f"[{task_id}] Grader LLM failed (non-blocking): {e}. Fail-open.")
+            return {"ok": True, "reason": "ok", "missing_targets": [], "note": "grader exception"}
+
+    verdict = grade()
+
+    # Dati personali (grader di atti): invece di rifare tutta la ricerca si ripulisce la
+    # risposta con gli omissis e la si rivaluta, fino a REDACTION_PASSES volte. La
+    # risposta ripulita sostituisce quella generata (gen_result è del chiamante).
+    passes = 0
+    while not verdict["ok"] and verdict["reason"] == "privacy" and passes < REDACTION_PASSES:
+        passes += 1
+        try:
+            redacted = redact_personal_data(gen_result.get("raw_answer") or gen_result.get("answer", ""), task_id)
+        except Exception as e:
+            log.warning(f"[{task_id}] [OMISSIS] Pulizia non riuscita ({e}): resta la bocciatura per dati personali.")
+            break
+        gen_result["raw_answer"] = redacted
+        gen_result["answer"] = resolve_citations(redacted, gen_result.get("index_to_item") or {})
+        log.info(f"[{task_id}] [OMISSIS] Dati personali sostituiti con omissis (passaggio {passes}): nuova valutazione.")
+        verdict = grade()
 
     missing = verdict.get("missing_targets", [])
 
